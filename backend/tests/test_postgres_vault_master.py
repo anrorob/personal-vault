@@ -35,6 +35,14 @@ from app.vault_master import (
     process_next_move,
     scan_root,
 )
+from app.share_grants import (
+    ACTIVE_GRANT_STATE,
+    LOCAL_ALL_TARGET,
+    LOCAL_USER_TARGET,
+    PENDING_GRANT_STATE,
+    REMOTE_VAULT_TARGET,
+    PostgresShareGrantStore,
+)
 from app import vault_control_users
 from app import vault_storage_control
 import app.share_grants as share_grants
@@ -3918,7 +3926,7 @@ def test_people_face_identification_persists_canonical_owner_uuid_and_filters_by
 ) -> None:
     authentication = PostgresAuthenticationStore(postgres_conninfo)
     owner = authentication.get_account("owner")
-    other = authentication.get_account("owner")
+    other = authentication.get_account("recipient")
     assert owner is not None and other is not None
     asset = replace(_catalogued_asset(uuid4(), "/vault/Gallery/owner-face.jpg", "owner"), owner_user_id=owner.user_id)
     postgres_store.restore_catalogued_asset(asset, "owner")
