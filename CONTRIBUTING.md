@@ -1,9 +1,21 @@
 # Contributing
 
-Use `development` for integration work and keep `main` releasable. Create focused branches, keep pull requests small, and include relevant automated tests.
+Personal Vault is currently owner-controlled. External contributors are welcome to propose changes through pull requests; they do not receive automatic merge or write authority.
 
-Do not commit credentials, production URLs, user identities, media files, database exports, private diagnostics, or host-specific deployment material. Use placeholders in examples and `.env.example`; keep real configuration in ignored files.
+## Workflow
 
-Before proposing a change, run the relevant backend tests and frontend checks. Changes that affect database-backed behaviour require the relevant PostgreSQL-backed test coverage in a separately provisioned development database.
+- Fork the repository and use a focused branch.
+- Target `development` unless a maintainer asks for `main`.
+- Keep `main` releasable and avoid unrelated formatting or generated-file churn.
+- Explain the problem, scope, tests, and any compatibility implications in the pull request.
 
-The project is currently preparing for public development. If a proposed contribution needs product, architecture, storage, or security decisions, open that discussion before implementation.
+## Expectations
+
+- Follow the public [architecture overview](docs/architecture.md), especially the immutable-identity, authorization, and logical-storage boundaries.
+- Add or update relevant tests. PostgreSQL-backed behaviour requires PostgreSQL-backed tests; see [backend/TESTING.md](backend/TESTING.md).
+- Use the established frontend lint/build and backend test commands where relevant.
+- Discuss significant architecture, storage, identity, security, or product-direction changes before implementation.
+
+Never include credentials, private media, real user identities, production URLs, database exports, host-specific operations material, or private diagnostics in commits, pull requests, or issues.
+
+Use normal GitHub issues for reproducible bugs and feature discussions. Use [SECURITY.md](SECURITY.md) for vulnerabilities.

@@ -1,5 +1,7 @@
 # Development environment plan
 
+This deployment-separation note supplements the practical [development setup](development.md).
+
 Run development as a separate deployment plane from production:
 
 - a distinct hostname, reverse-proxy site, Cloudflare tunnel or DNS route, and TLS configuration;
