@@ -1,0 +1,573 @@
+@import "tailwindcss" source(none);
+@source "../src";
+@import "tw-animate-css";
+
+@font-face {
+  font-family: "Potta One";
+  src: url("/assets/fonts/PottaOne-Latin.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+}
+
+@custom-variant dark (&:is(.dark *));
+
+/*
+ * Design system definition.
+ *
+ * The @theme inline block maps CSS custom properties to Tailwind utility
+ * classes (e.g. --color-primary -> bg-primary, text-primary).
+ *
+ * The :root and .dark blocks define the actual color values using oklch.
+ * All colors MUST use oklch format.
+ *
+ * To add a new semantic color:
+ * 1. Add the variable to :root (light value) and .dark (dark value)
+ * 2. Register it in @theme inline as --color-<name>: var(--<name>)
+ */
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 8px);
+  --radius-3xl: calc(var(--radius) + 12px);
+  --radius-4xl: calc(var(--radius) + 16px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-ring-offset-background: var(--background);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+}
+
+:root {
+  --radius: 0.625rem;
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.129 0.042 264.695);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.129 0.042 264.695);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.129 0.042 264.695);
+  --primary: oklch(0.208 0.042 265.755);
+  --primary-foreground: oklch(0.984 0.003 247.858);
+  --secondary: oklch(0.968 0.007 247.896);
+  --secondary-foreground: oklch(0.208 0.042 265.755);
+  --muted: oklch(0.968 0.007 247.896);
+  --muted-foreground: oklch(0.554 0.046 257.417);
+  --accent: oklch(0.968 0.007 247.896);
+  --accent-foreground: oklch(0.208 0.042 265.755);
+  --destructive: oklch(0.577 0.245 27.325);
+  --destructive-foreground: oklch(0.984 0.003 247.858);
+  --border: oklch(0.929 0.013 255.508);
+  --input: oklch(0.929 0.013 255.508);
+  --ring: oklch(0.704 0.04 256.788);
+  --chart-1: oklch(0.646 0.222 41.116);
+  --chart-2: oklch(0.6 0.118 184.704);
+  --chart-3: oklch(0.398 0.07 227.392);
+  --chart-4: oklch(0.828 0.189 84.429);
+  --chart-5: oklch(0.769 0.188 70.08);
+  --sidebar: oklch(0.984 0.003 247.858);
+  --sidebar-foreground: oklch(0.129 0.042 264.695);
+  --sidebar-primary: oklch(0.208 0.042 265.755);
+  --sidebar-primary-foreground: oklch(0.984 0.003 247.858);
+  --sidebar-accent: oklch(0.968 0.007 247.896);
+  --sidebar-accent-foreground: oklch(0.208 0.042 265.755);
+  --sidebar-border: oklch(0.929 0.013 255.508);
+  --sidebar-ring: oklch(0.704 0.04 256.788);
+}
+
+.dark {
+  --background: oklch(0.129 0.042 264.695);
+  --foreground: oklch(0.984 0.003 247.858);
+  --card: oklch(0.208 0.042 265.755);
+  --card-foreground: oklch(0.984 0.003 247.858);
+  --popover: oklch(0.208 0.042 265.755);
+  --popover-foreground: oklch(0.984 0.003 247.858);
+  --primary: oklch(0.929 0.013 255.508);
+  --primary-foreground: oklch(0.208 0.042 265.755);
+  --secondary: oklch(0.279 0.041 260.031);
+  --secondary-foreground: oklch(0.984 0.003 247.858);
+  --muted: oklch(0.279 0.041 260.031);
+  --muted-foreground: oklch(0.704 0.04 256.788);
+  --accent: oklch(0.279 0.041 260.031);
+  --accent-foreground: oklch(0.984 0.003 247.858);
+  --destructive: oklch(0.704 0.191 22.216);
+  --destructive-foreground: oklch(0.984 0.003 247.858);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.551 0.027 264.364);
+  --chart-1: oklch(0.488 0.243 264.376);
+  --chart-2: oklch(0.696 0.17 162.48);
+  --chart-3: oklch(0.769 0.188 70.08);
+  --chart-4: oklch(0.627 0.265 303.9);
+  --chart-5: oklch(0.645 0.246 16.439);
+  --sidebar: oklch(0.208 0.042 265.755);
+  --sidebar-foreground: oklch(0.984 0.003 247.858);
+  --sidebar-primary: oklch(0.488 0.243 264.376);
+  --sidebar-primary-foreground: oklch(0.984 0.003 247.858);
+  --sidebar-accent: oklch(0.279 0.041 260.031);
+  --sidebar-accent-foreground: oklch(0.984 0.003 247.858);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.551 0.027 264.364);
+}
+
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+
+  body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+  }
+}
+
+/*
+ * Personal Vault theme
+ * Scoped to .pv so it does not touch the public landing page.
+ */
+.pv {
+  --pv-bg: #080809;
+  --pv-bg-elev: #0e0e11;
+  --pv-panel: #17171a;
+  --pv-panel-2: #1d1c1a;
+  --pv-panel-dark: #101013;
+  --pv-border: #2d2b27;
+  --pv-border-strong: #5a4d30;
+  --pv-silver: #d4d1ca;
+  --pv-silver-dim: #99978f;
+  --pv-text: #ebe8e1;
+  --pv-text-dim: #aaa69c;
+  --pv-gold: #d7b968;
+  --pv-gold-soft: #c8a95c;
+  --pv-gold-bright: #f0d58a;
+  --pv-gold-dim: #8e7439;
+  --pv-gold-rgb: 215, 185, 104;
+  --pv-danger: #ffb4ab;
+  background:
+    radial-gradient(circle at 78% -12%, rgba(var(--pv-gold-rgb), 0.055), transparent 35rem),
+    radial-gradient(circle at 8% 110%, rgba(var(--pv-gold-rgb), 0.025), transparent 30rem),
+    var(--pv-bg);
+  color: var(--pv-text);
+  min-height: 100vh;
+  font-family: "Potta One";
+}
+
+/* Radix dialogs are portalled beneath body, outside the .pv theme scope. */
+.pv-dialog {
+  --pv-bg: #080809;
+  --pv-bg-elev: #0e0e11;
+  --pv-panel: #17171a;
+  --pv-panel-2: #1d1c1a;
+  --pv-panel-dark: #101013;
+  --pv-border: #2d2b27;
+  --pv-border-strong: #5a4d30;
+  --pv-silver: #d4d1ca;
+  --pv-silver-dim: #99978f;
+  --pv-text: #ebe8e1;
+  --pv-text-dim: #aaa69c;
+  --pv-gold: #d7b968;
+  --pv-gold-soft: #c8a95c;
+  --pv-gold-bright: #f0d58a;
+  --pv-gold-dim: #8e7439;
+  --pv-gold-rgb: 215, 185, 104;
+  --pv-danger: #ffb4ab;
+  color: var(--pv-text);
+}
+
+/*
+ * User-facing Vault typography and semantic utilities share the same owned
+ * interface font and Vault palette. Technical monospace values and Reading
+ * Room document content opt out explicitly where they require it.
+ */
+.pv,
+.pv-dialog {
+  --background: var(--pv-bg);
+  --foreground: var(--pv-text);
+  --card: var(--pv-panel);
+  --card-foreground: var(--pv-text);
+  --popover: var(--pv-panel);
+  --popover-foreground: var(--pv-text);
+  --primary: var(--pv-gold);
+  --primary-foreground: #1a1608;
+  --secondary: var(--pv-panel-2);
+  --secondary-foreground: var(--pv-text);
+  --muted: var(--pv-panel-dark);
+  --muted-foreground: var(--pv-text-dim);
+  --accent: var(--pv-panel-2);
+  --accent-foreground: var(--pv-gold-bright);
+  --border: var(--pv-border);
+  --input: var(--pv-border);
+  --ring: var(--pv-gold);
+  font-family: "Potta One";
+}
+
+.pv button,
+.pv input,
+.pv select,
+.pv textarea,
+.pv-dialog button,
+.pv-dialog input,
+.pv-dialog select,
+.pv-dialog textarea {
+  font: inherit;
+}
+
+.pv-dialog {
+  background:
+    linear-gradient(145deg, rgba(var(--pv-gold-rgb), 0.07), transparent 45%), var(--pv-panel-2);
+  border-color: var(--pv-border-strong);
+  box-shadow:
+    0 28px 80px rgba(0, 0, 0, 0.62),
+    0 0 0 1px rgba(var(--pv-gold-rgb), 0.08),
+    inset 0 1px 0 rgba(255, 255, 255, 0.035);
+}
+
+.pv-dialog .pv-input {
+  background: var(--pv-panel-dark);
+  border-color: var(--pv-border-strong);
+  color: var(--pv-text);
+  color-scheme: dark;
+}
+
+.pv-dialog .pv-input::placeholder {
+  color: var(--pv-text-dim);
+  opacity: 0.82;
+}
+
+.pv-dialog-close {
+  color: var(--pv-silver);
+  border: 1px solid var(--pv-border);
+  background: var(--pv-panel-dark);
+  padding: 0.35rem;
+  transition:
+    border-color 150ms ease,
+    color 150ms ease,
+    background-color 150ms ease;
+}
+
+.pv-dialog-close:hover {
+  color: var(--pv-gold-bright);
+  border-color: var(--pv-border-strong);
+  background: var(--pv-panel);
+}
+
+.pv-dialog-close:focus-visible {
+  border-color: var(--pv-gold-bright);
+  box-shadow: 0 0 0 3px rgba(var(--pv-gold-rgb), 0.2);
+  outline: none;
+}
+
+.pv-status-error {
+  color: var(--pv-danger);
+}
+
+.pv-panel {
+  background:
+    linear-gradient(145deg, rgba(var(--pv-gold-rgb), 0.035), transparent 42%),
+    linear-gradient(180deg, #19191c 0%, var(--pv-panel) 100%);
+  border: 1px solid var(--pv-border);
+  border-radius: 12px;
+  box-shadow:
+    0 14px 36px rgba(0, 0, 0, 0.16),
+    inset 0 1px 0 rgba(255, 255, 255, 0.018);
+}
+
+.pv-panel-dark {
+  background:
+    linear-gradient(145deg, rgba(var(--pv-gold-rgb), 0.035), transparent 44%),
+    linear-gradient(180deg, #121214 0%, var(--pv-panel-dark) 100%);
+}
+
+.pv-panel-hover {
+  transition:
+    border-color 220ms ease,
+    background-color 220ms ease,
+    box-shadow 220ms ease,
+    transform 220ms ease;
+}
+.pv-panel-hover:hover {
+  border-color: rgba(var(--pv-gold-rgb), 0.48);
+  background-color: var(--pv-panel-2);
+  box-shadow:
+    0 18px 42px rgba(0, 0, 0, 0.24),
+    0 0 0 1px rgba(var(--pv-gold-rgb), 0.06),
+    0 0 24px rgba(var(--pv-gold-rgb), 0.055);
+  transform: translateY(-2px);
+}
+
+.pv-panel-hover:focus-visible {
+  border-color: var(--pv-gold);
+  box-shadow: 0 0 0 3px rgba(var(--pv-gold-rgb), 0.16);
+  outline: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pv-action-spinner {
+    animation: none !important;
+  }
+}
+
+.pv-display-title,
+.pv-page-title,
+.pv-content-title {
+  font-family: "Potta One";
+  font-weight: 400;
+  color: var(--pv-gold-bright) !important;
+  letter-spacing: 0.015em;
+  text-shadow:
+    0 0 9px rgba(var(--pv-gold-rgb), 0.3),
+    0 0 24px rgba(var(--pv-gold-rgb), 0.12);
+}
+
+.pv-page-title {
+  letter-spacing: 0.035em;
+}
+
+.pv-card-icon,
+.pv-nav-icon {
+  color: var(--pv-gold-soft);
+  filter: drop-shadow(0 0 7px rgba(var(--pv-gold-rgb), 0.12));
+}
+
+.pv-nav-item {
+  color: var(--pv-silver-dim);
+  border: 1px solid transparent;
+  transition:
+    color 170ms ease,
+    border-color 170ms ease,
+    background-color 170ms ease,
+    box-shadow 170ms ease,
+    transform 170ms ease;
+}
+
+.pv-nav-item:hover {
+  color: var(--pv-text) !important;
+  background: rgba(var(--pv-gold-rgb), 0.035) !important;
+  transform: translateX(2px);
+}
+
+.pv-nav-item-active {
+  color: var(--pv-gold-bright) !important;
+  border-color: rgba(var(--pv-gold-rgb), 0.52) !important;
+  background: linear-gradient(
+    90deg,
+    rgba(var(--pv-gold-rgb), 0.14),
+    rgba(var(--pv-gold-rgb), 0.035)
+  ) !important;
+  box-shadow:
+    inset 2px 0 0 var(--pv-gold-bright),
+    0 0 18px rgba(var(--pv-gold-rgb), 0.055) !important;
+}
+
+.pv-nav-item-active .pv-nav-icon {
+  color: var(--pv-gold-bright);
+}
+
+.pv-nav-item:focus-visible {
+  color: var(--pv-text) !important;
+  border-color: var(--pv-gold);
+  box-shadow: 0 0 0 3px rgba(var(--pv-gold-rgb), 0.16);
+  outline: none;
+}
+
+.pv-input {
+  background-color: #0e0f12;
+  border: 1px solid var(--pv-border);
+  color: var(--pv-text);
+  border-radius: 8px;
+  padding: 0.75rem 0.9rem;
+  width: 100%;
+  outline: none;
+  transition:
+    border-color 150ms ease,
+    box-shadow 150ms ease;
+}
+.pv-input:focus {
+  border-color: var(--pv-gold);
+  box-shadow: 0 0 0 3px rgba(var(--pv-gold-rgb), 0.13);
+}
+
+.pv-btn-primary,
+.pv-btn-gold {
+  background: linear-gradient(180deg, var(--pv-gold-bright) 0%, var(--pv-gold) 48%, #a8873f 100%);
+  color: #1a1608;
+  font-weight: 600;
+  border-radius: 8px;
+  padding: 0.7rem 1rem;
+  border: 1px solid #8f7235;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.28),
+    0 7px 18px rgba(var(--pv-gold-rgb), 0.1);
+  transition:
+    filter 150ms ease,
+    transform 150ms ease,
+    box-shadow 150ms ease;
+}
+.pv-btn-primary:hover,
+.pv-btn-gold:hover {
+  filter: brightness(1.06);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.32),
+    0 9px 24px rgba(var(--pv-gold-rgb), 0.18);
+  transform: translateY(-1px);
+}
+.pv-btn-primary:active,
+.pv-btn-gold:active {
+  transform: translateY(1px);
+}
+
+.pv-btn-primary:focus-visible,
+.pv-btn-gold:focus-visible,
+.pv-btn-secondary:focus-visible,
+.pv-btn-ghost:focus-visible {
+  border-color: var(--pv-gold-bright);
+  box-shadow: 0 0 0 3px rgba(var(--pv-gold-rgb), 0.2);
+  outline: none;
+}
+
+.pv-btn-primary:disabled,
+.pv-btn-gold:disabled,
+.pv-btn-secondary:disabled,
+.pv-btn-ghost:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.pv-btn-secondary,
+.pv-btn-ghost {
+  background: transparent;
+  color: var(--pv-silver);
+  border: 1px solid var(--pv-border);
+  border-radius: 8px;
+  padding: 0.6rem 0.9rem;
+  transition:
+    border-color 150ms ease,
+    color 150ms ease;
+}
+.pv-btn-secondary:hover,
+.pv-btn-ghost:hover {
+  border-color: rgba(var(--pv-gold-rgb), 0.48);
+  color: var(--pv-gold-bright);
+  background: rgba(var(--pv-gold-rgb), 0.035);
+}
+
+.pv-exit-vault {
+  font-family: "Potta One";
+  color: var(--pv-gold) !important;
+  text-shadow: 0 0 12px rgba(var(--pv-gold-rgb), 0.22);
+}
+
+.pv-text-link {
+  color: var(--pv-text-dim);
+  transition: color 150ms ease;
+}
+
+.pv-text-link:hover {
+  color: var(--pv-text);
+}
+
+.pv-text-link:focus-visible {
+  color: var(--pv-text);
+  box-shadow: 0 0 0 3px rgba(var(--pv-gold-rgb), 0.16);
+  outline: none;
+}
+
+.pv-library-tab {
+  color: var(--pv-text-dim);
+  border-radius: 0.375rem;
+  padding: 0.375rem 0.75rem;
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+  transition:
+    background-color 150ms ease,
+    color 150ms ease,
+    box-shadow 150ms ease;
+}
+
+.pv-library-tab:hover {
+  color: var(--pv-text);
+  background: rgba(var(--pv-gold-rgb), 0.035);
+}
+
+.pv-library-tab:focus-visible {
+  color: var(--pv-text);
+  box-shadow: 0 0 0 3px rgba(var(--pv-gold-rgb), 0.16);
+  outline: none;
+}
+
+.pv-library-tab[data-active="true"] {
+  background: var(--pv-gold);
+  color: #09090b;
+}
+
+.pv-fade-in {
+  animation: pv-fade 240ms ease-out both;
+}
+@keyframes pv-fade {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/*
+ * A phone in landscape can cross Tailwind's width-based md breakpoint while
+ * retaining very little vertical space. Keep navigation in its mobile drawer
+ * mode for coarse-pointer landscape screens.
+ */
+@media (orientation: landscape) and (max-height: 600px) and (pointer: coarse) {
+  .pv-sidebar {
+    display: none !important;
+    position: fixed !important;
+  }
+
+  .pv-sidebar[data-mobile-open="true"] {
+    display: flex !important;
+  }
+
+  .pv-mobile-nav-toggle {
+    display: inline-flex !important;
+  }
+
+  .pv-desktop-header-logo {
+    display: none !important;
+  }
+
+  [data-mobile-navigation-overlay] {
+    display: block !important;
+  }
+}

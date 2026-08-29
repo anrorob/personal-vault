@@ -1,0 +1,9 @@
+node_modules
+.output
+.git
+.github
+.lovable
+*.log
+.env
+.env.*
+README.md

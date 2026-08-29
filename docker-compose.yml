@@ -1,0 +1,232 @@
+services:
+  pv-frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pv-frontend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      BACKEND_URL: http://pv-backend:8000
+    ports:
+      - "127.0.0.1:3000:3000"
+
+  pv-backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: pv-backend
+    restart: unless-stopped
+    environment:
+      POSTGRES_HOST: pv-database
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: pv_vault
+      POSTGRES_USER: pv_vault
+      PV_METADATA_STORAGE_PATH: /var/lib/personal-vault/metadata
+      PV_VAULT_MASTER_AI_ENABLED: "true"
+      PV_FLORENCE_URL: http://pv-florence2:8080/ocr
+      PV_RAMPP_URL: http://pv-rampp:8080/tag
+      PV_FACE_DETECTOR_URL: http://pv-face-detector:8080/detect
+      PV_PEOPLE_URL: http://pv-people:8080/analyse
+      PV_GALLERY_PATH: /media/gallery
+      PV_MUSIC_PATH: /media/music
+      PV_LIBRARY_PATH: /media/library
+      PV_TV_SHOWS_PATH: /media/tv
+      PV_MUSICBRAINZ_USER_AGENT: ${PV_MUSICBRAINZ_USER_AGENT:-PersonalVault/0.1 (self-hosted archive)}
+      PV_FEDERATION_CACHE_ROOT: /vault/.cache/federation
+      PV_FEDERATED_DOWNLOAD_STAGING_ROOT: /var/lib/personal-vault/federated-download-staging
+      PV_FEDERATED_DOWNLOAD_EXECUTOR_QUEUE: /var/lib/personal-vault/federated-download-requests
+      PV_FEDERATED_DOWNLOAD_EXECUTOR_RECEIPTS: /var/lib/personal-vault/federated-download-receipts
+      PV_FEDERATED_DOWNLOAD_EXECUTOR_KEY_PATH: /run/secrets/federated-download.key
+      PV_ARRIVAL_MANAGED_PUBLISHER_QUEUE: /var/lib/personal-vault/arrival-managed-requests
+      PV_ARRIVAL_MANAGED_PUBLISHER_RECEIPTS: /var/lib/personal-vault/arrival-managed-receipts
+      PV_ARRIVAL_MANAGED_PUBLISHER_KEY_PATH: /run/secrets/arrival-managed-publisher.key
+      PV_THEATRE_RENAME_QUEUE: /var/lib/personal-vault/theatre-rename-requests
+      PV_THEATRE_RENAME_RECEIPTS: /var/lib/personal-vault/theatre-rename-receipts
+      PV_STORAGE_SLOT_ROOTS_JSON: ${PV_STORAGE_SLOT_ROOTS_JSON:-{}}
+    volumes:
+      - pv-metadata-data:/var/lib/personal-vault/metadata
+      - pv-federation-cache:/vault/.cache/federation
+      - "/var/lib/personal-vault-storage/federated-download-staging:/var/lib/personal-vault/federated-download-staging"
+      - "/var/lib/personal-vault-storage/federated-download-requests:/var/lib/personal-vault/federated-download-requests"
+      - "/var/lib/personal-vault-storage/federated-download-receipts:/var/lib/personal-vault/federated-download-receipts:ro"
+      - "/etc/personal-vault/federated-download.key:/run/secrets/federated-download.key:ro"
+      - "/var/lib/personal-vault-storage/arrival-managed-requests:/var/lib/personal-vault/arrival-managed-requests"
+      - "/var/lib/personal-vault-storage/arrival-managed-receipts:/var/lib/personal-vault/arrival-managed-receipts:ro"
+      - "/etc/personal-vault/arrival-managed-publisher.key:/run/secrets/arrival-managed-publisher.key:ro"
+      - "/var/lib/personal-vault-storage/theatre-rename-requests:/var/lib/personal-vault/theatre-rename-requests"
+      - "/var/lib/personal-vault-storage/theatre-rename-receipts:/var/lib/personal-vault/theatre-rename-receipts:ro"
+      - "/var/lib/personal-vault-storage/control:/var/lib/personal-vault/metadata/storage-control:ro"
+      - "/var/lib/personal-vault-storage/control-requests:/var/lib/personal-vault/metadata/storage-control-requests"
+      - "/var/lib/personal-vault-storage/swap-requests:/var/lib/personal-vault/metadata/storage-swap-requests"
+      - "/var/lib/personal-vault-storage/swap-acks:/var/lib/personal-vault/metadata/storage-swap-acks"
+      - "/etc/personal-vault/storage-control-request.key:/run/secrets/storage-control.key:ro"
+      - "${PV_STORAGE_SLOT_ROOT:-./storage-slots}:/vault-storage-slots:ro"
+    depends_on:
+      pv-database:
+        condition: service_healthy
+      pv-florence2:
+        condition: service_healthy
+      pv-rampp:
+        condition: service_healthy
+      pv-face-detector:
+        condition: service_healthy
+      pv-people:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8000:8000"
+    networks:
+      - default
+      - jellyfin
+      - ai-internal
+
+  pv-florence2:
+    build:
+      context: ./ai
+      dockerfile: Dockerfile
+    container_name: pv-florence2
+    restart: unless-stopped
+    environment:
+      PV_FLORENCE_MODEL_PATH: /models/florence2/openvino
+      PV_FLORENCE_DEVICE: ${PV_FLORENCE_DEVICE:-CPU}
+      HOME: /tmp
+      HF_HOME: /tmp/huggingface
+      OPENVINO_TELEMETRY_DISABLED: "1"
+    volumes:
+      - ${PV_FLORENCE_MODEL_ROOT:-./models/florence2}:/models/florence2:ro
+    devices:
+      - /dev/dri/renderD128:/dev/dri/renderD128
+    group_add:
+      - ${PV_RENDER_GID:-992}
+    networks:
+      - ai-internal
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g
+    mem_limit: 16g
+    cpus: 16
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - from urllib.request import urlopen; urlopen('http://127.0.0.1:8080/health', timeout=5)
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+
+  pv-rampp:
+    build:
+      context: ./rampp
+      dockerfile: Dockerfile
+    container_name: pv-rampp
+    restart: unless-stopped
+    environment:
+      PV_RAMPP_MODEL_PATH: /models/rampp/ram_plus_swin_large_14m.pth
+      PV_RAMPP_CHECKPOINT_SHA256: 497c178836ba66698ca226c7895317e6e800034be986452dbd2593298d50e87d
+      HOME: /tmp
+      HF_HOME: /models/rampp/huggingface
+      TRANSFORMERS_OFFLINE: "1"
+      HF_HUB_OFFLINE: "1"
+    volumes:
+      - ${PV_RAMPP_MODEL_ROOT:-./models/rampp}:/models/rampp:ro
+    networks:
+      - ai-internal
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g
+    mem_limit: 8g
+    cpus: 8
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8080/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+
+  pv-people:
+    build:
+      context: ./people
+      dockerfile: Dockerfile
+    container_name: pv-people
+    restart: unless-stopped
+    environment:
+      PV_PEOPLE_MODEL_ROOT: /models/people
+      HOME: /tmp
+      DEEPFACE_HOME: /tmp/deepface
+      PV_PEOPLE_CACHE_ROOT: /tmp/deepface
+      TRANSFORMERS_OFFLINE: "1"
+      HF_HUB_OFFLINE: "1"
+    volumes:
+      - ${PV_PEOPLE_MODEL_ROOT:-./models/people}:/models/people:ro
+    networks:
+      - ai-internal
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g
+    mem_limit: 4g
+    cpus: 4
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8080/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+
+  pv-face-detector:
+    build:
+      context: ./face_detector
+      dockerfile: Dockerfile
+    container_name: pv-face-detector
+    restart: unless-stopped
+    environment:
+      PV_FACE_DETECTOR_MODEL_ROOT: /models/face-detector
+      HOME: /tmp
+    volumes:
+      - ${PV_FACE_DETECTOR_MODEL_ROOT:-./models/face-detector}:/models/face-detector:ro
+      - ${PV_FACE_DETECTOR_MODEL_ROOT:-./models/face-detector}/face_detection_full_range_sparse.tflite:/usr/local/lib/python3.10/site-packages/mediapipe/modules/face_detection/face_detection_full_range_sparse.tflite:ro
+    networks:
+      - ai-internal
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m
+    mem_limit: 512m
+    cpus: 2
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8080/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  pv-database:
+    image: postgres:17-alpine
+    container_name: pv-database
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: pv_vault
+      POSTGRES_USER: pv_vault
+    volumes:
+      - pv-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  pv-postgres-data:
+  pv-metadata-data:
+  pv-federation-cache:
+
+networks:
+  ai-internal:
+    internal: true
+  jellyfin:
+    external: true
+    name: jellyfin_default

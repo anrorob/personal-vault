@@ -1,0 +1,79 @@
+name: Backend and architecture tests
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "backend/**"
+      - "src/**"
+      - "AGENTS.md"
+      - "docs/project-context/**"
+      - "ops/backup/**"
+      - "ops/jellyfin/**"
+      - ".github/workflows/backend-auth-tests.yml"
+  pull_request:
+    paths:
+      - "backend/**"
+      - "src/**"
+      - "AGENTS.md"
+      - "docs/project-context/**"
+      - "ops/backup/**"
+      - "ops/jellyfin/**"
+      - ".github/workflows/backend-auth-tests.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-auth-tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python 3.13
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: pv_vault_test
+          POSTGRES_USER: pv_vault_test
+          POSTGRES_PASSWORD: test-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pv_vault_test -d pv_vault_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      PV_TEST_DATABASE_URL: >-
+        postgresql://pv_vault_test:test-password@localhost:5432/pv_vault_test
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Run backend and architecture tests
+        run: python -m pytest -q

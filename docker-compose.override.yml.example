@@ -1,0 +1,45 @@
+services:
+  pv-frontend:
+    networks:
+      - default
+      - pv-public
+
+  pv-backend:
+    env_file:
+      - ./config/auth.env
+      - ./config/database.env
+    environment:
+      PV_MOVIES_PATH: /media/movies
+      PV_TV_SHOWS_PATH: /media/tv
+      PV_GALLERY_PATH: /media/gallery
+      PV_PERSONAL_VIDEOS_PATH: /media/personal-videos
+      PV_DOCUMENTS_PATH: /media/documents
+      PV_ARCHIVES_PATH: /media/archives
+      PV_MUSIC_PATH: /media/music
+      PV_LIBRARY_PATH: /media/library
+      PV_ARRIVAL_HALL_PATH: "/vault/Arrival Hall"
+      PV_QUARANTINE_PATH: /vault/Quarantine
+      PV_QUARANTINE_RETENTION_DAYS: "30"
+      PV_UPLOAD_MAX_BYTES: "107374182400"
+    volumes:
+      - "${PV_VAULT_ROOT:-./vault}/Theatre/Movies:/media/movies:ro"
+      - "${PV_VAULT_ROOT:-./vault}/Theatre/TV Shows:/media/tv:ro"
+      - "${PV_VAULT_ROOT:-./vault}/Gallery:/media/gallery:rw"
+      - "${PV_VAULT_ROOT:-./vault}/Home Videos:/media/personal-videos:rw"
+      - "${PV_VAULT_ROOT:-./vault}/Documents:/media/documents:rw"
+      - "${PV_VAULT_ROOT:-./vault}/Archives:/media/archives:rw"
+      - "${PV_VAULT_ROOT:-./vault}/Music:/media/music:rw"
+      - "${PV_VAULT_ROOT:-./vault}/Library:/media/library:rw"
+      - "${PV_VAULT_ROOT:-./vault}/Arrival Hall:/vault/Arrival Hall:rw"
+      - "${PV_VAULT_ROOT:-./vault}/Quarantine:/vault/Quarantine:rw"
+    networks:
+      - default
+      - pv-public
+
+  pv-database:
+    env_file:
+      - ./config/database.env
+
+networks:
+  pv-public:
+    external: true
