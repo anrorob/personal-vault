@@ -2,7 +2,12 @@ import { LoaderCircle } from "lucide-react";
 import type { ReactNode } from "react";
 
 export type ActionProgressState =
-  "idle" | "queued" | "running" | "completed" | "completed_with_warnings" | "failed";
+  | "idle"
+  | "queued"
+  | "running"
+  | "completed"
+  | "completed_with_warnings"
+  | "failed";
 
 export function ActionProgress({
   state,

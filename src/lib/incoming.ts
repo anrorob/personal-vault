@@ -211,7 +211,11 @@ export type AutopilotPolicy = {
   id: string;
   source: "arrival_hall";
   content_type:
-    "personal_photo" | "receipt" | "financial_document" | "general_document" | "artwork";
+    | "personal_photo"
+    | "receipt"
+    | "financial_document"
+    | "general_document"
+    | "artwork";
   destination: "Gallery" | "Documents" | "Ledger" | "Archives";
   threshold: number;
   max_items: number;

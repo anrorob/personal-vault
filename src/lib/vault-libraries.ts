@@ -1,5 +1,12 @@
 export type VaultFileKind =
-  "video" | "image" | "audio" | "pdf" | "document" | "archive" | "software" | "other";
+  | "video"
+  | "image"
+  | "audio"
+  | "pdf"
+  | "document"
+  | "archive"
+  | "software"
+  | "other";
 
 export type VaultLibraryFile = {
   id: string;
