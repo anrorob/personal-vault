@@ -6,7 +6,7 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-## [1.0.0] — Release candidate (not tagged)
+## [1.0.0] — 2026-08-29
 
 ### Summary
 
@@ -28,7 +28,5 @@ All notable changes to this project are documented here. The format follows
 
 - A public project baseline, release identity, and release workflow.
 
-## Release notes
-
 Published releases are represented by immutable Git tags in the form
-`vMAJOR.MINOR.PATCH`. The first public release is not tagged by this change.
+`vMAJOR.MINOR.PATCH`.

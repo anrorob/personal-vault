@@ -2,6 +2,10 @@
 
 Personal Vault is currently owner-controlled. External contributors are welcome to propose changes through pull requests; they do not receive automatic merge or write authority.
 
+By submitting a contribution, you license that contribution under the project's
+[`AGPL-3.0-or-later`](LICENSE) licence. Contributors retain their copyright;
+no contributor licence agreement or copyright assignment is required.
+
 ## Workflow
 
 - Fork the repository and use a focused branch.

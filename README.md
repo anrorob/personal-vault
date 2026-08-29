@@ -74,4 +74,4 @@ for exact-tag deployment, development-Vault separation, and rollback rules.
 
 ## Licence status
 
-**Licence selection is pending before public release.** This repository remains private and the code is not yet offered for public reuse under an open-source licence.
+Personal Vault is licensed under the [GNU Affero General Public License v3.0 or later](LICENSE) (`AGPL-3.0-or-later`).

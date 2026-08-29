@@ -1,6 +1,6 @@
 # Public release checklist
 
-- [ ] Select and add the final licence.
+- [x] Add the approved `AGPL-3.0-or-later` licence and public licence wording (PV-REL-006; 2026-08-29).
 - [x] Complete version identity and release/tag decisions.
 - [x] Define the public release workflow and support expectations.
 - [x] Establish version identity, branch workflow, and validation-only CI (PV-REL-003).
@@ -9,7 +9,7 @@
 - [x] Promote the approved development baseline to `main` and pass independent main CI (PV-REL-005; 2026-08-29).
 - [x] Identify the Personal Vault 1.0.0 release candidate; formal tag/release remains pending (PV-REL-005; 2026-08-29).
 - [ ] Normalise the tracked frontend route-tree generator output to avoid formatting-only churn across development environments.
-- [ ] Confirm vulnerability-reporting contact/method is available publicly.
+- [ ] Enable and confirm GitHub Private Vulnerability Reporting after the repository visibility switch (PV-REL-006).
 - [ ] Deploy and accept a separately configured development Vault.
 - [ ] Approve the repository visibility switch.
 - [ ] Decide and complete the v1.0.0 release/tag process.
