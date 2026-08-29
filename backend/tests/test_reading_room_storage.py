@@ -61,4 +61,4 @@ def test_backend_compose_uses_stable_library_mount() -> None:
 
     assert "PV_LIBRARY_PATH: /media/library" in compose
     assert "PV_LIBRARY_PATH: /media/library" in override
-    assert "/vault/Library:/media/library:rw" in override
+    assert "${PV_VAULT_ROOT:-./vault}/Library:/media/library:rw" in override

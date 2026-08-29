@@ -10528,7 +10528,6 @@ class PostgresVaultMasterStore:
                 cursor.execute("DELETE FROM vault_collection_share_grants")
                 cursor.execute("DELETE FROM vault_shared_collection_members")
                 cursor.execute("DELETE FROM vault_shared_collections")
-                cursor.execute("DELETE FROM vault_owner_correction_receipts")
                 cursor.execute("DELETE FROM vault_asset_history")
                 cursor.execute("DELETE FROM vault_asset_deletions")
                 cursor.execute("DELETE FROM vault_asset_relationships")
