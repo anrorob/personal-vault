@@ -68,6 +68,10 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the branch and pull-request model. Se
 
 `development` is the integration branch and `main` is kept releasable. The repository is owner-controlled: external contributors may propose pull requests but do not receive automatic merge or write authority. The remaining public-release gates are tracked in [the release checklist](docs/public-release-checklist.md).
 
+The public version lives in [`VERSION`](VERSION). CI validates but never deploys,
+promotes, or tags. See the [release workflow and version identity](docs/releases.md)
+for exact-tag deployment, development-Vault separation, and rollback rules.
+
 ## Licence status
 
 **Licence selection is pending before public release.** This repository remains private and the code is not yet offered for public reuse under an open-source licence.

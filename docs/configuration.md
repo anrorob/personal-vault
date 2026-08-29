@@ -12,6 +12,11 @@ Real configuration is intentionally untracked. Start with `.env.example`, `confi
 | `PV_FLORENCE_DEVICE`, `PV_RENDER_GID` | Optional Florence hardware settings used by Compose. |
 | `PV_MUSICBRAINZ_USER_AGENT` | Identifies optional MusicBrainz requests. |
 | `PV_STORAGE_SLOT_ROOTS_JSON` | Optional explicit resolver-root map for managed slots. |
+| `PV_ENVIRONMENT` | Build/deployment identity: `development`, `test`, or `production`. |
+| `PV_COMMIT` | Build/deployment commit: an immutable SHA in production. |
+
+The release version comes only from the repository-root `VERSION` file; do not
+set it through environment configuration.
 
 ## Runtime authentication and database files
 

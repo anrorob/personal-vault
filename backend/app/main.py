@@ -11,6 +11,7 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.auth import get_authentication_store, get_enrolment_store, get_passkey_store, router as auth_router
+from app.build_info import build_info, load_project_version
 from app.auth_store import AuthenticationStore, PostgresAuthenticationStore
 from app.passkeys import PostgresPasskeyStore
 from app.config import get_admin_username, get_database_conninfo, get_webauthn_origin
@@ -637,7 +638,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Personal Vault API",
-    version="0.1.0",
+    version=load_project_version(),
     lifespan=lifespan,
 )
 
@@ -700,4 +701,5 @@ def health_check(
         "status": "ok",
         "service": "pv-backend",
         "database": "ok",
+        **build_info(),
     }

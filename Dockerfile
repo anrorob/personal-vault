@@ -1,5 +1,10 @@
 FROM oven/bun:1 AS build
 
+ARG PV_ENVIRONMENT=development
+ARG PV_COMMIT=unknown
+ENV PV_ENVIRONMENT=${PV_ENVIRONMENT}
+ENV PV_COMMIT=${PV_COMMIT}
+
 WORKDIR /app
 
 COPY package.json bun.lock ./

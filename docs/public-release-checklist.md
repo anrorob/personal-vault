@@ -1,8 +1,8 @@
 # Public release checklist
 
 - [ ] Select and add the final licence.
-- [ ] Complete version identity and release/tag decisions.
-- [ ] Define the public release workflow and support expectations.
+- [x] Complete version identity and release/tag decisions.
+- [x] Define the public release workflow and support expectations.
 - [ ] Validate a clean checkout using the documented development path.
 - [ ] Re-run secret/privacy scans on the final tree and intended release artifacts.
 - [ ] Confirm vulnerability-reporting contact/method is available publicly.

@@ -29,6 +29,9 @@ def test_health_reports_database_ready(client: TestClient) -> None:
         "status": "ok",
         "service": "pv-backend",
         "database": "ok",
+        "version": "1.0.0",
+        "commit": "test",
+        "environment": "test",
     }
 
 

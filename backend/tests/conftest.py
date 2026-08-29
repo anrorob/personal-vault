@@ -46,6 +46,8 @@ def client(
     monkeypatch.setenv("PV_WEBAUTHN_RP_ID", "testserver")
     monkeypatch.setenv("PV_WEBAUTHN_ORIGIN", "https://testserver")
     monkeypatch.setenv("PV_VAULT_MASTER_WORKER_ENABLED", "false")
+    monkeypatch.setenv("PV_ENVIRONMENT", "test")
+    monkeypatch.setenv("PV_COMMIT", "test")
 
     app.dependency_overrides[get_authentication_store] = (
         lambda: authentication_store

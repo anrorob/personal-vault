@@ -17,6 +17,11 @@ Personal Vault currently exposes application source and a production-shaped Comp
 3. Replace every placeholder. Passkeys require a real HTTPS hostname: `PV_WEBAUTHN_RP_ID` and the hostname in `PV_WEBAUTHN_ORIGIN` must match exactly.
 4. Copy `docker-compose.override.yml.example` to the ignored `docker-compose.override.yml` and adjust the logical Vault-root mapping for an isolated development tree.
 
+Set `PV_ENVIRONMENT=development` and a non-production `PV_COMMIT` marker in
+the root `.env`. The release version is read from [`VERSION`](../VERSION), not
+from an environment variable. See [releases](releases.md) before configuring a
+development Vault or any deployment target.
+
 The checked-in override expects external `pv-public` and `jellyfin_default` Docker networks. Create/use isolated equivalents deliberately, or adapt a local override; the repository does not yet supply a portable network/bootstrap installer.
 
 ## Core application requirements
@@ -49,4 +54,4 @@ bun run lint
 bun run build
 ```
 
-The GitHub Actions workflow runs the backend suite with a disposable PostgreSQL service on pushes to `main` that affect its configured paths.
+The GitHub Actions workflow runs backend tests with a disposable PostgreSQL service, plus frontend lint and build checks, on feature, development, and main integration paths. It does not deploy or promote any environment.

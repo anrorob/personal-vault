@@ -1,38 +1,27 @@
-name: Backend and architecture tests
+name: Continuous integration
 
 on:
   push:
     branches:
       - main
-    paths:
-      - "backend/**"
-      - "src/**"
-      - "AGENTS.md"
-      - "docs/project-context/**"
-      - "ops/backup/**"
-      - "ops/jellyfin/**"
-      - ".github/workflows/backend-auth-tests.yml"
+      - development
+      - "feature/**"
   pull_request:
-    paths:
-      - "backend/**"
-      - "src/**"
-      - "AGENTS.md"
-      - "docs/project-context/**"
-      - "ops/backup/**"
-      - "ops/jellyfin/**"
-      - ".github/workflows/backend-auth-tests.yml"
+    branches:
+      - main
+      - development
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: backend-auth-tests-${{ github.workflow }}-${{ github.ref }}
+  group: continuous-integration-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  test:
-    name: Python 3.13
+  backend:
+    name: Backend / Python 3.13
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -54,6 +43,8 @@ jobs:
     env:
       PV_TEST_DATABASE_URL: >-
         postgresql://pv_vault_test:test-password@localhost:5432/pv_vault_test
+      PV_ENVIRONMENT: test
+      PV_COMMIT: test
 
     defaults:
       run:
@@ -77,3 +68,22 @@ jobs:
 
       - name: Run backend and architecture tests
         run: python -m pytest -q
+
+  frontend:
+    name: Frontend / Bun
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PV_ENVIRONMENT: test
+      PV_COMMIT: test
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Lint frontend
+        run: bun run lint
+      - name: Build frontend
+        run: bun run build
