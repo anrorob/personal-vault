@@ -9,58 +9,53 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
-import { Route as IndexRouteImport } from './routes/index'
-import { Route as AppRouteImport } from './routes/app'
-import { Route as ChangePasswordRouteImport } from './routes/change-password'
 import { Route as LoginRouteImport } from './routes/login'
+import { Route as ChangePasswordRouteImport } from './routes/change-password'
+import { Route as AppRouteImport } from './routes/app'
+import { Route as IndexRouteImport } from './routes/index'
 import { Route as AppIndexRouteImport } from './routes/app.index'
-import { Route as AppAddRouteImport } from './routes/app.add'
-import { Route as AppArchivesRouteImport } from './routes/app.archives'
-import { Route as AppArrivalHallRouteImport } from './routes/app.arrival-hall'
-import { Route as AppCommonsRouteImport } from './routes/app.commons'
-import { Route as AppDocumentsRouteImport } from './routes/app.documents'
-import { Route as AppEmailRouteImport } from './routes/app.email'
-import { Route as AppFilesISharedRouteImport } from './routes/app.files-i-shared'
-import { Route as AppGalleryRouteImport } from './routes/app.gallery'
-import { Route as AppIncomingRouteImport } from './routes/app.incoming'
-import { Route as AppLedgerRouteImport } from './routes/app.ledger'
-import { Route as AppMoviesRouteImport } from './routes/app.movies'
-import { Route as AppMusicRouteImport } from './routes/app.music'
-import { Route as AppPeopleRouteImport } from './routes/app.people'
-import { Route as AppPersonalVideosRouteImport } from './routes/app.personal-videos'
-import { Route as AppReadingRoomRouteImport } from './routes/app.reading-room'
-import { Route as AppRoutingMemoryRouteImport } from './routes/app.routing-memory'
-import { Route as AppSecurityRouteImport } from './routes/app.security'
-import { Route as AppVaultControlRouteImport } from './routes/app.vault-control'
-import { Route as EnrolTokenRouteImport } from './routes/enrol.$token'
 import { Route as RecoverTokenRouteImport } from './routes/recover.$token'
-import { Route as AppGalleryIndexRouteImport } from './routes/app.gallery.index'
-import { Route as AppGalleryPhotoIdRouteImport } from './routes/app.gallery.$photoId'
-import { Route as AppMoviesIndexRouteImport } from './routes/app.movies.index'
-import { Route as AppMoviesMovieIdRouteImport } from './routes/app.movies.$movieId'
-import { Route as AppMoviesTvShowsRouteImport } from './routes/app.movies.tv-shows'
-import { Route as AppPeopleIndexRouteImport } from './routes/app.people.index'
-import { Route as AppPeoplePersonIdRouteImport } from './routes/app.people.$personId'
+import { Route as EnrolTokenRouteImport } from './routes/enrol.$token'
+import { Route as AppVaultControlRouteImport } from './routes/app.vault-control'
+import { Route as AppSecurityRouteImport } from './routes/app.security'
+import { Route as AppRoutingMemoryRouteImport } from './routes/app.routing-memory'
+import { Route as AppReadingRoomRouteImport } from './routes/app.reading-room'
+import { Route as AppPersonalVideosRouteImport } from './routes/app.personal-videos'
+import { Route as AppPeopleRouteImport } from './routes/app.people'
+import { Route as AppMusicRouteImport } from './routes/app.music'
+import { Route as AppMoviesRouteImport } from './routes/app.movies'
+import { Route as AppLedgerRouteImport } from './routes/app.ledger'
+import { Route as AppIncomingRouteImport } from './routes/app.incoming'
+import { Route as AppGalleryRouteImport } from './routes/app.gallery'
+import { Route as AppFilesISharedRouteImport } from './routes/app.files-i-shared'
+import { Route as AppEmailRouteImport } from './routes/app.email'
+import { Route as AppDocumentsRouteImport } from './routes/app.documents'
+import { Route as AppCommonsRouteImport } from './routes/app.commons'
+import { Route as AppArrivalHallRouteImport } from './routes/app.arrival-hall'
+import { Route as AppArchivesRouteImport } from './routes/app.archives'
+import { Route as AppAddRouteImport } from './routes/app.add'
 import { Route as AppVaultControlIndexRouteImport } from './routes/app.vault-control.index'
-import { Route as AppVaultControlFederationRouteImport } from './routes/app.vault-control.federation'
-import { Route as AppVaultControlIntakeRouteImport } from './routes/app.vault-control.intake'
-import { Route as AppVaultControlOverviewRouteImport } from './routes/app.vault-control.overview'
-import { Route as AppVaultControlRecoveryRouteImport } from './routes/app.vault-control.recovery'
-import { Route as AppVaultControlServicesRouteImport } from './routes/app.vault-control.services'
-import { Route as AppVaultControlStorageRouteImport } from './routes/app.vault-control.storage'
+import { Route as AppPeopleIndexRouteImport } from './routes/app.people.index'
+import { Route as AppMoviesIndexRouteImport } from './routes/app.movies.index'
+import { Route as AppGalleryIndexRouteImport } from './routes/app.gallery.index'
 import { Route as AppVaultControlUsersRouteImport } from './routes/app.vault-control.users'
+import { Route as AppVaultControlStorageRouteImport } from './routes/app.vault-control.storage'
+import { Route as AppVaultControlServicesRouteImport } from './routes/app.vault-control.services'
+import { Route as AppVaultControlRecoveryRouteImport } from './routes/app.vault-control.recovery'
+import { Route as AppVaultControlOverviewRouteImport } from './routes/app.vault-control.overview'
+import { Route as AppVaultControlIntakeRouteImport } from './routes/app.vault-control.intake'
+import { Route as AppVaultControlFederationRouteImport } from './routes/app.vault-control.federation'
+import { Route as AppPeoplePersonIdRouteImport } from './routes/app.people.$personId'
+import { Route as AppMoviesTvShowsRouteImport } from './routes/app.movies.tv-shows'
+import { Route as AppMoviesMovieIdRouteImport } from './routes/app.movies.$movieId'
+import { Route as AppGalleryPhotoIdRouteImport } from './routes/app.gallery.$photoId'
 import { Route as AppMoviesTvShowsIndexRouteImport } from './routes/app.movies.tv-shows.index'
-import { Route as AppMoviesTvShowsShowIdRouteImport } from './routes/app.movies.tv-shows.$showId'
 import { Route as AppReadingRoomPublicationIdReadRouteImport } from './routes/app.reading-room.$publicationId.read'
+import { Route as AppMoviesTvShowsShowIdRouteImport } from './routes/app.movies.tv-shows.$showId'
 
-const IndexRoute = IndexRouteImport.update({
-  id: '/',
-  path: '/',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const AppRoute = AppRouteImport.update({
-  id: '/app',
-  path: '/app',
+const LoginRoute = LoginRouteImport.update({
+  id: '/login',
+  path: '/login',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ChangePasswordRoute = ChangePasswordRouteImport.update({
@@ -68,9 +63,14 @@ const ChangePasswordRoute = ChangePasswordRouteImport.update({
   path: '/change-password',
   getParentRoute: () => rootRouteImport,
 } as any)
-const LoginRoute = LoginRouteImport.update({
-  id: '/login',
-  path: '/login',
+const AppRoute = AppRouteImport.update({
+  id: '/app',
+  path: '/app',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const IndexRoute = IndexRouteImport.update({
+  id: '/',
+  path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
 const AppIndexRoute = AppIndexRouteImport.update({
@@ -78,84 +78,19 @@ const AppIndexRoute = AppIndexRouteImport.update({
   path: '/',
   getParentRoute: () => AppRoute,
 } as any)
-const AppAddRoute = AppAddRouteImport.update({
-  id: '/add',
-  path: '/add',
-  getParentRoute: () => AppRoute,
+const RecoverTokenRoute = RecoverTokenRouteImport.update({
+  id: '/recover/$token',
+  path: '/recover/$token',
+  getParentRoute: () => rootRouteImport,
 } as any)
-const AppArchivesRoute = AppArchivesRouteImport.update({
-  id: '/archives',
-  path: '/archives',
-  getParentRoute: () => AppRoute,
+const EnrolTokenRoute = EnrolTokenRouteImport.update({
+  id: '/enrol/$token',
+  path: '/enrol/$token',
+  getParentRoute: () => rootRouteImport,
 } as any)
-const AppArrivalHallRoute = AppArrivalHallRouteImport.update({
-  id: '/arrival-hall',
-  path: '/arrival-hall',
-  getParentRoute: () => AppRoute,
-} as any)
-const AppCommonsRoute = AppCommonsRouteImport.update({
-  id: '/commons',
-  path: '/commons',
-  getParentRoute: () => AppRoute,
-} as any)
-const AppDocumentsRoute = AppDocumentsRouteImport.update({
-  id: '/documents',
-  path: '/documents',
-  getParentRoute: () => AppRoute,
-} as any)
-const AppEmailRoute = AppEmailRouteImport.update({
-  id: '/email',
-  path: '/email',
-  getParentRoute: () => AppRoute,
-} as any)
-const AppFilesISharedRoute = AppFilesISharedRouteImport.update({
-  id: '/files-i-shared',
-  path: '/files-i-shared',
-  getParentRoute: () => AppRoute,
-} as any)
-const AppGalleryRoute = AppGalleryRouteImport.update({
-  id: '/gallery',
-  path: '/gallery',
-  getParentRoute: () => AppRoute,
-} as any)
-const AppIncomingRoute = AppIncomingRouteImport.update({
-  id: '/incoming',
-  path: '/incoming',
-  getParentRoute: () => AppRoute,
-} as any)
-const AppLedgerRoute = AppLedgerRouteImport.update({
-  id: '/ledger',
-  path: '/ledger',
-  getParentRoute: () => AppRoute,
-} as any)
-const AppMoviesRoute = AppMoviesRouteImport.update({
-  id: '/movies',
-  path: '/movies',
-  getParentRoute: () => AppRoute,
-} as any)
-const AppMusicRoute = AppMusicRouteImport.update({
-  id: '/music',
-  path: '/music',
-  getParentRoute: () => AppRoute,
-} as any)
-const AppPeopleRoute = AppPeopleRouteImport.update({
-  id: '/people',
-  path: '/people',
-  getParentRoute: () => AppRoute,
-} as any)
-const AppPersonalVideosRoute = AppPersonalVideosRouteImport.update({
-  id: '/personal-videos',
-  path: '/personal-videos',
-  getParentRoute: () => AppRoute,
-} as any)
-const AppReadingRoomRoute = AppReadingRoomRouteImport.update({
-  id: '/reading-room',
-  path: '/reading-room',
-  getParentRoute: () => AppRoute,
-} as any)
-const AppRoutingMemoryRoute = AppRoutingMemoryRouteImport.update({
-  id: '/routing-memory',
-  path: '/routing-memory',
+const AppVaultControlRoute = AppVaultControlRouteImport.update({
+  id: '/vault-control',
+  path: '/vault-control',
   getParentRoute: () => AppRoute,
 } as any)
 const AppSecurityRoute = AppSecurityRouteImport.update({
@@ -163,59 +98,134 @@ const AppSecurityRoute = AppSecurityRouteImport.update({
   path: '/security',
   getParentRoute: () => AppRoute,
 } as any)
-const AppVaultControlRoute = AppVaultControlRouteImport.update({
-  id: '/vault-control',
-  path: '/vault-control',
+const AppRoutingMemoryRoute = AppRoutingMemoryRouteImport.update({
+  id: '/routing-memory',
+  path: '/routing-memory',
   getParentRoute: () => AppRoute,
 } as any)
-const EnrolTokenRoute = EnrolTokenRouteImport.update({
-  id: '/enrol/$token',
-  path: '/enrol/$token',
-  getParentRoute: () => rootRouteImport,
+const AppReadingRoomRoute = AppReadingRoomRouteImport.update({
+  id: '/reading-room',
+  path: '/reading-room',
+  getParentRoute: () => AppRoute,
 } as any)
-const RecoverTokenRoute = RecoverTokenRouteImport.update({
-  id: '/recover/$token',
-  path: '/recover/$token',
-  getParentRoute: () => rootRouteImport,
+const AppPersonalVideosRoute = AppPersonalVideosRouteImport.update({
+  id: '/personal-videos',
+  path: '/personal-videos',
+  getParentRoute: () => AppRoute,
 } as any)
-const AppGalleryIndexRoute = AppGalleryIndexRouteImport.update({
+const AppPeopleRoute = AppPeopleRouteImport.update({
+  id: '/people',
+  path: '/people',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppMusicRoute = AppMusicRouteImport.update({
+  id: '/music',
+  path: '/music',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppMoviesRoute = AppMoviesRouteImport.update({
+  id: '/movies',
+  path: '/movies',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppLedgerRoute = AppLedgerRouteImport.update({
+  id: '/ledger',
+  path: '/ledger',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppIncomingRoute = AppIncomingRouteImport.update({
+  id: '/incoming',
+  path: '/incoming',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppGalleryRoute = AppGalleryRouteImport.update({
+  id: '/gallery',
+  path: '/gallery',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppFilesISharedRoute = AppFilesISharedRouteImport.update({
+  id: '/files-i-shared',
+  path: '/files-i-shared',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppEmailRoute = AppEmailRouteImport.update({
+  id: '/email',
+  path: '/email',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppDocumentsRoute = AppDocumentsRouteImport.update({
+  id: '/documents',
+  path: '/documents',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppCommonsRoute = AppCommonsRouteImport.update({
+  id: '/commons',
+  path: '/commons',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppArrivalHallRoute = AppArrivalHallRouteImport.update({
+  id: '/arrival-hall',
+  path: '/arrival-hall',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppArchivesRoute = AppArchivesRouteImport.update({
+  id: '/archives',
+  path: '/archives',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppAddRoute = AppAddRouteImport.update({
+  id: '/add',
+  path: '/add',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppVaultControlIndexRoute = AppVaultControlIndexRouteImport.update({
   id: '/',
   path: '/',
-  getParentRoute: () => AppGalleryRoute,
-} as any)
-const AppGalleryPhotoIdRoute = AppGalleryPhotoIdRouteImport.update({
-  id: '/$photoId',
-  path: '/$photoId',
-  getParentRoute: () => AppGalleryRoute,
-} as any)
-const AppMoviesIndexRoute = AppMoviesIndexRouteImport.update({
-  id: '/',
-  path: '/',
-  getParentRoute: () => AppMoviesRoute,
-} as any)
-const AppMoviesMovieIdRoute = AppMoviesMovieIdRouteImport.update({
-  id: '/$movieId',
-  path: '/$movieId',
-  getParentRoute: () => AppMoviesRoute,
-} as any)
-const AppMoviesTvShowsRoute = AppMoviesTvShowsRouteImport.update({
-  id: '/tv-shows',
-  path: '/tv-shows',
-  getParentRoute: () => AppMoviesRoute,
+  getParentRoute: () => AppVaultControlRoute,
 } as any)
 const AppPeopleIndexRoute = AppPeopleIndexRouteImport.update({
   id: '/',
   path: '/',
   getParentRoute: () => AppPeopleRoute,
 } as any)
-const AppPeoplePersonIdRoute = AppPeoplePersonIdRouteImport.update({
-  id: '/$personId',
-  path: '/$personId',
-  getParentRoute: () => AppPeopleRoute,
-} as any)
-const AppVaultControlIndexRoute = AppVaultControlIndexRouteImport.update({
+const AppMoviesIndexRoute = AppMoviesIndexRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => AppMoviesRoute,
+} as any)
+const AppGalleryIndexRoute = AppGalleryIndexRouteImport.update({
+  id: '/',
+  path: '/',
+  getParentRoute: () => AppGalleryRoute,
+} as any)
+const AppVaultControlUsersRoute = AppVaultControlUsersRouteImport.update({
+  id: '/users',
+  path: '/users',
+  getParentRoute: () => AppVaultControlRoute,
+} as any)
+const AppVaultControlStorageRoute = AppVaultControlStorageRouteImport.update({
+  id: '/storage',
+  path: '/storage',
+  getParentRoute: () => AppVaultControlRoute,
+} as any)
+const AppVaultControlServicesRoute = AppVaultControlServicesRouteImport.update({
+  id: '/services',
+  path: '/services',
+  getParentRoute: () => AppVaultControlRoute,
+} as any)
+const AppVaultControlRecoveryRoute = AppVaultControlRecoveryRouteImport.update({
+  id: '/recovery',
+  path: '/recovery',
+  getParentRoute: () => AppVaultControlRoute,
+} as any)
+const AppVaultControlOverviewRoute = AppVaultControlOverviewRouteImport.update({
+  id: '/overview',
+  path: '/overview',
+  getParentRoute: () => AppVaultControlRoute,
+} as any)
+const AppVaultControlIntakeRoute = AppVaultControlIntakeRouteImport.update({
+  id: '/intake',
+  path: '/intake',
   getParentRoute: () => AppVaultControlRoute,
 } as any)
 const AppVaultControlFederationRoute =
@@ -224,44 +234,29 @@ const AppVaultControlFederationRoute =
     path: '/federation',
     getParentRoute: () => AppVaultControlRoute,
   } as any)
-const AppVaultControlIntakeRoute = AppVaultControlIntakeRouteImport.update({
-  id: '/intake',
-  path: '/intake',
-  getParentRoute: () => AppVaultControlRoute,
+const AppPeoplePersonIdRoute = AppPeoplePersonIdRouteImport.update({
+  id: '/$personId',
+  path: '/$personId',
+  getParentRoute: () => AppPeopleRoute,
 } as any)
-const AppVaultControlOverviewRoute = AppVaultControlOverviewRouteImport.update({
-  id: '/overview',
-  path: '/overview',
-  getParentRoute: () => AppVaultControlRoute,
+const AppMoviesTvShowsRoute = AppMoviesTvShowsRouteImport.update({
+  id: '/tv-shows',
+  path: '/tv-shows',
+  getParentRoute: () => AppMoviesRoute,
 } as any)
-const AppVaultControlRecoveryRoute = AppVaultControlRecoveryRouteImport.update({
-  id: '/recovery',
-  path: '/recovery',
-  getParentRoute: () => AppVaultControlRoute,
+const AppMoviesMovieIdRoute = AppMoviesMovieIdRouteImport.update({
+  id: '/$movieId',
+  path: '/$movieId',
+  getParentRoute: () => AppMoviesRoute,
 } as any)
-const AppVaultControlServicesRoute = AppVaultControlServicesRouteImport.update({
-  id: '/services',
-  path: '/services',
-  getParentRoute: () => AppVaultControlRoute,
-} as any)
-const AppVaultControlStorageRoute = AppVaultControlStorageRouteImport.update({
-  id: '/storage',
-  path: '/storage',
-  getParentRoute: () => AppVaultControlRoute,
-} as any)
-const AppVaultControlUsersRoute = AppVaultControlUsersRouteImport.update({
-  id: '/users',
-  path: '/users',
-  getParentRoute: () => AppVaultControlRoute,
+const AppGalleryPhotoIdRoute = AppGalleryPhotoIdRouteImport.update({
+  id: '/$photoId',
+  path: '/$photoId',
+  getParentRoute: () => AppGalleryRoute,
 } as any)
 const AppMoviesTvShowsIndexRoute = AppMoviesTvShowsIndexRouteImport.update({
   id: '/',
   path: '/',
-  getParentRoute: () => AppMoviesTvShowsRoute,
-} as any)
-const AppMoviesTvShowsShowIdRoute = AppMoviesTvShowsShowIdRouteImport.update({
-  id: '/$showId',
-  path: '/$showId',
   getParentRoute: () => AppMoviesTvShowsRoute,
 } as any)
 const AppReadingRoomPublicationIdReadRoute =
@@ -270,6 +265,11 @@ const AppReadingRoomPublicationIdReadRoute =
     path: '/$publicationId/read',
     getParentRoute: () => AppReadingRoomRoute,
   } as any)
+const AppMoviesTvShowsShowIdRoute = AppMoviesTvShowsShowIdRouteImport.update({
+  id: '/$showId',
+  path: '/$showId',
+  getParentRoute: () => AppMoviesTvShowsRoute,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -544,18 +544,11 @@ export interface RootRouteChildren {
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    '/': {
-      id: '/'
-      path: '/'
-      fullPath: '/'
-      preLoaderRoute: typeof IndexRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/app': {
-      id: '/app'
-      path: '/app'
-      fullPath: '/app'
-      preLoaderRoute: typeof AppRouteImport
+    '/login': {
+      id: '/login'
+      path: '/login'
+      fullPath: '/login'
+      preLoaderRoute: typeof LoginRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/change-password': {
@@ -565,11 +558,18 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ChangePasswordRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/login': {
-      id: '/login'
-      path: '/login'
-      fullPath: '/login'
-      preLoaderRoute: typeof LoginRouteImport
+    '/app': {
+      id: '/app'
+      path: '/app'
+      fullPath: '/app'
+      preLoaderRoute: typeof AppRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/': {
+      id: '/'
+      path: '/'
+      fullPath: '/'
+      preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/app/': {
@@ -579,116 +579,25 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppIndexRouteImport
       parentRoute: typeof AppRoute
     }
-    '/app/add': {
-      id: '/app/add'
-      path: '/add'
-      fullPath: '/app/add'
-      preLoaderRoute: typeof AppAddRouteImport
-      parentRoute: typeof AppRoute
+    '/recover/$token': {
+      id: '/recover/$token'
+      path: '/recover/$token'
+      fullPath: '/recover/$token'
+      preLoaderRoute: typeof RecoverTokenRouteImport
+      parentRoute: typeof rootRouteImport
     }
-    '/app/archives': {
-      id: '/app/archives'
-      path: '/archives'
-      fullPath: '/app/archives'
-      preLoaderRoute: typeof AppArchivesRouteImport
-      parentRoute: typeof AppRoute
+    '/enrol/$token': {
+      id: '/enrol/$token'
+      path: '/enrol/$token'
+      fullPath: '/enrol/$token'
+      preLoaderRoute: typeof EnrolTokenRouteImport
+      parentRoute: typeof rootRouteImport
     }
-    '/app/arrival-hall': {
-      id: '/app/arrival-hall'
-      path: '/arrival-hall'
-      fullPath: '/app/arrival-hall'
-      preLoaderRoute: typeof AppArrivalHallRouteImport
-      parentRoute: typeof AppRoute
-    }
-    '/app/commons': {
-      id: '/app/commons'
-      path: '/commons'
-      fullPath: '/app/commons'
-      preLoaderRoute: typeof AppCommonsRouteImport
-      parentRoute: typeof AppRoute
-    }
-    '/app/documents': {
-      id: '/app/documents'
-      path: '/documents'
-      fullPath: '/app/documents'
-      preLoaderRoute: typeof AppDocumentsRouteImport
-      parentRoute: typeof AppRoute
-    }
-    '/app/email': {
-      id: '/app/email'
-      path: '/email'
-      fullPath: '/app/email'
-      preLoaderRoute: typeof AppEmailRouteImport
-      parentRoute: typeof AppRoute
-    }
-    '/app/files-i-shared': {
-      id: '/app/files-i-shared'
-      path: '/files-i-shared'
-      fullPath: '/app/files-i-shared'
-      preLoaderRoute: typeof AppFilesISharedRouteImport
-      parentRoute: typeof AppRoute
-    }
-    '/app/gallery': {
-      id: '/app/gallery'
-      path: '/gallery'
-      fullPath: '/app/gallery'
-      preLoaderRoute: typeof AppGalleryRouteImport
-      parentRoute: typeof AppRoute
-    }
-    '/app/incoming': {
-      id: '/app/incoming'
-      path: '/incoming'
-      fullPath: '/app/incoming'
-      preLoaderRoute: typeof AppIncomingRouteImport
-      parentRoute: typeof AppRoute
-    }
-    '/app/ledger': {
-      id: '/app/ledger'
-      path: '/ledger'
-      fullPath: '/app/ledger'
-      preLoaderRoute: typeof AppLedgerRouteImport
-      parentRoute: typeof AppRoute
-    }
-    '/app/movies': {
-      id: '/app/movies'
-      path: '/movies'
-      fullPath: '/app/movies'
-      preLoaderRoute: typeof AppMoviesRouteImport
-      parentRoute: typeof AppRoute
-    }
-    '/app/music': {
-      id: '/app/music'
-      path: '/music'
-      fullPath: '/app/music'
-      preLoaderRoute: typeof AppMusicRouteImport
-      parentRoute: typeof AppRoute
-    }
-    '/app/people': {
-      id: '/app/people'
-      path: '/people'
-      fullPath: '/app/people'
-      preLoaderRoute: typeof AppPeopleRouteImport
-      parentRoute: typeof AppRoute
-    }
-    '/app/personal-videos': {
-      id: '/app/personal-videos'
-      path: '/personal-videos'
-      fullPath: '/app/personal-videos'
-      preLoaderRoute: typeof AppPersonalVideosRouteImport
-      parentRoute: typeof AppRoute
-    }
-    '/app/reading-room': {
-      id: '/app/reading-room'
-      path: '/reading-room'
-      fullPath: '/app/reading-room'
-      preLoaderRoute: typeof AppReadingRoomRouteImport
-      parentRoute: typeof AppRoute
-    }
-    '/app/routing-memory': {
-      id: '/app/routing-memory'
-      path: '/routing-memory'
-      fullPath: '/app/routing-memory'
-      preLoaderRoute: typeof AppRoutingMemoryRouteImport
+    '/app/vault-control': {
+      id: '/app/vault-control'
+      path: '/vault-control'
+      fullPath: '/app/vault-control'
+      preLoaderRoute: typeof AppVaultControlRouteImport
       parentRoute: typeof AppRoute
     }
     '/app/security': {
@@ -698,75 +607,117 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppSecurityRouteImport
       parentRoute: typeof AppRoute
     }
-    '/app/vault-control': {
-      id: '/app/vault-control'
-      path: '/vault-control'
-      fullPath: '/app/vault-control'
-      preLoaderRoute: typeof AppVaultControlRouteImport
+    '/app/routing-memory': {
+      id: '/app/routing-memory'
+      path: '/routing-memory'
+      fullPath: '/app/routing-memory'
+      preLoaderRoute: typeof AppRoutingMemoryRouteImport
       parentRoute: typeof AppRoute
     }
-    '/enrol/$token': {
-      id: '/enrol/$token'
-      path: '/enrol/$token'
-      fullPath: '/enrol/$token'
-      preLoaderRoute: typeof EnrolTokenRouteImport
-      parentRoute: typeof rootRouteImport
+    '/app/reading-room': {
+      id: '/app/reading-room'
+      path: '/reading-room'
+      fullPath: '/app/reading-room'
+      preLoaderRoute: typeof AppReadingRoomRouteImport
+      parentRoute: typeof AppRoute
     }
-    '/recover/$token': {
-      id: '/recover/$token'
-      path: '/recover/$token'
-      fullPath: '/recover/$token'
-      preLoaderRoute: typeof RecoverTokenRouteImport
-      parentRoute: typeof rootRouteImport
+    '/app/personal-videos': {
+      id: '/app/personal-videos'
+      path: '/personal-videos'
+      fullPath: '/app/personal-videos'
+      preLoaderRoute: typeof AppPersonalVideosRouteImport
+      parentRoute: typeof AppRoute
     }
-    '/app/gallery/': {
-      id: '/app/gallery/'
-      path: '/'
-      fullPath: '/app/gallery/'
-      preLoaderRoute: typeof AppGalleryIndexRouteImport
-      parentRoute: typeof AppGalleryRoute
+    '/app/people': {
+      id: '/app/people'
+      path: '/people'
+      fullPath: '/app/people'
+      preLoaderRoute: typeof AppPeopleRouteImport
+      parentRoute: typeof AppRoute
     }
-    '/app/gallery/$photoId': {
-      id: '/app/gallery/$photoId'
-      path: '/$photoId'
-      fullPath: '/app/gallery/$photoId'
-      preLoaderRoute: typeof AppGalleryPhotoIdRouteImport
-      parentRoute: typeof AppGalleryRoute
+    '/app/music': {
+      id: '/app/music'
+      path: '/music'
+      fullPath: '/app/music'
+      preLoaderRoute: typeof AppMusicRouteImport
+      parentRoute: typeof AppRoute
     }
-    '/app/movies/': {
-      id: '/app/movies/'
-      path: '/'
-      fullPath: '/app/movies/'
-      preLoaderRoute: typeof AppMoviesIndexRouteImport
-      parentRoute: typeof AppMoviesRoute
+    '/app/movies': {
+      id: '/app/movies'
+      path: '/movies'
+      fullPath: '/app/movies'
+      preLoaderRoute: typeof AppMoviesRouteImport
+      parentRoute: typeof AppRoute
     }
-    '/app/movies/$movieId': {
-      id: '/app/movies/$movieId'
-      path: '/$movieId'
-      fullPath: '/app/movies/$movieId'
-      preLoaderRoute: typeof AppMoviesMovieIdRouteImport
-      parentRoute: typeof AppMoviesRoute
+    '/app/ledger': {
+      id: '/app/ledger'
+      path: '/ledger'
+      fullPath: '/app/ledger'
+      preLoaderRoute: typeof AppLedgerRouteImport
+      parentRoute: typeof AppRoute
     }
-    '/app/movies/tv-shows': {
-      id: '/app/movies/tv-shows'
-      path: '/tv-shows'
-      fullPath: '/app/movies/tv-shows'
-      preLoaderRoute: typeof AppMoviesTvShowsRouteImport
-      parentRoute: typeof AppMoviesRoute
+    '/app/incoming': {
+      id: '/app/incoming'
+      path: '/incoming'
+      fullPath: '/app/incoming'
+      preLoaderRoute: typeof AppIncomingRouteImport
+      parentRoute: typeof AppRoute
     }
-    '/app/people/': {
-      id: '/app/people/'
-      path: '/'
-      fullPath: '/app/people/'
-      preLoaderRoute: typeof AppPeopleIndexRouteImport
-      parentRoute: typeof AppPeopleRoute
+    '/app/gallery': {
+      id: '/app/gallery'
+      path: '/gallery'
+      fullPath: '/app/gallery'
+      preLoaderRoute: typeof AppGalleryRouteImport
+      parentRoute: typeof AppRoute
     }
-    '/app/people/$personId': {
-      id: '/app/people/$personId'
-      path: '/$personId'
-      fullPath: '/app/people/$personId'
-      preLoaderRoute: typeof AppPeoplePersonIdRouteImport
-      parentRoute: typeof AppPeopleRoute
+    '/app/files-i-shared': {
+      id: '/app/files-i-shared'
+      path: '/files-i-shared'
+      fullPath: '/app/files-i-shared'
+      preLoaderRoute: typeof AppFilesISharedRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/app/email': {
+      id: '/app/email'
+      path: '/email'
+      fullPath: '/app/email'
+      preLoaderRoute: typeof AppEmailRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/app/documents': {
+      id: '/app/documents'
+      path: '/documents'
+      fullPath: '/app/documents'
+      preLoaderRoute: typeof AppDocumentsRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/app/commons': {
+      id: '/app/commons'
+      path: '/commons'
+      fullPath: '/app/commons'
+      preLoaderRoute: typeof AppCommonsRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/app/arrival-hall': {
+      id: '/app/arrival-hall'
+      path: '/arrival-hall'
+      fullPath: '/app/arrival-hall'
+      preLoaderRoute: typeof AppArrivalHallRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/app/archives': {
+      id: '/app/archives'
+      path: '/archives'
+      fullPath: '/app/archives'
+      preLoaderRoute: typeof AppArchivesRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/app/add': {
+      id: '/app/add'
+      path: '/add'
+      fullPath: '/app/add'
+      preLoaderRoute: typeof AppAddRouteImport
+      parentRoute: typeof AppRoute
     }
     '/app/vault-control/': {
       id: '/app/vault-control/'
@@ -775,39 +726,32 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppVaultControlIndexRouteImport
       parentRoute: typeof AppVaultControlRoute
     }
-    '/app/vault-control/federation': {
-      id: '/app/vault-control/federation'
-      path: '/federation'
-      fullPath: '/app/vault-control/federation'
-      preLoaderRoute: typeof AppVaultControlFederationRouteImport
-      parentRoute: typeof AppVaultControlRoute
+    '/app/people/': {
+      id: '/app/people/'
+      path: '/'
+      fullPath: '/app/people/'
+      preLoaderRoute: typeof AppPeopleIndexRouteImport
+      parentRoute: typeof AppPeopleRoute
     }
-    '/app/vault-control/intake': {
-      id: '/app/vault-control/intake'
-      path: '/intake'
-      fullPath: '/app/vault-control/intake'
-      preLoaderRoute: typeof AppVaultControlIntakeRouteImport
-      parentRoute: typeof AppVaultControlRoute
+    '/app/movies/': {
+      id: '/app/movies/'
+      path: '/'
+      fullPath: '/app/movies/'
+      preLoaderRoute: typeof AppMoviesIndexRouteImport
+      parentRoute: typeof AppMoviesRoute
     }
-    '/app/vault-control/overview': {
-      id: '/app/vault-control/overview'
-      path: '/overview'
-      fullPath: '/app/vault-control/overview'
-      preLoaderRoute: typeof AppVaultControlOverviewRouteImport
-      parentRoute: typeof AppVaultControlRoute
+    '/app/gallery/': {
+      id: '/app/gallery/'
+      path: '/'
+      fullPath: '/app/gallery/'
+      preLoaderRoute: typeof AppGalleryIndexRouteImport
+      parentRoute: typeof AppGalleryRoute
     }
-    '/app/vault-control/recovery': {
-      id: '/app/vault-control/recovery'
-      path: '/recovery'
-      fullPath: '/app/vault-control/recovery'
-      preLoaderRoute: typeof AppVaultControlRecoveryRouteImport
-      parentRoute: typeof AppVaultControlRoute
-    }
-    '/app/vault-control/services': {
-      id: '/app/vault-control/services'
-      path: '/services'
-      fullPath: '/app/vault-control/services'
-      preLoaderRoute: typeof AppVaultControlServicesRouteImport
+    '/app/vault-control/users': {
+      id: '/app/vault-control/users'
+      path: '/users'
+      fullPath: '/app/vault-control/users'
+      preLoaderRoute: typeof AppVaultControlUsersRouteImport
       parentRoute: typeof AppVaultControlRoute
     }
     '/app/vault-control/storage': {
@@ -817,12 +761,68 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppVaultControlStorageRouteImport
       parentRoute: typeof AppVaultControlRoute
     }
-    '/app/vault-control/users': {
-      id: '/app/vault-control/users'
-      path: '/users'
-      fullPath: '/app/vault-control/users'
-      preLoaderRoute: typeof AppVaultControlUsersRouteImport
+    '/app/vault-control/services': {
+      id: '/app/vault-control/services'
+      path: '/services'
+      fullPath: '/app/vault-control/services'
+      preLoaderRoute: typeof AppVaultControlServicesRouteImport
       parentRoute: typeof AppVaultControlRoute
+    }
+    '/app/vault-control/recovery': {
+      id: '/app/vault-control/recovery'
+      path: '/recovery'
+      fullPath: '/app/vault-control/recovery'
+      preLoaderRoute: typeof AppVaultControlRecoveryRouteImport
+      parentRoute: typeof AppVaultControlRoute
+    }
+    '/app/vault-control/overview': {
+      id: '/app/vault-control/overview'
+      path: '/overview'
+      fullPath: '/app/vault-control/overview'
+      preLoaderRoute: typeof AppVaultControlOverviewRouteImport
+      parentRoute: typeof AppVaultControlRoute
+    }
+    '/app/vault-control/intake': {
+      id: '/app/vault-control/intake'
+      path: '/intake'
+      fullPath: '/app/vault-control/intake'
+      preLoaderRoute: typeof AppVaultControlIntakeRouteImport
+      parentRoute: typeof AppVaultControlRoute
+    }
+    '/app/vault-control/federation': {
+      id: '/app/vault-control/federation'
+      path: '/federation'
+      fullPath: '/app/vault-control/federation'
+      preLoaderRoute: typeof AppVaultControlFederationRouteImport
+      parentRoute: typeof AppVaultControlRoute
+    }
+    '/app/people/$personId': {
+      id: '/app/people/$personId'
+      path: '/$personId'
+      fullPath: '/app/people/$personId'
+      preLoaderRoute: typeof AppPeoplePersonIdRouteImport
+      parentRoute: typeof AppPeopleRoute
+    }
+    '/app/movies/tv-shows': {
+      id: '/app/movies/tv-shows'
+      path: '/tv-shows'
+      fullPath: '/app/movies/tv-shows'
+      preLoaderRoute: typeof AppMoviesTvShowsRouteImport
+      parentRoute: typeof AppMoviesRoute
+    }
+    '/app/movies/$movieId': {
+      id: '/app/movies/$movieId'
+      path: '/$movieId'
+      fullPath: '/app/movies/$movieId'
+      preLoaderRoute: typeof AppMoviesMovieIdRouteImport
+      parentRoute: typeof AppMoviesRoute
+    }
+    '/app/gallery/$photoId': {
+      id: '/app/gallery/$photoId'
+      path: '/$photoId'
+      fullPath: '/app/gallery/$photoId'
+      preLoaderRoute: typeof AppGalleryPhotoIdRouteImport
+      parentRoute: typeof AppGalleryRoute
     }
     '/app/movies/tv-shows/': {
       id: '/app/movies/tv-shows/'
@@ -831,19 +831,19 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppMoviesTvShowsIndexRouteImport
       parentRoute: typeof AppMoviesTvShowsRoute
     }
-    '/app/movies/tv-shows/$showId': {
-      id: '/app/movies/tv-shows/$showId'
-      path: '/$showId'
-      fullPath: '/app/movies/tv-shows/$showId'
-      preLoaderRoute: typeof AppMoviesTvShowsShowIdRouteImport
-      parentRoute: typeof AppMoviesTvShowsRoute
-    }
     '/app/reading-room/$publicationId/read': {
       id: '/app/reading-room/$publicationId/read'
       path: '/$publicationId/read'
       fullPath: '/app/reading-room/$publicationId/read'
       preLoaderRoute: typeof AppReadingRoomPublicationIdReadRouteImport
       parentRoute: typeof AppReadingRoomRoute
+    }
+    '/app/movies/tv-shows/$showId': {
+      id: '/app/movies/tv-shows/$showId'
+      path: '/$showId'
+      fullPath: '/app/movies/tv-shows/$showId'
+      preLoaderRoute: typeof AppMoviesTvShowsShowIdRouteImport
+      parentRoute: typeof AppMoviesTvShowsRoute
     }
   }
 }
