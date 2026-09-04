@@ -7,9 +7,12 @@ import time
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.responses import JSONResponse
 
+from app.vault_supplier import get_pairing_origin, PostgresVaultSupplierStore, get_vault_supplier_store, router as vault_supplier_router
 from app.auth import get_authentication_store, get_enrolment_store, get_passkey_store, router as auth_router
 from app.build_info import build_info, load_project_version
 from app.auth_store import AuthenticationStore, PostgresAuthenticationStore
@@ -602,6 +605,10 @@ def bootstrap_application_schema() -> None:
             raise RuntimeError(f"Backend schema bootstrap requires {store_type.__name__}")
         store.initialize()
     PostgresTvShowStore(get_database_conninfo()).initialize()
+    supplier_store = get_vault_supplier_store()
+    if not isinstance(supplier_store, PostgresVaultSupplierStore):
+        raise RuntimeError("Backend schema bootstrap requires PostgresVaultSupplierStore")
+    supplier_store.initialize()
 
     vault_store = stores[0]
     assert isinstance(vault_store, PostgresVaultMasterStore)
@@ -643,6 +650,15 @@ app = FastAPI(
 )
 
 
+@app.exception_handler(RequestValidationError)
+async def supplier_validation_error(request: Request, error: RequestValidationError):
+    if request.url.path == "/api/vault-supplier/pair":
+        fields = {item["loc"][-1] for item in error.errors()}
+        code = "invalid_installation_key" if fields & {"installation_public_key", "key_algorithm"} else "invalid_pairing_descriptor"
+        return JSONResponse(status_code=422, content={"detail": {"code": code, "message": "Pairing request is malformed."}})
+    return await request_validation_exception_handler(request, error)
+
+
 @app.middleware("http")
 async def enforce_browser_request_boundary(request: Request, call_next):
     """Reject host-header and cross-origin cookie abuse before routing.
@@ -652,7 +668,13 @@ async def enforce_browser_request_boundary(request: Request, call_next):
     origin. This is deliberately a small same-origin defence, not a CSRF token
     framework or a CORS expansion.
     """
-    canonical_origin = get_webauthn_origin()
+    if request.url.path in {"/api/vault-supplier/pairing-code", "/api/vault-supplier/pair"}:
+        try:
+            canonical_origin = get_pairing_origin()
+        except HTTPException as error:
+            return JSONResponse({"detail": error.detail}, status_code=error.status_code, headers={"Cache-Control": "no-store"})
+    else:
+        canonical_origin = get_webauthn_origin()
     expected_host = urlsplit(canonical_origin).netloc.casefold()
     host = request.headers.get("host", "").casefold()
     if host != expected_host:
@@ -664,10 +686,11 @@ async def enforce_browser_request_boundary(request: Request, call_next):
     ):
         return JSONResponse({"detail": "Cross-origin request rejected"}, status_code=403)
     response = await call_next(request)
-    if request.url.path.startswith(("/api/auth/", "/api/vault-control/")):
+    if request.url.path.startswith(("/api/auth/", "/api/vault-control/", "/api/vault-supplier/")):
         response.headers.setdefault("Cache-Control", "no-store")
     return response
 app.include_router(auth_router)
+app.include_router(vault_supplier_router)
 app.include_router(user_state_router)
 app.include_router(tv_shows_router)
 app.include_router(tv_playback_router)

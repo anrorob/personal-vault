@@ -1,5 +1,10 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useState } from "react";
+import {
+  generatePairingCredential,
+  copyPairingCredential,
+  type PairingCredential,
+} from "@/lib/supplier-pairing";
 import { registerPasskey, passkeysSupported } from "@/lib/passkeys";
 import {
   describeAuthenticationMethod,
@@ -35,6 +40,14 @@ type SecurityEvent = {
   client_ip: string | null;
   user_agent: string | null;
 };
+type SupplierInstallation = {
+  installation_id: string;
+  supplier_version: string;
+  protocol_version: number;
+  created_at: string;
+  last_seen_at: string | null;
+  revoked_at: string | null;
+};
 
 const dateTime = (value: string) =>
   new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(
@@ -50,6 +63,10 @@ const eventLabel = (event: SecurityEvent) =>
     passkey_added: "Passkey added",
     passkey_removed: "Passkey removed",
     password_changed: "Password changed",
+    vault_supplier_pairing_code_generated: "Vault Supplier pairing credential generated",
+    vault_supplier_pairing_code_replaced: "Vault Supplier pairing credential replaced",
+    vault_supplier_paired: "Vault Supplier paired",
+    vault_supplier_revoked: "Vault Supplier installation revoked",
   })[event.event_type] ?? "Security activity";
 
 export const Route = createFileRoute("/app/security")({ component: SecurityPage });
@@ -62,6 +79,20 @@ function SecurityPage() {
   const [passwordLoginEnabled, setPasswordLoginEnabled] = useState<boolean | null>(null);
   const [sessions, setSessions] = useState<ActiveSession[]>([]);
   const [events, setEvents] = useState<SecurityEvent[]>([]);
+  const [supplierInstallations, setSupplierInstallations] = useState<SupplierInstallation[]>([]);
+  const [pairingCode, setPairingCode] = useState<PairingCredential | null>(null);
+
+  useEffect(() => {
+    if (!pairingCode) return;
+    const timeout = window.setTimeout(
+      () => {
+        setPairingCode(null);
+        setMessage("The pairing credential has expired. Generate a new credential.");
+      },
+      Math.max(0, Date.parse(pairingCode.expiresAt) - Date.now()),
+    );
+    return () => window.clearTimeout(timeout);
+  }, [pairingCode]);
 
   const load = useCallback(async () => {
     const response = await fetch("/api/auth/passkeys", { credentials: "include" });
@@ -71,12 +102,15 @@ function SecurityPage() {
       const session = await fetch("/api/auth/session", { credentials: "include" });
       if (session.ok)
         setPasswordLoginEnabled(((await session.json()) as Session).password_login_enabled ?? null);
-      const [activeSessions, securityEvents] = await Promise.all([
+      const [activeSessions, securityEvents, supplierResponse] = await Promise.all([
         fetch("/api/auth/sessions", { credentials: "include" }),
         fetch("/api/auth/security-events", { credentials: "include" }),
+        fetch("/api/vault-supplier/installations", { credentials: "include" }),
       ]);
       if (activeSessions.ok) setSessions((await activeSessions.json()) as ActiveSession[]);
       if (securityEvents.ok) setEvents((await securityEvents.json()) as SecurityEvent[]);
+      if (supplierResponse.ok)
+        setSupplierInstallations((await supplierResponse.json()) as SupplierInstallation[]);
     }
   }, [navigate]);
 
@@ -140,6 +174,41 @@ function SecurityPage() {
     }
   };
 
+  const createPairingCode = async () => {
+    setBusy(true);
+    setMessage("");
+    try {
+      setPairingCode(null);
+      setPairingCode(await generatePairingCredential());
+      setMessage(
+        "Pairing credential generated. Generating another credential invalidates this one.",
+      );
+      await load();
+    } catch (reason) {
+      setMessage(
+        reason instanceof Error ? reason.message : "Could not generate a pairing credential.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const revokeSupplier = async (installation: SupplierInstallation) => {
+    if (
+      !window.confirm(
+        "Revoke this Vault Supplier installation? It will no longer be able to authenticate.",
+      )
+    )
+      return;
+    const response = await fetch(
+      `/api/vault-supplier/installations/${installation.installation_id}`,
+      { method: "DELETE", credentials: "include" },
+    );
+    if (!response.ok) return setMessage("That Supplier installation could not be revoked.");
+    setMessage("Vault Supplier installation revoked.");
+    await load();
+  };
+
   return (
     <section className="mx-auto max-w-3xl space-y-6">
       <div>
@@ -156,6 +225,93 @@ function SecurityPage() {
           <p className="mt-1 text-sm" style={{ color: "var(--pv-text-dim)" }}>
             Keep at least one passkey registered. If all passkeys are lost, an administrator can
             assist with recovery.
+          </p>
+        )}
+      </div>
+      <div className="pv-panel space-y-4 p-6">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h3 className="text-lg font-semibold">Vault Supplier</h3>
+            <p className="text-sm" style={{ color: "var(--pv-text-dim)" }}>
+              Pair a Windows Vault Supplier installation to this Vault. Pairing credentials are
+              single-use and short-lived.
+            </p>
+          </div>
+          <button
+            className="pv-btn-primary"
+            type="button"
+            onClick={() => void createPairingCode()}
+            disabled={busy}
+          >
+            {pairingCode ? "Replace pairing credential" : "Generate pairing credential"}
+          </button>
+        </div>
+        {pairingCode && (
+          <div className="rounded-md border p-4" style={{ borderColor: "var(--pv-border)" }}>
+            <textarea
+              aria-label="Pairing credential"
+              readOnly
+              value={pairingCode.code}
+              className="w-full resize-none break-all rounded border p-2 font-mono text-xs"
+              rows={5}
+              onFocus={(event) => event.currentTarget.select()}
+            />
+            <button
+              type="button"
+              className="pv-btn-secondary mt-2"
+              onClick={() =>
+                void copyPairingCredential(pairingCode).then(
+                  () => setMessage("Pairing credential copied."),
+                  (reason: unknown) =>
+                    setMessage(
+                      reason instanceof Error
+                        ? reason.message
+                        : "Could not copy credential. Select and copy it manually.",
+                    ),
+                )
+              }
+            >
+              Copy pairing credential
+            </button>
+            <p className="mt-1 text-sm" style={{ color: "var(--pv-text-dim)" }}>
+              Expires {dateTime(pairingCode.expiresAt)}. Keep this credential private.
+            </p>
+          </div>
+        )}
+        {supplierInstallations.length ? (
+          supplierInstallations.map((installation) => (
+            <div
+              key={installation.installation_id}
+              className="flex flex-wrap items-center justify-between gap-3 border-t pt-3"
+              style={{ borderColor: "var(--pv-border)" }}
+            >
+              <div>
+                <p className="font-medium">
+                  Installation {installation.installation_id.slice(0, 8)}…
+                  {installation.installation_id.slice(-4)}
+                </p>
+                <p className="text-sm" style={{ color: "var(--pv-text-dim)" }}>
+                  Paired {dateTime(installation.created_at)} · {installation.supplier_version}
+                  {installation.last_seen_at
+                    ? ` · Last seen ${dateTime(installation.last_seen_at)}`
+                    : ""}
+                </p>
+              </div>
+              {!installation.revoked_at && (
+                <button
+                  className="pv-btn-danger"
+                  type="button"
+                  onClick={() => void revokeSupplier(installation)}
+                  disabled={busy}
+                >
+                  Revoke
+                </button>
+              )}
+            </div>
+          ))
+        ) : (
+          <p className="text-sm" style={{ color: "var(--pv-text-dim)" }}>
+            No Vault Supplier installations are authorized for this user.
           </p>
         )}
       </div>

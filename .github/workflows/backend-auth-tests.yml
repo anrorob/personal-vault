@@ -85,5 +85,7 @@ jobs:
         run: bun install --frozen-lockfile
       - name: Lint frontend
         run: bun run lint
+      - name: Test frontend helpers
+        run: bun test tests
       - name: Build frontend
         run: bun run build

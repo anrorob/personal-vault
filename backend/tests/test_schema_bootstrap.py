@@ -36,7 +36,10 @@ from app.vault_master_reading_review import (
 )
 
 
+from app.vault_supplier import PostgresVaultSupplierStore
+
 POSTGRES_STORE_TYPES = (
+    PostgresVaultSupplierStore,
     PostgresAuthenticationStore,
     PostgresVaultMasterStore,
     PostgresGalleryIntelligenceStore,
@@ -79,6 +82,7 @@ def test_postgres_store_construction_never_calls_initialize(
             lambda self: pytest.fail(f"{type(self).__name__} ran schema DDL in __init__"),
         )
 
+    PostgresVaultSupplierStore("postgresql://invalid")
     PostgresAuthenticationStore("postgresql://invalid")
     PostgresVaultMasterStore("postgresql://invalid")
     PostgresGalleryIntelligenceStore("postgresql://invalid")
@@ -175,7 +179,7 @@ def test_worker_disabled_people_requests_are_concurrent_and_ddl_free(
                 connection.execute(f"TRUNCATE {audit_table}")
 
             with ThreadPoolExecutor(max_workers=6) as executor:
-                responses = list(executor.map(lambda _: client.get("/api/gallery/people"), range(12)))
+                responses = list(executor.map(lambda i: client.get("/api/vault-supplier/installations" if i % 2 else "/api/gallery/people"), range(12)))
             assert [response.status_code for response in responses] == [200] * 12
 
             with psycopg.connect(conninfo) as connection:

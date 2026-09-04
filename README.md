@@ -17,7 +17,7 @@ Personal Vault is a self-hosted digital archive for privately owned media and do
 - Multi-user accounts, passkey-first authentication, and administrative Vault Control
 - Local sharing foundations and shared collections
 
-Email, Ledger, Vault Supplier, federation, recovery tooling, and installer work are not public-release capabilities. See [project status](docs/project-status.md) for the deliberately short current/planned split.
+Email, Ledger, federation, recovery tooling, and installer work are not public-release capabilities. See [project status](docs/project-status.md) for the deliberately short current/planned split.
 
 ## Principles
 
@@ -79,3 +79,5 @@ for exact-tag deployment, development-Vault separation, and rollback rules.
 ## Licence status
 
 Personal Vault is licensed under the [GNU Affero General Public License v3.0 or later](LICENSE) (`AGPL-3.0-or-later`).
+
+Vault Supplier now supports PVPAIR1 credential issuance, installation pairing/revocation, and signed identity verification. File transfer and a ready-made LAN deployment remain outside this public foundation. See [pairing configuration](docs/vault-supplier-setup.md).
