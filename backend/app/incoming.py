@@ -25,6 +25,7 @@ from pydantic import BaseModel
 from app.auth import AuthenticatedUsername, get_authentication_store
 from app.auth_store import AuthenticationStore
 from app.config import get_upload_max_bytes
+from app.vault_master_work_wake import signal_arrival_hall_work_available
 
 
 router = APIRouter(tags=["arrival-hall"])
@@ -323,6 +324,63 @@ def record_arrival_hall_file_owner(
         os.replace(temporary_path, manifest_path)
 
 
+def record_arrival_hall_file_source_context(
+    incoming_path: Path,
+    destination: Path,
+    owner_user_id: UUID,
+    source_context: dict[str, object],
+    supplier_transfer_id: UUID,
+) -> None:
+    """Attach Supplier advisory provenance to its already-owned staged file.
+
+    This is Arrival Hall evidence, not canonical asset metadata or a routing
+    destination.  The owner check prevents a stale Supplier session from
+    attaching provenance to another user's staged filename.
+    """
+    relative_path = destination.relative_to(incoming_path).as_posix()
+    manifest_path = _owner_manifest_path(incoming_path)
+    temporary_path = manifest_path.with_name(f"{manifest_path.name}.{uuid4().hex}.tmp")
+    with _owner_manifest_lock:
+        entries = _read_owner_manifest(incoming_path)
+        entry = entries.get(relative_path)
+        if not isinstance(entry, dict) or entry.get("owner_user_id") != str(owner_user_id):
+            raise ValueError("Arrival Hall Supplier provenance owner does not match")
+        entries[relative_path] = {
+            **entry,
+            "supplier_provenance": {
+                "transfer_id": str(supplier_transfer_id),
+                "source_context": dict(source_context),
+            },
+        }
+        temporary_path.write_text(json.dumps(entries, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+        os.replace(temporary_path, manifest_path)
+
+
+def complete_arrival_hall_publication(
+    incoming_path: Path,
+    destination: Path,
+    owner: object,
+    *,
+    source_context: dict[str, object] | None = None,
+    supplier_transfer_id: UUID | None = None,
+) -> None:
+    """Record a visible Arrival Hall item, then wake normal worker processing.
+
+    This is intentionally source-neutral: callers invoke it only after their
+    final file publication has succeeded.  The wake does not perform routing
+    or movement and remains best-effort inside the notifier.
+    """
+    record_arrival_hall_file_owner(incoming_path, destination, owner)
+    owner_user_id = getattr(owner, "user_id", None)
+    if source_context is not None and supplier_transfer_id is not None:
+        if not isinstance(owner_user_id, UUID):
+            raise ValueError("Arrival Hall uploader identity is unavailable")
+        record_arrival_hall_file_source_context(
+            incoming_path, destination, owner_user_id, source_context, supplier_transfer_id
+        )
+    signal_arrival_hall_work_available()
+
+
 def get_arrival_hall_file_owner(
     incoming_path: Path,
     path: Path,
@@ -341,6 +399,29 @@ def get_arrival_hall_file_owner(
         owner_user_id = entry.get("owner_user_id")
         return owner_user_id if isinstance(owner_user_id, str) else None
     return None
+
+
+def get_arrival_hall_file_source_context(
+    incoming_path: Path,
+    path: Path,
+) -> dict[str, object] | None:
+    """Return safe Supplier provenance stored for this exact staged file."""
+    try:
+        relative_path = path.resolve(strict=True).relative_to(incoming_path.resolve(strict=True)).as_posix()
+    except (OSError, ValueError):
+        return None
+    with _owner_manifest_lock:
+        entry = _read_owner_manifest(incoming_path).get(relative_path)
+    if not isinstance(entry, dict):
+        return None
+    provenance = entry.get("supplier_provenance")
+    if not isinstance(provenance, dict):
+        return None
+    context = provenance.get("source_context")
+    transfer_id = provenance.get("transfer_id")
+    if not isinstance(context, dict) or not isinstance(transfer_id, str):
+        return None
+    return {"transfer_id": transfer_id, **context}
 
 
 def get_arrival_hall_file_uploaded_at(
@@ -558,7 +639,7 @@ async def upload_to_incoming(
             incoming_path,
             filename,
         )
-        record_arrival_hall_file_owner(incoming_path, destination, username)
+        complete_arrival_hall_publication(incoming_path, destination, username)
     except HTTPException:
         temporary_path.unlink(missing_ok=True)
         raise

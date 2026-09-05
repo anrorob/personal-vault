@@ -75,7 +75,7 @@ def test_identity_and_verify_match_the_exact_signed_contract(client: TestClient)
         "vault_id": paired["vault_id"],
         "server_key_id": paired["server_identity"]["key_id_sha256"],
         "verify_path": "/api/vault-supplier/lan/verify",
-        "capabilities": {"receiver_available": False, "resumable_upload_supported": False},
+        "capabilities": {"receiver_available": True, "resumable_upload_supported": True},
     }
     nonce = "A" * 43
     response = client.post("/api/vault-supplier/lan/verify", json={"protocol_version": 1, "nonce": nonce})

@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from app.config import get_upload_max_bytes
 from app.auth_store import Account, MemoryAuthenticationStore
+import app.incoming as incoming_module
 from app.incoming import (
     get_arrival_hall_path,
     get_incoming_path,
@@ -113,7 +114,14 @@ def test_arrival_hall_endpoint_is_canonical_alias(
 def test_upload_streams_file_into_incoming(
     client: TestClient,
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
+    signals: list[str] = []
+    monkeypatch.setattr(
+        incoming_module,
+        "signal_arrival_hall_work_available",
+        lambda: signals.append("arrival_hall"),
+    )
     configure_incoming(tmp_path)
     authenticate(client)
 
@@ -135,6 +143,7 @@ def test_upload_streams_file_into_incoming(
         b"owned-image-content"
     )
     assert not list(tmp_path.glob(".pv-upload-*.part"))
+    assert signals == ["arrival_hall"]
 
 
 def test_arrival_hall_files_and_previews_are_isolated_by_uploader(

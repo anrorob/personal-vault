@@ -3391,6 +3391,7 @@ def scan_root(
     source_kind: str,
     playback_publisher: Callable[[tuple[Path, ...]], object] | None = None,
     owner_lookup: Callable[[Path], str | UUID | None] | None = None,
+    source_context_lookup: Callable[[Path], dict[str, object] | None] | None = None,
 ) -> UUID:
     resolved_root = root.resolve(strict=True)
 
@@ -3403,7 +3404,12 @@ def scan_root(
 
     try:
         for path in sorted(resolved_root.rglob("*")):
-            if path.name.startswith(".pv-") or path.is_symlink() or not path.is_file():
+            if (
+                path.name.startswith(".pv-")
+                or any(part.startswith(".pv-") for part in path.relative_to(resolved_root).parts)
+                or path.is_symlink()
+                or not path.is_file()
+            ):
                 continue
 
             owner = (
@@ -3411,15 +3417,20 @@ def scan_root(
                 if source_kind == INCOMING_SOURCE and owner_lookup
                 else None
             )
+            scanned = scan_file(
+                path,
+                resolved_root,
+                owner_username=owner if isinstance(owner, str) else None,
+                owner_user_id=owner if isinstance(owner, UUID) else None,
+            )
+            if source_kind == INCOMING_SOURCE and source_context_lookup:
+                source_context = source_context_lookup(path)
+                if source_context is not None:
+                    scanned = ScannedFile(**{**scanned.__dict__, "metadata": {**scanned.metadata, "source_context": source_context}})
             store.record_file(
                 batch_id,
                 source_kind,
-                scan_file(
-                    path,
-                    resolved_root,
-                    owner_username=owner if isinstance(owner, str) else None,
-                    owner_user_id=owner if isinstance(owner, UUID) else None,
-                ),
+                scanned,
             )
             if source_kind == INVENTORY_SOURCE:
                 inventory_paths.append(path)
@@ -3489,6 +3500,7 @@ def process_next_batch(
     store: VaultMasterStore,
     playback_publisher: Callable[[tuple[Path, ...]], object] | None = None,
     owner_lookup: Callable[[Path], str | UUID | None] | None = None,
+    source_context_lookup: Callable[[Path], dict[str, object] | None] | None = None,
 ) -> UUID | None:
     claimed = store.claim_next_batch()
     if claimed is None:
@@ -3501,22 +3513,32 @@ def process_next_batch(
 
     try:
         for path in sorted(root.rglob("*")):
-            if path.name.startswith(".pv-") or path.is_symlink() or not path.is_file():
+            if (
+                path.name.startswith(".pv-")
+                or any(part.startswith(".pv-") for part in path.relative_to(root).parts)
+                or path.is_symlink()
+                or not path.is_file()
+            ):
                 continue
             owner = (
                 owner_lookup(path)
                 if source_kind == INCOMING_SOURCE and owner_lookup
                 else None
             )
+            scanned = scan_file(
+                path,
+                root,
+                owner_username=owner if isinstance(owner, str) else None,
+                owner_user_id=owner if isinstance(owner, UUID) else None,
+            )
+            if source_kind == INCOMING_SOURCE and source_context_lookup:
+                source_context = source_context_lookup(path)
+                if source_context is not None:
+                    scanned = ScannedFile(**{**scanned.__dict__, "metadata": {**scanned.metadata, "source_context": source_context}})
             store.record_file(
                 batch_id,
                 source_kind,
-                scan_file(
-                    path,
-                    root,
-                    owner_username=owner if isinstance(owner, str) else None,
-                    owner_user_id=owner if isinstance(owner, UUID) else None,
-                ),
+                scanned,
             )
             if source_kind == INVENTORY_SOURCE:
                 inventory_paths.append(path)

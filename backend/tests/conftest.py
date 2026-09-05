@@ -10,6 +10,8 @@ from fastapi.testclient import TestClient
 from app.auth import SESSION_COOKIE_NAME, VAULT_CONTROL_ELEVATION_DURATION, get_authentication_store, get_enrolment_store, get_passkey_store
 from app.auth_store import MemoryAuthenticationStore
 from app.passkeys import MemoryPasskeyStore
+from app.vault_supplier_transfer import MemoryTransferStore, get_transfer_store
+from app.vault_master_intake import MemoryIntakeStore, get_intake_store
 from app.enrolment import MemoryEnrolmentStore
 import app.main as main_module
 from app.main import app
@@ -69,6 +71,10 @@ def client(
     app.dependency_overrides[get_enrolment_store] = lambda: enrolment_store
     supplier_store = MemoryVaultSupplierStore()
     app.dependency_overrides[get_vault_supplier_store] = lambda: supplier_store
+    transfer_store = MemoryTransferStore()
+    app.dependency_overrides[get_transfer_store] = lambda: transfer_store
+    intake_store = MemoryIntakeStore()
+    app.dependency_overrides[get_intake_store] = lambda: intake_store
     ingestion_ai_store = MemoryIngestionAiStore()
     app.dependency_overrides[get_ingestion_ai_store] = lambda: ingestion_ai_store
     # Unit API tests deliberately replace every persistent dependency with a

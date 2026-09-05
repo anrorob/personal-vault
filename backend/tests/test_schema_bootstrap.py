@@ -37,6 +37,8 @@ from app.vault_master_reading_review import (
 
 
 from app.vault_supplier import PostgresVaultSupplierStore
+from app.vault_supplier_transfer import PostgresTransferStore, get_transfer_store
+from app.tv_resolver_publication import PostgresTvResolverStore
 
 POSTGRES_STORE_TYPES = (
     PostgresVaultSupplierStore,
@@ -51,6 +53,8 @@ POSTGRES_STORE_TYPES = (
     PostgresIntakeStore,
     PostgresReadingRoomStore,
     PostgresPublicationReviewStore,
+    PostgresTransferStore,
+    PostgresTvResolverStore,
 )
 
 
@@ -67,8 +71,11 @@ def _clear_store_caches() -> None:
         get_intake_store,
         get_reading_room_store,
         get_publication_review_store,
+        get_transfer_store,
     ):
-        getter.cache_clear()
+        clear = getattr(getter, "cache_clear", None)
+        if clear is not None:
+            clear()
 
 
 def test_postgres_store_construction_never_calls_initialize(
@@ -94,6 +101,29 @@ def test_postgres_store_construction_never_calls_initialize(
     PostgresIntakeStore("postgresql://invalid")
     PostgresReadingRoomStore("postgresql://invalid")
     PostgresPublicationReviewStore("postgresql://invalid")
+    PostgresTransferStore("postgresql://invalid")
+    PostgresTvResolverStore("postgresql://invalid")
+
+
+def test_tv_resolver_schema_bootstrap_is_additive_and_idempotent() -> None:
+    conninfo = os.getenv("PV_TEST_DATABASE_URL")
+    if not conninfo:
+        pytest.skip("PV_TEST_DATABASE_URL is not configured")
+    PostgresAuthenticationStore(conninfo).initialize()
+    PostgresVaultMasterStore(conninfo).initialize()
+    resolver = PostgresTvResolverStore(conninfo)
+    resolver.initialize()
+    resolver.initialize()
+    expected = {
+        "vault_tv_resolver_batches",
+        "vault_tv_resolver_seasons",
+        "vault_tv_resolver_tracks",
+    }
+    with psycopg.connect(conninfo) as connection:
+        rows = connection.execute(
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+        ).fetchall()
+    assert expected <= {row[0] for row in rows}
 
 
 def test_worker_disabled_lifespan_bootstraps_before_serving(

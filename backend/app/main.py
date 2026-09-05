@@ -18,6 +18,7 @@ from app.auth import get_authentication_store, get_enrolment_store, get_passkey_
 from app.build_info import build_info, load_project_version
 from app.auth_store import AuthenticationStore, PostgresAuthenticationStore
 from app.passkeys import PostgresPasskeyStore
+from app.vault_supplier_transfer import backfill_arrival_hall_source_context, PostgresTransferStore, get_transfer_store, router as vault_supplier_transfer_router
 from app.config import get_admin_username, get_database_conninfo, get_webauthn_origin
 from app.request_security import trusted_proxy_networks
 from app.gallery import router as gallery_router
@@ -37,6 +38,7 @@ from app.video_intelligence import (
 from app.incoming import (
     get_arrival_hall_path,
     get_arrival_hall_file_owner,
+    get_arrival_hall_file_source_context,
     router as arrival_hall_router,
 )
 from app.movies import (
@@ -73,6 +75,7 @@ from app.theatre_movie_rename import (
 from app.vault_master_jellyfin import (
     get_jellyfin_metadata_client,
     publish_jellyfin_media_updates,
+    request_jellyfin_library_scan,
     run_jellyfin_movie_import,
     run_jellyfin_music_import,
 )
@@ -90,6 +93,7 @@ from app.vault_master_autopilot import (
     process_autopilot_batch,
     reconcile_autopilot_runs,
 )
+from app.vault_master_work_wake import get_vault_master_work_wake
 from app.vault_master_intake import (
     PostgresIntakeStore,
     get_intake_store,
@@ -108,6 +112,7 @@ from app.vault_services import router as vault_services_router, set_worker_state
 from app.vault_control_users import router as vault_control_users_router
 from app.user_state import router as user_state_router
 from app.tv_shows import PostgresTvShowStore, router as tv_shows_router
+from app.tv_resolver_publication import PostgresTvResolverStore
 from app.tv_playback import router as tv_playback_router
 from app.tv_jellyfin_import import import_pending_tv_metadata
 
@@ -125,6 +130,10 @@ def _arrival_hall_owner_reference(path: Path) -> str | UUID | None:
         return UUID(owner)
     except ValueError:
         return owner
+
+
+def _arrival_hall_source_context_reference(path: Path) -> dict[str, object] | None:
+    return get_arrival_hall_file_source_context(get_arrival_hall_path(), path)
 
 
 logger = logging.getLogger("pv.vault-master.worker")
@@ -237,6 +246,8 @@ def queue_video_intelligence_for_published_asset(store, video_store, item_id) ->
 
 
 async def run_vault_master_worker() -> None:
+    work_wake = get_vault_master_work_wake()
+    seen_work_generation = work_wake.generation()
     poll_seconds = max(
         1,
         int(os.getenv("PV_VAULT_MASTER_POLL_SECONDS", "5")),
@@ -317,6 +328,17 @@ async def run_vault_master_worker() -> None:
                 managed_arrival = await asyncio.to_thread(reconcile_next_arrival_managed_receipt, store)
                 if managed_arrival is not None:
                     logger.info("Arrival Hall managed receipt reconciled: asset_id=%s", managed_arrival)
+                    # A resolver batch requests exactly one bounded scan after
+                    # all of its canonical episode receipts are durable.  Scan
+                    # failure never reverses canonical publication.
+                    published_batches = await asyncio.to_thread(
+                        PostgresTvResolverStore(get_database_conninfo()).reconcile
+                    )
+                    for batch_id in published_batches:
+                        try:
+                            await asyncio.to_thread(request_jellyfin_library_scan)
+                        except Exception:
+                            logger.exception("TV resolver Jellyfin handoff failed: batch_id=%s", batch_id)
                     processed = managed_arrival
             if processed is None and intake_open:
                 moved = await asyncio.to_thread(
@@ -335,7 +357,14 @@ async def run_vault_master_worker() -> None:
                         store,
                         publish_jellyfin_media_updates,
                         _arrival_hall_owner_reference,
+                        _arrival_hall_source_context_reference,
                     )
+                )
+            # Move failures do not produce a managed receipt, but they still
+            # need to become durable resolver-batch failure state for retry.
+            if processed is not None and managed_arrival is None:
+                await asyncio.to_thread(
+                    PostgresTvResolverStore(get_database_conninfo()).reconcile
                 )
             if moved is not None:
                 next_music_import = time.monotonic() + 15
@@ -553,7 +582,10 @@ async def run_vault_master_worker() -> None:
             next_storage_integration_reconciliation = time.monotonic() + 15
 
         if processed is None:
-            await asyncio.sleep(poll_seconds)
+            seen_work_generation = await work_wake.wait_for_work(
+                seen_work_generation,
+                poll_seconds,
+            )
 
 
 def bootstrap_application_schema() -> None:
@@ -610,6 +642,7 @@ def bootstrap_application_schema() -> None:
     if not isinstance(supplier_store, PostgresVaultSupplierStore):
         raise RuntimeError("Backend schema bootstrap requires PostgresVaultSupplierStore")
     supplier_store.initialize()
+    PostgresTvResolverStore(get_database_conninfo()).initialize()
 
     vault_store = stores[0]
     assert isinstance(vault_store, PostgresVaultMasterStore)
@@ -620,6 +653,13 @@ def bootstrap_application_schema() -> None:
             os.getenv("PV_INCOMING_PATH", "/vault/Incoming"),
             arrival_hall_root,
         )
+    transfer_store = get_transfer_store()
+    if not isinstance(transfer_store, PostgresTransferStore):
+        raise RuntimeError("Backend schema bootstrap requires PostgreSQL Vault Supplier transfer storage")
+    transfer_store.initialize()
+    restored = backfill_arrival_hall_source_context(get_arrival_hall_path(), transfer_store)
+    if restored:
+        logger.info("Restored Supplier source context for %s staged Arrival Hall files", restored)
 
 
 @asynccontextmanager
@@ -644,6 +684,7 @@ async def lifespan(app: FastAPI):
     worker.cancel()
     with suppress(asyncio.CancelledError):
         await worker
+    get_vault_master_work_wake().detach_worker_loop()
     set_worker_state("stopped")
 
 app = FastAPI(
@@ -653,12 +694,25 @@ app = FastAPI(
 )
 
 
+def _is_vault_supplier_receiver_path(path: str) -> bool:
+    return path in {
+        "/api/vault-supplier/intake/state",
+        "/api/vault-supplier/intake/check-hashes",
+        "/api/vault-supplier/transfers",
+    } or path.startswith("/api/vault-supplier/transfers/")
+
+
 @app.exception_handler(RequestValidationError)
 async def supplier_validation_error(request: Request, error: RequestValidationError):
     if request.url.path == "/api/vault-supplier/pair":
         fields = {item["loc"][-1] for item in error.errors()}
         code = "invalid_installation_key" if fields & {"installation_public_key", "key_algorithm"} else "invalid_pairing_descriptor"
         return JSONResponse(status_code=422, content={"detail": {"code": code, "message": "Pairing request is malformed."}})
+    if _is_vault_supplier_receiver_path(request.url.path):
+        return JSONResponse(
+            status_code=422,
+            content={"detail": {"code": "invalid_request", "message": "Vault Supplier receiver request is malformed."}},
+        )
     return await request_validation_exception_handler(request, error)
 
 
@@ -694,6 +748,7 @@ async def enforce_browser_request_boundary(request: Request, call_next):
     return response
 app.include_router(auth_router)
 app.include_router(vault_supplier_router)
+app.include_router(vault_supplier_transfer_router)
 app.include_router(user_state_router)
 app.include_router(tv_shows_router)
 app.include_router(tv_playback_router)

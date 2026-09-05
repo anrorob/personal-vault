@@ -11,10 +11,10 @@
 ## Planned or exploratory
 
 - A supported installer and recovery/operational tooling
-- Supplier file transfer, Email, and Ledger areas
+- A ready-made Vault Supplier client or deployment, Email, and Ledger areas
 - Federation beyond its current foundations
 - Public release/versioning workflow and final licensing
 
 No dates or compatibility promises are attached to these items. The project remains private until the publication gates in [the release checklist](public-release-checklist.md) are intentionally completed.
 
-Vault Supplier now supports PVPAIR1 credential issuance, installation pairing/revocation, and signed identity verification. File transfer and a ready-made LAN deployment remain outside this public foundation. See [pairing configuration](vault-supplier-setup.md).
+Vault Supplier supports PVPAIR1 credential issuance, installation pairing/revocation, signed identity verification, and a generic server-side resumable-transfer contract. Transfer finalization can retain the advisory `source_kind`, `source_id`, `source_label`, and `relative_path` evidence required by post-ingestion features such as the TV resolver; it is never ownership, routing, or filesystem authority. The public foundation does not include the private Windows Supplier application, a ready-made LAN listener, TLS material, firewall or Avahi configuration, deployment artifacts, or machine-specific state. See [pairing configuration](vault-supplier-setup.md) and [the transfer protocol](vault-supplier-transfer-protocol-v1.md).

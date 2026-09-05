@@ -653,7 +653,7 @@ def _lan_metadata(vault_id: UUID, server_identity: LanServerIdentity) -> dict[st
         "vault_id": str(vault_id),
         "server_key_id": server_identity.key_id_sha256,
         "verify_path": VERIFY_PATH,
-        "capabilities": {"receiver_available": False, "resumable_upload_supported": False},
+        "capabilities": {"receiver_available": True, "resumable_upload_supported": True},
     }
 
 
@@ -676,7 +676,7 @@ def lan_verify(body: LanVerifyRequest, store: VaultSupplierStore = Depends(get_v
     except ValueError:
         raise _lan_error("invalid_nonce", "Nonce must be an unpadded Base64URL encoding of exactly 32 bytes.", status.HTTP_400_BAD_REQUEST) from None
     vault_id, _ = store.local_vault()
-    capabilities = {"receiver_available": False, "resumable_upload_supported": False}
+    capabilities = {"receiver_available": True, "resumable_upload_supported": True}
     try:
         server_identity = get_lan_server_identity()
         port = lan_port()
