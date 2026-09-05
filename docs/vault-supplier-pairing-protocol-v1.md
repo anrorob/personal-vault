@@ -29,8 +29,8 @@ serialized in this order with compact separators, without a BOM or whitespace:
 is SHA-256 of those exact DER bytes. The credential includes no user identity,
 username, private key, session/authentication token, LAN address, or LAN port.
 Field order is deterministic for emission; consumers must parse JSON rather
-than depend on field order. Current credentials are approximately 600–800
-characters depending on origin length. No encryption or signature is added to
+than depend on field order. Credential length varies with the configured origin
+without a fixed length. No encryption or signature is added to
 the descriptor: it is a short-lived bearer bootstrap value delivered by the
 authenticated Vault UI. Keep the complete credential private.
 
@@ -133,7 +133,8 @@ remains enforced. User identity is resolved by immutable UUID and must be active
     "public_key_spki_der_base64": "<exact-credential-SPKI>",
     "key_id_sha256": "<exact-credential-key-ID>"
   },
-  "lan_connection_metadata": {"available": false, "mode": "unavailable"}
+  "lan_connection_metadata": {"available": false, "mode": "unavailable"},
+  "lan_endpoint_hint": "https://vault-lan.local:9443"
 }
 ```
 
@@ -143,6 +144,54 @@ pairing. The immutable authorized user UUID is learned only from successful
 pairing. Display labels never authorize access. Existing LAN discovery and
 signature proof remain defined in [LAN protocol v1](vault-supplier-lan-protocol-v1.md).
 No LAN URL/port is added to the bootstrap credential.
+
+### Optional LAN location hint (PV-VS-PAIR-014)
+
+Successful pairing responses include `lan_endpoint_hint`, either an absolute
+HTTPS URI with an explicit port or JSON `null` when no LAN listener location is
+configured. Clients must also accept an absent field from older servers.
+The wire form is `https://<hostname>:<port>`, without a path or trailing slash,
+userinfo, query, or fragment. It contains no pairing secret or authentication
+token. There is no localhost, management-origin, or default-port fallback.
+
+`PVPAIR1.origin` remains the management HTTPS origin used for pairing.
+`lan_connection_metadata` retains its existing capability/mode meaning and
+values. `lan_endpoint_hint` is a separate **location candidate only**; it does
+not change those metadata fields or claim that a receiver is reachable or verified.
+For example, an independent Vault can pair at
+`https://vault.example.net` and supply `https://vault-lan.local:9443`.
+These values are not derived from each other by hostname or port rewriting.
+
+**A LAN endpoint hint MUST NOT be treated as authenticated solely because it
+came from the pairing response.** Before use, Vault Supplier MUST perform normal
+strict LAN identity verification: normal TLS certificate validation, identity
+endpoint, expected Vault UUID, pinned key ID and SPKI, fresh nonce, exact canonical
+signed payload, and ECDSA signature verification. A saved hint remains Vault-scoped
+discovery input. This response adds no TLS exception or trust bypass.
+
+The authoritative listener configuration is exposed to the backend through
+optional `PV_VAULT_SUPPLIER_LAN_CERTIFICATE_PATH`, pointing to the **same public
+PEM certificate used by the HTTPS LAN listener**, and existing
+`PV_VAULT_SUPPLIER_LAN_PORT`, explicitly set to that listener's port. The hostname
+comes from the certificate's single DNS subjectAltName. This is a reference to existing listener configuration, not a
+second hostname/URI setting. No certificate or key is generated or changed.
+Only public certificate data is read; parsing it to extract a location is not
+certificate authentication or server identity verification.
+
+The certificate path being unset means the optional location is not configured:
+return `null`, even if a LAN protocol port is otherwise set. To disable the hint
+when a listener is decommissioned, unset this path. Hint generation performs no
+network availability probe. A configured but missing/malformed certificate,
+missing or multiple DNS SANs, wildcard/invalid DNS name, or absent/malformed port
+is a configuration error. Hostnames are ASCII DNS names (including IDNA A-labels),
+lowercased on output; ports must be decimal integers 1–65535 and remain explicit,
+including 443. URI syntax embedded in DNS names is rejected.
+
+Startup validates this configuration before schema bootstrap or workers start.
+If it becomes invalid at runtime, pairing fails with HTTP 503
+`invalid_lan_endpoint_hint` before consuming the secret or registering an
+installation. Fixing location configuration permits retrying the same unconsumed
+credential. A location change alone does not change PVPAIR1 identity bindings.
 
 ## Errors
 
@@ -166,8 +215,10 @@ Pairing domain errors use:
 | `invalid_installation_identity` | Existing installation UUID belongs to another identity |
 | `installation_revoked` | Installation is revoked |
 | `user_not_allowed` | Bound account is unavailable/inactive |
+| `invalid_lan_endpoint_hint` | Configured LAN listener cannot supply an unambiguous valid location (503) |
 
-Domain failures are HTTP 400, except `user_not_allowed` (403). Request shape/type
+Domain failures are HTTP 400, except `user_not_allowed` (403) and
+`invalid_lan_endpoint_hint` (503). Request shape/type
 errors are HTTP 422 using `invalid_installation_key` for key fields and otherwise
 `invalid_pairing_descriptor`. Validation responses never echo input secrets.
 Session authentication and browser host/CSRF errors retain the application-wide

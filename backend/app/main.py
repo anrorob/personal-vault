@@ -12,6 +12,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.responses import JSONResponse
 
+from app.vault_supplier_lan import lan_endpoint_hint
 from app.vault_supplier import get_pairing_origin, PostgresVaultSupplierStore, get_vault_supplier_store, router as vault_supplier_router
 from app.auth import get_authentication_store, get_enrolment_store, get_passkey_store, router as auth_router
 from app.build_info import build_info, load_project_version
@@ -624,6 +625,8 @@ def bootstrap_application_schema() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     del app
+    # Reject malformed optional listener configuration before serving or DDL.
+    lan_endpoint_hint()
     # Required application schemas are not worker-owned.  Complete this
     # controlled bootstrap before either worker-enabled or API-only traffic.
     await asyncio.to_thread(bootstrap_application_schema)

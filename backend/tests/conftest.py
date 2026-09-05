@@ -57,6 +57,8 @@ def client(
     key_path = tmp_path_factory.mktemp("vault-supplier-lan-key") / "server-key.pem"
     key_path.write_bytes(server_key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
     monkeypatch.setenv("PV_VAULT_SUPPLIER_SERVER_IDENTITY_KEY_PATH", str(key_path))
+    monkeypatch.delenv("PV_VAULT_SUPPLIER_LAN_CERTIFICATE_PATH", raising=False)
+    monkeypatch.setenv("PV_VAULT_SUPPLIER_LAN_PORT", "9443")
 
     app.dependency_overrides[get_authentication_store] = (
         lambda: authentication_store

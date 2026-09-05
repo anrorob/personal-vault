@@ -33,10 +33,12 @@ from app.vault_supplier_lan import (
     LAN_PROTOCOL_VERSION,
     VERIFY_PATH,
     LanServerIdentity,
+    LanEndpointHintConfigurationError,
     ServerIdentityUnavailable,
     canonical_payload,
     get_lan_server_identity,
     lan_port,
+    lan_endpoint_hint,
     validate_nonce,
 )
 
@@ -618,6 +620,10 @@ def pair(body: PairRequest, store: VaultSupplierStore = Depends(get_vault_suppli
         public_key = _public_key(body.installation_public_key, body.key_algorithm)
     except ValueError:
         raise _domain_error("invalid_installation_key") from None
+    try:
+        endpoint_hint = lan_endpoint_hint()
+    except LanEndpointHintConfigurationError:
+        raise _domain_error("invalid_lan_endpoint_hint", status.HTTP_503_SERVICE_UNAVAILABLE) from None
     vault_id, display_name = store.local_vault()
     binding = pairing_binding(vault_id, server_identity)
     try:
@@ -631,7 +637,7 @@ def pair(body: PairRequest, store: VaultSupplierStore = Depends(get_vault_suppli
     auth.record_security_event("vault_supplier_paired", user_id=code.user_id, actor_user_id=code.user_id, metadata={"installation_id":str(installation.installation_id)})
     auth.record_security_event("vault_supplier_user_authorized", user_id=code.user_id, actor_user_id=code.user_id, metadata={"installation_id":str(installation.installation_id)})
     auth.record_security_event("vault_supplier_installation_registered", user_id=code.user_id, actor_user_id=code.user_id, metadata={"installation_id":str(installation.installation_id)})
-    return {"vault_id":str(code.vault_id), "vault_display_name":display_name, "user_id":str(code.user_id), "user_display_name":account.display_name, "installation_id":str(installation.installation_id), "protocol_version":PROTOCOL_VERSION, "lan_connection_metadata":{"available":False,"mode":"unavailable"}, "server_identity":server_identity.pairing_response()}
+    return {"vault_id":str(code.vault_id), "vault_display_name":display_name, "user_id":str(code.user_id), "user_display_name":account.display_name, "installation_id":str(installation.installation_id), "protocol_version":PROTOCOL_VERSION, "lan_connection_metadata":{"available":False,"mode":"unavailable"}, "server_identity":server_identity.pairing_response(), "lan_endpoint_hint":endpoint_hint}
 
 
 class LanVerifyRequest(BaseModel):

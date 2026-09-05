@@ -19,3 +19,22 @@ Discovery advertises `_vault-supplier._tcp.local.` as `Personal Vault <first-eig
 `GET /api/vault-supplier/lan/identity` returns unsigned discovery metadata. `POST /api/vault-supplier/lan/verify` accepts only `{"protocol_version":1,"nonce":"<43-char-unpadded-base64url>"}`. The nonce decodes to exactly 32 bytes. The response has the exact signed seven-line LF-terminated UTF-8 canonical payload, standard padded Base64 of that payload, and standard padded Base64 ASN.1 DER ECDSA P-256/SHA-256 signature defined by VS-003B. This pairing foundation advertises `receiver_available=false` and `resumable_upload_supported=false`. File transfer is not included.
 
 LAN errors use `{"detail":{"code":"...","message":"..."}}`: `invalid_nonce` and `protocol_mismatch` are HTTP 400; an unavailable signing identity is HTTP 500 `server_identity_unavailable`.
+
+Successful pairing responses also expose optional `lan_endpoint_hint`, derived
+from the listener's existing public PEM certificate through a read-only mount
+configured by `PV_VAULT_SUPPLIER_LAN_CERTIFICATE_PATH`, and its explicitly
+configured `PV_VAULT_SUPPLIER_LAN_PORT`. Exactly one valid DNS SAN is required.
+For example, a certificate for `vault-lan.local` and port `9443` yield
+`https://vault-lan.local:9443`. Unset the certificate pointer to return JSON null;
+older servers may omit the field. Malformed explicit configuration fails safely.
+
+The hint is location only, separate from management origin and unchanged
+`lan_connection_metadata` capability/mode information. A LAN endpoint hint MUST
+NOT be treated as authenticated solely because it came from the pairing response.
+Clients independently validate TLS, Vault UUID, pinned key ID/SPKI, fresh nonce,
+canonical payload, ECDSA signature, and signed port/capabilities before use.
+See [pairing protocol v1](vault-supplier-pairing-protocol-v1.md) for validation
+and configuration details. No certificate or signing key is generated or rotated.
+
+Self-hosted LAN identity and verification require an explicit
+`PV_VAULT_SUPPLIER_LAN_PORT`; there is no product default port.
