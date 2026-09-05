@@ -85,7 +85,7 @@ def test_identity_and_verify_match_the_exact_signed_contract(client: TestClient)
     expected = canonical_payload(
         vault_id=UUID(paired["vault_id"]), nonce=nonce,
         key_id=paired["server_identity"]["key_id_sha256"], port=9443,
-        receiver_available=False, resumable_upload_supported=False,
+        receiver_available=True, resumable_upload_supported=True,
     )
     assert payload == expected
     assert verify_signature(b64decode(paired["server_identity"]["public_key_spki_der_base64"], validate=True), payload, verified["signature_der_base64"])
