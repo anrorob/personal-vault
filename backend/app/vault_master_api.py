@@ -116,7 +116,7 @@ from app.vault_master_ingestion_ai import (
     routing_signature,
 )
 from app.tv_shows import parse_reviewed_episode
-from app.tv_disc_resolver import discover_tv_disc_batches, resolve_tv_disc_batch
+from app.tv_disc_resolver import RESOLVER_VERSION, discover_tv_disc_batches, resolve_tv_disc_batch
 from app.tv_resolver_publication import PostgresTvResolverStore
 from app.vault_master_autopilot import (
     AUTOPILOT_MAX_FAILURE_PERCENT,
@@ -4690,8 +4690,11 @@ def list_tv_resolver_batches(
     # deployed PostgreSQL uses durable review records.
     durable = None if isinstance(store, MemoryVaultMasterStore) or owner_id is None else PostgresTvResolverStore(get_database_conninfo())
     if durable is not None:
-        for batch in batches:
-            durable.sync_proposal(owner_id, batch, resolve_tv_disc_batch(batch))
+        try:
+            for batch in batches:
+                durable.sync_proposal(owner_id, batch, resolve_tv_disc_batch(batch))
+        except ValueError as error:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
         return {"batches": durable.list_for_owner(owner_id)}
     proposals = []
     for batch in batches:
@@ -4699,7 +4702,7 @@ def list_tv_resolver_batches(
         proposals.append(
             {
                 "batch_key": proposal.batch_key,
-                "resolver_version": "pv-tv-disc-resolver.v1",
+                "resolver_version": RESOLVER_VERSION,
                 "show_title": proposal.show_title,
                 "confidence": proposal.confidence,
                 "needs_review": proposal.needs_review,

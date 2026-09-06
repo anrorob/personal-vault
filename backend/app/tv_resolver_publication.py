@@ -36,7 +36,9 @@ class DurableTvResolverBatch:
     proposal_fingerprint: str
 
 
-def _source_identity(items: Iterable[ImportItem]) -> str:
+def _source_identity(items: Iterable[ImportItem], show_title: str | None) -> str:
+    if show_title:
+        return f"show:{' '.join(show_title.casefold().split())}"
     identities: set[str] = set()
     for item in items:
         context = item.metadata.get("source_context")
@@ -49,8 +51,6 @@ def _source_identity(items: Iterable[ImportItem]) -> str:
             identities.add(value.casefold())
     if len(identities) == 1:
         return f"supplier:{next(iter(identities))}"
-    if identities:
-        raise ValueError("TV resolver batch source provenance is conflicting")
     # Non-Supplier imports retain a stable Arrival Hall grouping identity.  It
     # is advisory batch evidence only, never a filesystem authority.
     parents = {
@@ -142,9 +142,12 @@ class PostgresTvResolverStore:
                 )
             """)
 
+            cursor.execute("CREATE INDEX IF NOT EXISTS vault_tv_resolver_tracks_arrival_item_idx ON vault_tv_resolver_tracks (arrival_item_id, batch_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS vault_tv_resolver_batches_owner_status_idx ON vault_tv_resolver_batches (owner_user_id, status)")
+
     def sync_proposal(self, owner_user_id: UUID, items: Iterable[ImportItem], proposal: TvBatchProposal) -> DurableTvResolverBatch:
         members = tuple(items)
-        source_identity = _source_identity(members)
+        source_identity = _source_identity(members, proposal.show_title)
         fingerprint = _fingerprint(proposal, source_identity)
         conflicts = ["show identity is missing or conflicting"] if proposal.show_title is None else []
         status = "needs_review" if proposal.needs_review or conflicts else "proposed"
@@ -153,9 +156,22 @@ class PostgresTvResolverStore:
             row = cursor.fetchone()
             if row:
                 return DurableTvResolverBatch(row["id"], row["owner_user_id"], row["status"], row["proposed_show_title"], row["confidence"], row["source_identity"], row["resolver_version"], row["proposal_fingerprint"])
-            cursor.execute("""UPDATE vault_tv_resolver_batches SET status='superseded', updated_at=CURRENT_TIMESTAMP
-                              WHERE owner_user_id=%s AND source_identity=%s
-                                AND status IN ('proposed','needs_review')""", (owner_user_id, source_identity))
+            member_ids = [item.id for item in members]
+            cursor.execute("SELECT * FROM vault_tv_resolver_batches WHERE id IN (SELECT track.batch_id FROM vault_tv_resolver_tracks track JOIN vault_tv_resolver_batches batch ON batch.id=track.batch_id WHERE batch.owner_user_id=%s AND track.arrival_item_id=ANY(%s) AND batch.status IN ('proposed','needs_review','approved','publishing','published','failed')) FOR UPDATE", (owner_user_id, member_ids))
+            supersede: list[UUID] = []
+            for existing in [dict(entry) for entry in cursor.fetchall()]:
+                cursor.execute("SELECT arrival_item_id FROM vault_tv_resolver_tracks WHERE batch_id=%s", (existing["id"],))
+                old_members = {entry["arrival_item_id"] for entry in cursor.fetchall()}
+                if existing["status"] in {"approved", "publishing", "published", "failed"}:
+                    raise ValueError("TV resolver proposal overlaps a protected publication batch; review is required")
+                if set(member_ids) < old_members:
+                    return DurableTvResolverBatch(existing["id"], existing["owner_user_id"], existing["status"], existing["proposed_show_title"], existing["confidence"], existing["source_identity"], existing["resolver_version"], existing["proposal_fingerprint"])
+                if old_members <= set(member_ids):
+                    supersede.append(existing["id"])
+                else:
+                    raise ValueError("TV resolver proposal partially overlaps an active review batch; review is required")
+            if supersede:
+                cursor.execute("UPDATE vault_tv_resolver_batches SET status='superseded', updated_at=CURRENT_TIMESTAMP WHERE id=ANY(%s)", (supersede,))
             batch_id = uuid4()
             cursor.execute("""INSERT INTO vault_tv_resolver_batches
                 (id,owner_user_id,resolver_version,source_identity,proposed_show_title,status,confidence,evidence,conflicts,proposal_fingerprint)

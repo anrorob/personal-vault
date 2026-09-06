@@ -17,7 +17,7 @@ from uuid import UUID
 from app.vault_master import INCOMING_SOURCE, ImportItem
 
 
-RESOLVER_VERSION = "pv-tv-disc-resolver.v1"
+RESOLVER_VERSION = "pv-tv-disc-resolver.v2"
 _DISC_TRACK = re.compile(r"\bdisc\s*(?P<disc>\d+)\s*[_ -]*t(?P<track>\d+)\b", re.I)
 _SEASON = re.compile(r"\bseason\s*(?P<season>\d{1,3})\b", re.I)
 _SHOW_FROM_NAME = re.compile(r"^(?P<show>.+?)\s*-?\s*season\s*\d{1,3}\b", re.I)
@@ -113,7 +113,7 @@ def _duration_cluster(durations: list[float]) -> tuple[float, float] | None:
     best: list[float] = []
     for candidate in ordered:
         band = [duration for duration in ordered if candidate * .72 <= duration <= candidate * 1.45]
-        if len(band) > len(best) or (len(band) == len(best) and sum(band) > sum(best)):
+        if len(band) >= 3 and (not best or median(band) > median(best) or (median(band) == median(best) and len(band) > len(best))):
             best = band
     if len(best) < 3:
         return None
@@ -131,8 +131,8 @@ def resolve_tv_disc_batch(items: Iterable[ImportItem]) -> TvBatchProposal:
         parsed.append((item, path_show, path_season, name_show, name_season, disc_track, _duration(item)))
     shows = {show.casefold(): show for _, path_show, _, name_show, _, _, _ in parsed for show in (path_show, name_show) if show}
     show_title = next(iter(shows.values()), None) if len(shows) == 1 else None
-    durations = [duration for *_, duration in parsed if duration is not None]
-    cluster = _duration_cluster(durations)
+    season_clusters = {season: _duration_cluster([duration for _, _, path_season, _, name_season, _, duration in parsed if (path_season or name_season) == season and duration is not None]) for season in {path_season or name_season for _, _, path_season, _, name_season, _, _ in parsed} if season is not None}
+    fallback_cluster = _duration_cluster([duration for *_, duration in parsed if duration is not None])
     duplicate_item_ids: set[UUID] = set()
     seen_hashes: set[str] = set()
     # Preserve the first staged instance as the candidate.  Exact later
@@ -147,8 +147,8 @@ def resolve_tv_disc_batch(items: Iterable[ImportItem]) -> TvBatchProposal:
         evidence.append("show name agrees across available context")
     else:
         evidence.append("show name is missing or conflicting")
-    if cluster:
-        evidence.append(f"runtime cluster centre={round(cluster[0])}s")
+    if any(season_clusters.values()):
+        evidence.append("per-season longest coherent runtime cluster")
     else:
         evidence.append("no reliable runtime cluster")
 
@@ -157,6 +157,7 @@ def resolve_tv_disc_batch(items: Iterable[ImportItem]) -> TvBatchProposal:
         track_evidence: list[str] = []
         conflict = path_season is not None and name_season is not None and path_season != name_season
         season = path_season or name_season
+        cluster = season_clusters.get(season) or fallback_cluster
         if path_season is not None and path_season == name_season:
             track_evidence.append("folder and filename season agree")
         elif conflict:
@@ -206,17 +207,13 @@ def discover_tv_disc_batches(items: Iterable[ImportItem]) -> tuple[tuple[ImportI
     """
     groups: dict[tuple[UUID | None, str], list[ImportItem]] = {}
     for item in items:
-        if item.source_kind != INCOMING_SOURCE or parse_disc_track(item.filename) is None:
+        if item.source_kind != INCOMING_SOURCE or item.state in {"moved", "arrival_removed", "rejected"} or parse_disc_track(item.filename) is None:
             continue
         path_show, path_season = _path_context(item)
         name_show, name_season = _filename_context(item)
         show = path_show or name_show
         if show is None or (path_season is None and name_season is None):
             continue
-        context = item.metadata.get("source_context")
-        source_id = context.get("source_id") if isinstance(context, dict) else None
-        source_label = context.get("source_label") if isinstance(context, dict) else None
-        source_key = source_id if isinstance(source_id, str) and source_id else source_label
-        grouping_key = f"supplier:{source_key.casefold()}" if isinstance(source_key, str) and source_key else f"show:{show.casefold()}"
+        grouping_key = f"show:{show.casefold()}"
         groups.setdefault((item.owner_user_id, grouping_key), []).append(item)
     return tuple(tuple(group) for _, group in sorted(groups.items(), key=lambda pair: pair[0][1]))
