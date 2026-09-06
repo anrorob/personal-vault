@@ -328,8 +328,8 @@ async def run_vault_master_worker() -> None:
                 managed_arrival = await asyncio.to_thread(reconcile_next_arrival_managed_receipt, store)
                 if managed_arrival is not None:
                     logger.info("Arrival Hall managed receipt reconciled: asset_id=%s", managed_arrival)
-                    # A resolver batch requests exactly one bounded scan after
-                    # all of its canonical episode receipts are durable.  Scan
+                    # A resolver batch requests one bounded scan per completed
+                    # episode/extras publication phase. Scan
                     # failure never reverses canonical publication.
                     published_batches = await asyncio.to_thread(
                         PostgresTvResolverStore(get_database_conninfo()).reconcile
@@ -360,6 +360,10 @@ async def run_vault_master_worker() -> None:
                         _arrival_hall_source_context_reference,
                     )
                 )
+            from app.arrival_managed_publisher import reconcile_rejected_request
+            rejected = await asyncio.to_thread(reconcile_rejected_request, store)
+            if rejected is not None:
+                await asyncio.to_thread(PostgresTvResolverStore(get_database_conninfo()).reconcile)
             # Move failures do not produce a managed receipt, but they still
             # need to become durable resolver-batch failure state for retry.
             if processed is not None and managed_arrival is None:

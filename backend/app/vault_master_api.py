@@ -4683,19 +4683,31 @@ def list_tv_resolver_batches(
     """
     response.headers["Cache-Control"] = "private, no-store"
     owner_id = getattr(username, "user_id", None)
-    batches = discover_tv_disc_batches(
-        item for item in store.list_items() if item.owner_user_id == owner_id
-    )
     # Unit-test and local memory stores retain the existing read-only view;
     # deployed PostgreSQL uses durable review records.
     durable = None if isinstance(store, MemoryVaultMasterStore) or owner_id is None else PostgresTvResolverStore(get_database_conninfo())
     if durable is not None:
+        # Retain the approved 99-track review as staging shrinks during delivery.
+        # Its remaining extras must not generate an overlapping replacement.
+        protected_ids = {
+            track["arrival_item_id"]
+            for batch in durable.list_for_owner(owner_id, include_complete=True)
+            if batch["status"] in {"approved", "publishing", "published", "failed", "complete"}
+            for track in batch["tracks"]
+        }
+        batches = discover_tv_disc_batches(
+            item for item in store.list_items()
+            if item.owner_user_id == owner_id and item.id not in protected_ids
+        )
         try:
             for batch in batches:
                 durable.sync_proposal(owner_id, batch, resolve_tv_disc_batch(batch))
         except ValueError as error:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
         return {"batches": durable.list_for_owner(owner_id)}
+    batches = discover_tv_disc_batches(
+        item for item in store.list_items() if item.owner_user_id == owner_id
+    )
     proposals = []
     for batch in batches:
         proposal = resolve_tv_disc_batch(batch)
@@ -4766,6 +4778,19 @@ def approve_tv_resolver_batch(
     durable = _durable_tv_resolver_batch(batch_id, username, store)
     try:
         return durable.approve(batch_id, username.user_id, str(username), request.publication_audience)
+    except LookupError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND) from None
+    except ValueError as error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+
+
+@router.post("/tv-resolver/batches/{batch_id}/publish-extras")
+def publish_tv_resolver_extras(
+    batch_id: UUID, username: AuthenticatedUsername, store: VaultMasterStoreDependency,
+) -> dict[str, object]:
+    durable = _durable_tv_resolver_batch(batch_id, username, store)
+    try:
+        return durable.publish_extras(batch_id, username.user_id, str(username))
     except LookupError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND) from None
     except ValueError as error:

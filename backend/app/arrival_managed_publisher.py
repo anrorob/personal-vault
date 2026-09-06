@@ -50,6 +50,8 @@ class ArrivalManagedPublicationRequest:
 
     @classmethod
     def create(cls, *, item: ImportItem) -> "ArrivalManagedPublicationRequest":
+        from app.tv_publication_authority import validate_request_authority
+        validate_request_authority(item)
         if (
             item.owner_user_id is None
             or not item.relative_path
@@ -63,6 +65,11 @@ class ArrivalManagedPublicationRequest:
             _logical_destination(item.proposed_destination), item.sha256,
             item.size_bytes, datetime.now(UTC).isoformat(),
         )
+
+
+@dataclass(frozen=True)
+class ResolverRelocationRequest(ArrivalManagedPublicationRequest):
+    recovery: dict[str, str]
 
 
 def queue_request(request: ArrivalManagedPublicationRequest, *, queue_root: Path, key: bytes) -> Path:
@@ -82,7 +89,7 @@ def verify_request(document: object, key: bytes) -> ArrivalManagedPublicationReq
         return None
     request = document["request"]
     required = {"request_id", "item_id", "owner_user_id", "source_relative_path", "logical_destination", "expected_sha256", "expected_size_bytes", "created_at"}
-    if set(request) != required:
+    if set(request) not in (required, required | {"recovery"}):
         return None
     signature = hmac.new(key, _payload(request), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(signature, document["signature"]):
@@ -96,6 +103,8 @@ def verify_request(document: object, key: bytes) -> ArrivalManagedPublicationReq
             expected_sha256=str(request["expected_sha256"]),
             expected_size_bytes=int(request["expected_size_bytes"]), created_at=str(request["created_at"]),
         )
+        if "recovery" in request:
+            parsed = ResolverRelocationRequest(**asdict(parsed), recovery=request["recovery"])
         created_at = datetime.fromisoformat(parsed.created_at)
     except (TypeError, ValueError):
         return None
@@ -149,11 +158,13 @@ def verify_receipt(document: object, key: bytes) -> dict[str, object] | None:
     receipt = document["receipt"]
     required = {"request_id", "item_id", "owner_user_id", "logical_destination", "logical_area", "slot_id", "relative_path", "expected_sha256", "expected_size_bytes", "verified_at"}
     signature = hmac.new(key, _payload(receipt), hashlib.sha256).hexdigest()
-    return receipt if set(receipt) == required and hmac.compare_digest(signature, document["signature"]) else None
+    return receipt if set(receipt) in (required, required | {"recovery"}) and hmac.compare_digest(signature, document["signature"]) else None
 
 
-def queue_item(item: ImportItem) -> None:
-    queue_request(ArrivalManagedPublicationRequest.create(item=item), queue_root=_queue_root(), key=_key())
+def queue_item(item: ImportItem) -> UUID:
+    request = ArrivalManagedPublicationRequest.create(item=item)
+    queue_request(request, queue_root=_queue_root(), key=_key())
+    return request.request_id
 
 
 def reissue_item(item: ImportItem, incoming_root: Path) -> Path:
@@ -200,9 +211,45 @@ def reconcile_next_receipt(store: object) -> UUID | None:
             receipt = verify_receipt(json.loads(receipt_path.read_text(encoding="utf-8")), key)
             if receipt is None:
                 continue
-            published = store.publish_arrival_managed_receipt(UUID(str(receipt["item_id"])), receipt)
+            if "recovery" in receipt:
+                from app.tv_resolver_recovery import reconcile_relocation
+                published = reconcile_relocation(store, receipt)
+            else:
+                published = store.publish_arrival_managed_receipt(UUID(str(receipt["item_id"])), receipt)
             if published is not None:
                 return published.id
         except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            continue
+    return None
+
+
+def reconcile_rejected_request(store: object) -> UUID | None:
+    try:
+        key = _key()
+    except OSError:
+        return None
+    for path in sorted(_queue_root().glob('*.rejected.request')):
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            request = verify_request(json.loads(path.read_text(encoding='utf-8')), key)
+            if request is None:
+                continue
+            item = store.get_item(request.item_id)
+            if (item is None or item.state != 'theatre_promotion_pending'
+                or not item.metadata.get('tv_resolver_batch_id')
+                or item.metadata.get('managed_request_id') != str(request.request_id)
+                or item.owner_user_id != request.owner_user_id
+                or item.sha256 != request.expected_sha256
+                or item.proposed_destination != request.logical_destination):
+                continue
+            # A successful signed receipt takes precedence (e.g. source cleanup
+            # failed after publication); normal receipt reconciliation owns it.
+            if (_receipt_root() / f'{request.request_id}.json').exists():
+                continue
+            store.record_move_result(item.id, 'move_failed', 'Arrival Hall managed publisher',
+                'Managed publisher rejected this attempt; source, checksum, destination or capacity verification failed')
+            return item.id
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
             continue
     return None

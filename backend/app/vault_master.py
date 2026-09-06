@@ -1366,7 +1366,7 @@ class VaultMasterStore(Protocol):
 
     def claim_next_move(self) -> ImportItem | None: ...
 
-    def mark_theatre_promotion_pending(self, item_id: UUID) -> ImportItem | None: ...
+    def mark_theatre_promotion_pending(self, item_id: UUID, request_id: UUID | None = None) -> ImportItem | None: ...
 
     def publish_arrival_managed_receipt(
         self, item_id: UUID, receipt: dict[str, object]
@@ -1416,6 +1416,8 @@ def safely_move_approved_file(
     incoming_root: Path,
     destination_root: Path,
 ) -> Path:
+    if item.metadata.get("tv_resolver_batch_id"):
+        raise ValueError("TV resolver episodes require managed canonical TV publication")
     if item.state not in {"approved", "move_failed"}:
         raise ValueError("Only an approved file can be moved")
     if Path(item.filename).name != item.filename:
@@ -3557,18 +3559,26 @@ def process_next_move(
     incoming_root: Path,
     destination_roots: dict[str, Path],
     playback_publisher: Callable[[tuple[Path, ...]], object] | None = None,
-    theatre_queue: Callable[[ImportItem], None] | None = None,
+    theatre_queue: Callable[[ImportItem], object] | None = None,
 ) -> UUID | None:
     item = store.claim_next_move()
     if item is None:
         return None
+    if item.state == "move_failed":
+        return item.id
+    from app.tv_publication_authority import validate_request_authority
+    try:
+        validate_request_authority(item)
+    except ValueError as error:
+        store.record_move_result(item.id, "move_failed", "Vault Master worker", str(error))
+        return item.id
     if item.proposed_category in {"Movies", "TV Shows"}:
         if theatre_queue is None:
             store.record_move_result(item.id, "move_failed", "Vault Master worker", "Theatre publisher is unavailable")
             return item.id
         try:
-            theatre_queue(item)
-            store.mark_theatre_promotion_pending(item.id)
+            request_id = theatre_queue(item)
+            store.mark_theatre_promotion_pending(item.id, request_id if isinstance(request_id, UUID) else None)
         except (OSError, ValueError) as error:
             store.record_move_result(item.id, "move_failed", "Vault Master worker", str(error))
         return item.id
@@ -3920,6 +3930,12 @@ class MemoryVaultMasterStore:
         scanned_file: ScannedFile,
     ) -> ImportItem:
         existing = self.items.get(scanned_file.source_path)
+        if existing and existing.metadata.get("tv_resolver_batch_id"):
+            if (existing.sha256 != scanned_file.sha256
+                or existing.size_bytes != scanned_file.size_bytes
+                or (scanned_file.owner_user_id is not None and existing.owner_user_id != scanned_file.owner_user_id)):
+                raise ValueError("Rescan conflicts with approved TV resolver evidence")
+            return existing
         state = (
             "inventoried"
             if source_kind == INVENTORY_SOURCE
@@ -5397,11 +5413,11 @@ class MemoryVaultMasterStore:
                 return claimed
         return None
 
-    def mark_theatre_promotion_pending(self, item_id: UUID) -> ImportItem | None:
+    def mark_theatre_promotion_pending(self, item_id: UUID, request_id: UUID | None = None) -> ImportItem | None:
         item = self._find_item(item_id)
         if item is None or item.state != "moving":
             return None
-        updated = ImportItem(**{**item.__dict__, "state": "theatre_promotion_pending"})
+        updated = ImportItem(**{**item.__dict__, "state": "theatre_promotion_pending", "metadata": {**item.metadata, "managed_request_id": str(request_id) if request_id else None}})
         self.items[item.source_path] = updated
         return updated
 
@@ -7150,13 +7166,24 @@ class PostgresVaultMasterStore:
                     owner_user_id = self._resolve_owner_user_id(cursor, owner_username)
                 cursor.execute(
                     """
-                    SELECT sha256, proposed_category, proposal_reason
+                    SELECT *
                     FROM vault_master_items
                     WHERE source_path = %s
+                    FOR UPDATE
                     """,
                     (scanned_file.source_path,),
                 )
                 existing = cursor.fetchone()
+                if existing is not None and source_kind == INCOMING_SOURCE:
+                    from app.tv_publication_authority import approved_projection
+                    protected = self._to_item(existing)
+                    if approved_projection(cursor, protected) is not None:
+                        if (protected.sha256 != scanned_file.sha256
+                            or protected.size_bytes != scanned_file.size_bytes
+                            or protected.owner_user_id != owner_user_id):
+                            raise ValueError("Rescan conflicts with approved TV resolver evidence")
+                        # Approval is a durable decision, not fresh scan metadata.
+                        return protected
                 effective_category = proposal[0]
                 if (
                     existing is not None
@@ -9987,12 +10014,29 @@ class PostgresVaultMasterStore:
                     (row["id"],),
                 )
                 claimed = cursor.fetchone()
+                from app.tv_publication_authority import approved_projection
+                try:
+                    projection = approved_projection(cursor, self._to_item(claimed))
+                except ValueError as error:
+                    cursor.execute("UPDATE vault_master_items SET state='move_failed' WHERE id=%s RETURNING *", (claimed['id'],))
+                    failed = cursor.fetchone()
+                    cursor.execute("INSERT INTO vault_master_activity(id,item_id,action,username,detail,succeeded) VALUES (%s,%s,'move_failed','Vault Master worker',%s,FALSE)", (uuid4(), claimed['id'], str(error)))
+                    return self._to_item(failed)
+                if projection is not None:
+                    cursor.execute(
+                        """UPDATE vault_master_items SET proposed_category='TV Shows',
+                           proposed_destination=%s, publication_audience=%s, metadata=%s
+                           WHERE id=%s RETURNING *""",
+                        (projection["proposed_destination"], projection["publication_audience"],
+                         Jsonb(projection["metadata"]), claimed["id"]),
+                    )
+                    claimed = cursor.fetchone()
         return self._to_item(claimed)
 
-    def mark_theatre_promotion_pending(self, item_id: UUID) -> ImportItem | None:
+    def mark_theatre_promotion_pending(self, item_id: UUID, request_id: UUID | None = None) -> ImportItem | None:
         with self._connect() as connection:
             with connection.cursor() as cursor:
-                cursor.execute("UPDATE vault_master_items SET state='theatre_promotion_pending', updated_at=CURRENT_TIMESTAMP WHERE id=%s AND state='moving' RETURNING *", (item_id,))
+                cursor.execute("UPDATE vault_master_items SET state='theatre_promotion_pending', metadata=metadata || %s, updated_at=CURRENT_TIMESTAMP WHERE id=%s AND state='moving' RETURNING *", (Jsonb({'managed_request_id': str(request_id) if request_id else None}), item_id))
                 row = cursor.fetchone()
         return self._to_item(row) if row else None
 
@@ -10123,8 +10167,11 @@ class PostgresVaultMasterStore:
                     # The root executor has already moved its bytes by the time
                     # this receipt is reconciled, so reject malformed review
                     # state before creating (or marking) any catalogue record.
-                    if category == "TV Shows" and not self._valid_tv_receipt_group(
-                        cursor, item, tv_marker
+                    from app.tv_extras import valid_extra_receipt
+                    is_extra = category == 'TV Shows' and isinstance(item.metadata.get('tv_extra'), dict)
+                    if category == "TV Shows" and not (
+                        valid_extra_receipt(cursor, item) if is_extra
+                        else self._valid_tv_receipt_group(cursor, item, tv_marker)
                     ):
                         return None
                     logical_area = f"Theatre / {category}"
@@ -10184,6 +10231,9 @@ class PostgresVaultMasterStore:
                         cursor.execute("UPDATE vault_assets SET metadata = metadata || %s, metadata_provenance = metadata_provenance || %s, effective_metadata = effective_metadata || %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s", (Jsonb({"storage_placement": placement}), Jsonb({"storage_placement": "root_verified_receipt"}), Jsonb({"storage_placement": placement}), file_row["asset_id"]))
                         cursor.execute("UPDATE vault_master_items SET state = 'moved', updated_at = CURRENT_TIMESTAMP WHERE id = %s", (item.id,))
                         asset_id = UUID(str(file_row["asset_id"]))
+                        if is_extra:
+                            cursor.execute("INSERT INTO vault_tv_extras(asset_id,season_id) VALUES (%s,%s)", (asset_id, UUID(item.metadata['tv_extra']['season_id'])))
+                            cursor.execute("UPDATE vault_assets SET metadata=metadata || %s, effective_metadata=effective_metadata || %s, metadata_provenance=metadata_provenance || %s WHERE id=%s", (Jsonb({'tv_extra': item.metadata['tv_extra']}), Jsonb({'tv_extra': item.metadata['tv_extra']}), Jsonb({'tv_extra': 'approved_tv_resolver'}), asset_id))
                     cursor.execute("INSERT INTO vault_master_activity (id, batch_id, item_id, action, username, detail, succeeded) VALUES (%s, %s, %s, 'file_moved', %s, %s, TRUE)", (uuid4(), item.batch_id, item.id, "Arrival Hall managed publisher", f"Published root-verified managed receipt {receipt['request_id']}"))
                     sidecar_vault_path = destination
         except psycopg.errors.UniqueViolation:
@@ -10240,6 +10290,21 @@ class PostgresVaultMasterStore:
         if len(members) != len(member_numbers):
             return False
         audiences = {member.publication_audience for member in members}
+        if item.metadata.get("tv_resolver_batch_id"):
+            from app.tv_publication_authority import approved_projection
+            try:
+                for member in members:
+                    projection = approved_projection(cursor, member)
+                    if (projection is None or projection["metadata"]["tv_publication_set"] != marker
+                        or member.metadata.get("tv_publication_set") != marker
+                        or member.proposed_category != "TV Shows"
+                        or member.proposed_destination != projection["proposed_destination"]
+                        or member.publication_audience != projection["publication_audience"]
+                        or member.state not in {"move_queued", "moving", "theatre_promotion_pending", "moved", "move_failed"}):
+                        return False
+            except ValueError:
+                return False
+            return len(audiences) == 1 and audiences <= {"private", "vault-wide"}
         from app.tv_shows import parse_reviewed_episode
         expected_source = marker["source_directory"]
         expected_title = marker["show_title"]
@@ -10560,6 +10625,7 @@ class PostgresVaultMasterStore:
                         IF to_regclass('vault_tv_publication_set_members') IS NOT NULL THEN
                             DELETE FROM vault_tv_publication_set_members;
                             DELETE FROM vault_tv_publication_sets;
+                            DELETE FROM vault_tv_extras;
                             DELETE FROM vault_tv_episodes;
                             DELETE FROM vault_tv_seasons;
                             DELETE FROM vault_tv_shows;

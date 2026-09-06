@@ -131,6 +131,11 @@ class PostgresTvShowStore:
                     UNIQUE(show_id, season_number)
                 )
             """)
+            cursor.execute("""CREATE TABLE IF NOT EXISTS vault_tv_extras (
+                asset_id UUID PRIMARY KEY REFERENCES vault_assets(id) ON DELETE RESTRICT,
+                season_id UUID NOT NULL REFERENCES vault_tv_seasons(id) ON DELETE RESTRICT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )""")
             cursor.execute("ALTER TABLE vault_tv_seasons ADD COLUMN IF NOT EXISTS owned_artwork JSONB NOT NULL DEFAULT '{}'::jsonb")
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS vault_tv_episodes (

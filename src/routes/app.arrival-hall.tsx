@@ -18,6 +18,8 @@ import {
 import { useCallback, useEffect, useRef, useState } from "react";
 import { formatPhotoDate } from "@/lib/gallery";
 import { getAuthSession } from "@/lib/auth";
+import { TvResolverActions, type TvResolverAction } from "@/components/TvResolverActions";
+import { normalizeTvResolverBatches, tvCounts, type TvResolverBatch } from "@/lib/tv-resolver";
 import {
   encodeArrivalHallPath,
   formatBytes,
@@ -93,47 +95,6 @@ type BulkActionProgress = {
   itemIds: string[];
 };
 
-type TvResolverTrack = {
-  id: string;
-  original_filename: string;
-  runtime_seconds: number | null;
-  disc_number: number | null;
-  track_number: number | null;
-  classification: string;
-  proposed_season_number: number | null;
-  proposed_episode_number: number | null;
-  canonical_destination: string | null;
-  confidence: number | null;
-  evidence: string[];
-  publication_state: string;
-  failure_detail: string | null;
-};
-type TvResolverSeason = {
-  season_number: number;
-  episode_candidate_count: number;
-  extra_count: number;
-  unresolved_count: number;
-};
-type TvResolverBatch = {
-  id: string;
-  status: string;
-  proposed_show_title: string | null;
-  confidence: number | null;
-  seasons: TvResolverSeason[];
-  tracks: TvResolverTrack[];
-};
-
-function tvCounts(batch: TvResolverBatch) {
-  const episodes = batch.tracks.filter((track) => track.classification === "episode_candidate");
-  return {
-    episodes: episodes.length,
-    extras: batch.tracks.filter((track) => track.classification === "extra").length,
-    unresolved: batch.tracks.filter((track) => track.classification === "unresolved").length,
-    failed: episodes.filter((track) => track.publication_state === "failed").length,
-    published: episodes.filter((track) => track.publication_state === "published").length,
-  };
-}
-
 function runtime(seconds: number | null) {
   return seconds ? `${Math.round(seconds / 60)}m` : "Runtime unavailable";
 }
@@ -164,6 +125,7 @@ function ArrivalHallPage() {
   const [listing, setListing] = useState<ArrivalHallListing | null>(null);
   const [vaultMaster, setVaultMaster] = useState<VaultMasterListing | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [savingDecision, setSavingDecision] = useState<string | null>(null);
   const [itemActions, setItemActions] = useState<Record<string, ItemAction>>({});
@@ -200,6 +162,7 @@ function ArrivalHallPage() {
   >("all");
   const [isAdministrator, setIsAdministrator] = useState(false);
   const [tvBatches, setTvBatches] = useState<TvResolverBatch[]>([]);
+  const [tvResolverError, setTvResolverError] = useState<string | null>(null);
   const [tvBusy, setTvBusy] = useState<string | null>(null);
 
   useEffect(() => {
@@ -222,49 +185,45 @@ function ArrivalHallPage() {
     const loadVersion = ++loadVersionRef.current;
     setRefreshing(true);
     setError(null);
+    setTvResolverError(null);
+
+    const tvRequest = fetch("/api/vault-master/tv-resolver/batches", {
+      credentials: "include",
+      headers: { Accept: "application/json" },
+    });
 
     try {
-      const [
-        response,
-        vaultMasterResponse,
-        aiResponse,
-        batchesResponse,
-        controlResponses,
-        tvResponse,
-      ] = await Promise.all([
-        fetch("/api/arrival-hall", {
-          credentials: "include",
-          headers: { Accept: "application/json" },
-        }),
-        fetch("/api/vault-master/items", {
-          credentials: "include",
-          headers: { Accept: "application/json" },
-        }),
-        fetch("/api/vault-master/items/ai", {
-          credentials: "include",
-          headers: { Accept: "application/json" },
-        }),
-        fetch("/api/vault-master/items/ai/batches", {
-          credentials: "include",
-          headers: { Accept: "application/json" },
-        }),
-        Promise.all([
-          fetch("/api/vault-master/autopilot", {
+      const [response, vaultMasterResponse, aiResponse, batchesResponse, controlResponses] =
+        await Promise.all([
+          fetch("/api/arrival-hall", {
             credentials: "include",
             headers: { Accept: "application/json" },
           }),
-          isAdministrator
-            ? fetch("/api/vault-master/publication-bundles", {
-                credentials: "include",
-                headers: { Accept: "application/json" },
-              })
-            : Promise.resolve(null),
-        ]),
-        fetch("/api/vault-master/tv-resolver/batches", {
-          credentials: "include",
-          headers: { Accept: "application/json" },
-        }),
-      ]);
+          fetch("/api/vault-master/items", {
+            credentials: "include",
+            headers: { Accept: "application/json" },
+          }),
+          fetch("/api/vault-master/items/ai", {
+            credentials: "include",
+            headers: { Accept: "application/json" },
+          }),
+          fetch("/api/vault-master/items/ai/batches", {
+            credentials: "include",
+            headers: { Accept: "application/json" },
+          }),
+          Promise.all([
+            fetch("/api/vault-master/autopilot", {
+              credentials: "include",
+              headers: { Accept: "application/json" },
+            }),
+            isAdministrator
+              ? fetch("/api/vault-master/publication-bundles", {
+                  credentials: "include",
+                  headers: { Accept: "application/json" },
+                })
+              : Promise.resolve(null),
+          ]),
+        ]);
       const [autopilotResponse, publicationResponse] = controlResponses;
 
       if (response.status === 401) {
@@ -278,8 +237,7 @@ function ArrivalHallPage() {
         !aiResponse.ok ||
         !batchesResponse.ok ||
         !autopilotResponse.ok ||
-        (isAdministrator && !publicationResponse?.ok) ||
-        !tvResponse.ok
+        (isAdministrator && !publicationResponse?.ok)
       ) {
         throw new Error("Arrival Hall request failed");
       }
@@ -315,7 +273,18 @@ function ArrivalHallPage() {
       setAiEvidence(nextAiEvidence);
       setAnalysisBatches(nextAnalysisBatches);
       setAutopilot(nextAutopilot);
-      setTvBatches(((await tvResponse.json()) as { batches: TvResolverBatch[] }).batches);
+      try {
+        const tvResponse = await tvRequest;
+        if (!tvResponse.ok) throw new Error("TV Resolver request failed");
+        const normalized = normalizeTvResolverBatches(await tvResponse.json());
+        setTvBatches(normalized.batches);
+        if (normalized.dropped) {
+          setTvResolverError("Some TV Resolver proposals could not be displayed.");
+        }
+      } catch {
+        setTvBatches([]);
+        setTvResolverError("TV Resolver proposal could not be displayed.");
+      }
       setPublicationBundles(publications);
       setPublicationReviews(
         Object.fromEntries(
@@ -333,7 +302,7 @@ function ArrivalHallPage() {
     }
   }, [isAdministrator, navigate]);
 
-  async function tvAction(batch: TvResolverBatch, action: "approve" | "retry") {
+  async function tvAction(batch: TvResolverBatch, action: TvResolverAction) {
     if (tvBusy) return;
     if (
       action === "approve" &&
@@ -357,7 +326,9 @@ function ArrivalHallPage() {
       setNotice(
         action === "approve"
           ? "TV batch approved; publication progress will refresh automatically."
-          : "Eligible failed episodes were queued for retry.",
+          : action === "publish-extras"
+            ? "TV extras queued for publication in their existing seasons."
+            : "Failed tracks were queued for retry.",
       );
       await loadArrivalHall();
     } catch (caught) {
@@ -1219,6 +1190,9 @@ function ArrivalHallPage() {
 
       {error && <div className="pv-panel p-6 text-sm text-center text-red-300">{error}</div>}
       {notice && <div className="pv-panel p-4 text-sm text-center">{notice}</div>}
+      {tvResolverError && (
+        <div className="pv-panel p-4 text-sm text-center text-amber-200">{tvResolverError}</div>
+      )}
       {tvBatches.length > 0 && (
         <section className="pv-panel p-5 space-y-4" aria-labelledby="tv-resolver-title">
           <div>
@@ -1236,118 +1210,113 @@ function ArrivalHallPage() {
               Series batch review
             </h3>
             <p className="text-xs" style={{ color: "var(--pv-text-dim)" }}>
-              Episode candidates are reviewed and approved as one durable batch. Extras remain
-              staged.
+              Publish episodes first, then publish the classified extras in their existing seasons.
             </p>
           </div>
-          {tvBatches.map((batch) => {
-            const counts = tvCounts(batch);
-            const canApprove =
-              ["proposed", "needs_review"].includes(batch.status) &&
-              counts.unresolved === 0 &&
-              counts.failed === 0;
-            return (
-              <article
-                key={batch.id}
-                className="rounded-lg p-4 space-y-3"
-                style={{ border: "1px solid var(--pv-border)" }}
-              >
-                <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div>
-                    <h4 className="font-semibold" style={{ color: "var(--pv-silver)" }}>
-                      {batch.proposed_show_title ?? "Unresolved TV batch"}
-                    </h4>
-                    <p className="text-xs" style={{ color: "var(--pv-text-dim)" }}>
-                      {batch.seasons.length} seasons · {counts.episodes} episode candidates ·{" "}
-                      {counts.extras} extras · {counts.unresolved} unresolved
-                      {counts.failed ? ` · ${counts.failed} failed` : ""}
-                    </p>
+          {tvBatches
+            .filter((batch) => batch.status !== "complete")
+            .map((batch) => {
+              const counts = tvCounts(batch);
+              return (
+                <article
+                  key={batch.id}
+                  className="rounded-lg p-4 space-y-3"
+                  style={{ border: "1px solid var(--pv-border)" }}
+                >
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <h4 className="font-semibold" style={{ color: "var(--pv-silver)" }}>
+                        {batch.proposed_show_title ?? "Unresolved TV batch"}
+                      </h4>
+                      <p className="text-xs" style={{ color: "var(--pv-text-dim)" }}>
+                        {batch.seasons.length} seasons · {counts.episodes} episodes ·{" "}
+                        {counts.extras} extras · {counts.unresolved} unresolved
+                        {counts.failed ? ` · ${counts.failed} failed` : ""}
+                      </p>
+                    </div>
+                    <span
+                      className="rounded-full px-3 py-1 text-[10px] uppercase tracking-wider"
+                      style={{ color: "var(--pv-gold)", border: "1px solid var(--pv-border)" }}
+                    >
+                      {counts.episodes > 0 && counts.published === counts.episodes
+                        ? "Episodes published"
+                        : batch.status}
+                    </span>
                   </div>
-                  <span
-                    className="rounded-full px-3 py-1 text-[10px] uppercase tracking-wider"
-                    style={{ color: "var(--pv-gold)", border: "1px solid var(--pv-border)" }}
-                  >
-                    {batch.status}
-                  </span>
-                </div>
-                <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-                  {batch.seasons.map((season) => (
-                    <div
-                      key={season.season_number}
-                      className="rounded-md px-3 py-2 text-xs"
-                      style={{ border: "1px solid var(--pv-border)", color: "var(--pv-text-dim)" }}
-                    >
-                      Season {season.season_number} · {season.episode_candidate_count} episodes ·{" "}
-                      {season.extra_count} extras · {season.unresolved_count} unresolved
-                    </div>
-                  ))}
-                </div>
-                {["publishing", "published", "failed"].includes(batch.status) && (
-                  <p className="text-xs" style={{ color: "var(--pv-text-dim)" }}>
-                    Published {counts.published} of {counts.episodes} episodes
-                    {counts.extras ? ` · ${counts.extras} extras remain in Arrival Hall` : ""}
-                  </p>
-                )}
-                <div className="flex flex-wrap gap-2">
-                  <button
-                    type="button"
-                    className="pv-btn-primary"
-                    disabled={!canApprove || tvBusy === batch.id}
-                    onClick={() => void tvAction(batch, "approve")}
-                  >
-                    {tvBusy === batch.id ? "Working…" : "Approve batch"}
-                  </button>
-                  {batch.status === "failed" && (
-                    <button
-                      type="button"
-                      className="pv-btn-secondary"
-                      disabled={tvBusy === batch.id}
-                      onClick={() => void tvAction(batch, "retry")}
-                    >
-                      Retry failed
-                    </button>
+                  <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                    {batch.seasons.map((season) => (
+                      <div
+                        key={season.season_number}
+                        className="rounded-md px-3 py-2 text-xs"
+                        style={{
+                          border: "1px solid var(--pv-border)",
+                          color: "var(--pv-text-dim)",
+                        }}
+                      >
+                        Season {season.season_number} · {season.episode_candidate_count} episodes ·{" "}
+                        {season.extra_count} extras · {season.unresolved_count} unresolved
+                      </div>
+                    ))}
+                  </div>
+                  {["publishing", "published", "failed"].includes(batch.status) && (
+                    <p className="text-xs" style={{ color: "var(--pv-text-dim)" }}>
+                      {counts.published} of {counts.episodes} episodes
+                      {` · ${counts.extrasRemaining} extras remaining`}
+                    </p>
                   )}
-                  <details className="w-full">
-                    <summary className="cursor-pointer text-xs" style={{ color: "var(--pv-gold)" }}>
-                      Review mapping ({batch.tracks.length} tracks)
-                    </summary>
-                    <div className="mt-3 max-h-96 space-y-2 overflow-auto">
-                      {batch.tracks.map((track) => (
-                        <div
-                          key={track.id}
-                          className="rounded-md p-3 text-xs"
-                          style={{ border: "1px solid var(--pv-border)" }}
-                        >
-                          <p style={{ color: "var(--pv-silver)" }}>
-                            {track.classification === "episode_candidate" &&
-                            track.proposed_season_number &&
-                            track.proposed_episode_number
-                              ? `S${String(track.proposed_season_number).padStart(2, "0")}E${String(track.proposed_episode_number).padStart(2, "0")} · `
-                              : ""}
-                            {track.original_filename}
-                          </p>
-                          <p style={{ color: "var(--pv-text-dim)" }}>
-                            Disc {track.disc_number ?? "—"} · Track {track.track_number ?? "—"} ·{" "}
-                            {runtime(track.runtime_seconds)} ·{" "}
-                            {track.classification.replaceAll("_", " ")}
-                          </p>
-                          {track.canonical_destination && (
-                            <p className="mt-1 break-all" style={{ color: "var(--pv-gold)" }}>
-                              Proposed:{" "}
-                              {track.canonical_destination.replace("/vault/Theatre/TV Shows/", "")}
+                  <div className="flex flex-wrap gap-2">
+                    <TvResolverActions
+                      batch={batch}
+                      busy={tvBusy === batch.id}
+                      onAction={(action) => void tvAction(batch, action)}
+                    />
+                    <details className="w-full">
+                      <summary
+                        className="cursor-pointer text-xs"
+                        style={{ color: "var(--pv-gold)" }}
+                      >
+                        Review mapping ({batch.tracks.length} tracks)
+                      </summary>
+                      <div className="mt-3 max-h-96 space-y-2 overflow-auto">
+                        {batch.tracks.map((track) => (
+                          <div
+                            key={track.id}
+                            className="rounded-md p-3 text-xs"
+                            style={{ border: "1px solid var(--pv-border)" }}
+                          >
+                            <p style={{ color: "var(--pv-silver)" }}>
+                              {track.classification === "likely_episode" &&
+                              track.proposed_season_number &&
+                              track.proposed_episode_number
+                                ? `S${String(track.proposed_season_number).padStart(2, "0")}E${String(track.proposed_episode_number).padStart(2, "0")} · `
+                                : ""}
+                              {track.original_filename}
                             </p>
-                          )}
-                          {track.failure_detail && (
-                            <p className="mt-1 text-red-300">{track.failure_detail}</p>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                  </details>
-                </div>
-              </article>
-            );
-          })}
+                            <p style={{ color: "var(--pv-text-dim)" }}>
+                              Disc {track.disc_number ?? "—"} · Track {track.track_number ?? "—"} ·{" "}
+                              {runtime(track.runtime_seconds)} ·{" "}
+                              {track.classification.replaceAll("_", " ")}
+                            </p>
+                            {track.canonical_destination && (
+                              <p className="mt-1 break-all" style={{ color: "var(--pv-gold)" }}>
+                                Proposed:{" "}
+                                {track.canonical_destination.replace(
+                                  "/vault/Theatre/TV Shows/",
+                                  "",
+                                )}
+                              </p>
+                            )}
+                            {track.failure_detail && (
+                              <p className="mt-1 text-red-300">{track.failure_detail}</p>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </details>
+                  </div>
+                </article>
+              );
+            })}
         </section>
       )}
       {isAdministrator && publicationBundles.bundles.length > 0 && (
