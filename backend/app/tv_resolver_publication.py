@@ -183,7 +183,7 @@ class PostgresTvResolverStore:
             batches = [dict(row) for row in cursor.fetchall()]
             for batch in batches:
                 cursor.execute("SELECT * FROM vault_tv_resolver_seasons WHERE batch_id=%s ORDER BY season_number", (batch["id"],)); batch["seasons"] = [dict(row) for row in cursor.fetchall()]
-                cursor.execute("SELECT * FROM vault_tv_resolver_tracks WHERE batch_id=%s ORDER BY proposed_season_number NULLS LAST, disc_number NULLS LAST, track_number NULLS LAST, original_filename", (batch["id"],)); batch["tracks"] = [dict(row) for row in cursor.fetchall()]
+                cursor.execute("SELECT * FROM vault_tv_resolver_tracks WHERE batch_id=%s ORDER BY proposed_season_number NULLS LAST, disc_number NULLS LAST, track_number NULLS LAST, original_filename", (batch["id"],)); batch["tracks"] = [dict(row) for row in cursor.fetchall() if include_complete or row["publication_state"] != "cancelled"]
             return batches
 
     def get_for_owner(self, batch_id: UUID, owner_user_id: UUID) -> dict[str, object] | None:
@@ -201,7 +201,7 @@ class PostgresTvResolverStore:
                 return {"id": batch_id, "status": batch["status"]}
             if batch["status"] not in {"proposed", "needs_review", "failed"} or not batch["proposed_show_title"]:
                 raise ValueError("TV resolver batch is not eligible for approval")
-            cursor.execute("SELECT * FROM vault_tv_resolver_tracks WHERE batch_id=%s FOR UPDATE", (batch_id,))
+            cursor.execute("SELECT * FROM vault_tv_resolver_tracks WHERE batch_id=%s AND publication_state <> 'cancelled' FOR UPDATE", (batch_id,))
             tracks = [dict(row) for row in cursor.fetchall()]
             episodes = [track for track in tracks if track["classification"] == EPISODE_CLASSIFICATION]
             if not episodes or any(track["proposed_season_number"] is None or track["proposed_episode_number"] is None or not track["canonical_destination"] for track in episodes):
@@ -258,7 +258,7 @@ class PostgresTvResolverStore:
                 raise LookupError("TV resolver batch not found")
             if batch['review_metadata'].get('extras_approved_at') or batch['status'] == 'complete':
                 return {'id': batch_id, 'status': batch['status']}
-            cursor.execute("SELECT * FROM vault_tv_resolver_tracks WHERE batch_id=%s FOR UPDATE", (batch_id,))
+            cursor.execute("SELECT * FROM vault_tv_resolver_tracks WHERE batch_id=%s AND publication_state <> 'cancelled' FOR UPDATE", (batch_id,))
             tracks = cursor.fetchall()
             episodes = [t for t in tracks if t['classification'] == 'likely_episode']
             if batch['status'] != 'published' or not episodes or any(t['publication_state'] != 'published' for t in episodes):
@@ -292,8 +292,36 @@ class PostgresTvResolverStore:
             cursor.execute("INSERT INTO vault_master_activity(id,action,username,detail,succeeded) VALUES (%s,'tv_resolver_extras_approved',%s,%s,TRUE)", (uuid4(), username, f'TV resolver extras approved for batch {batch_id}'))
         return {'id': batch_id, 'status': 'publishing'}
 
+    def retire_removed(self, item_id: UUID | None = None) -> None:
+        """Retain removed staging as cancelled history without touching publication."""
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute("""SELECT batch.id FROM vault_tv_resolver_batches batch
+                WHERE EXISTS (SELECT 1 FROM vault_tv_resolver_tracks track
+                    JOIN vault_master_items item ON item.id=track.arrival_item_id
+                    WHERE track.batch_id=batch.id AND item.source_kind='incoming'
+                    AND item.owner_user_id=batch.owner_user_id AND item.state='arrival_removed'
+                    AND track.publication_state NOT IN ('published','cancelled')
+                    AND (%s::uuid IS NULL OR item.id=%s))
+                ORDER BY batch.id FOR UPDATE""", (item_id, item_id))
+            for row in cursor.fetchall():
+                batch_id = row['id']
+                cursor.execute("""UPDATE vault_tv_resolver_tracks track
+                    SET publication_state='cancelled', failure_detail=NULL
+                    FROM vault_master_items item, vault_tv_resolver_batches batch
+                    WHERE track.batch_id=%s AND batch.id=track.batch_id
+                    AND item.id=track.arrival_item_id AND item.source_kind='incoming'
+                    AND item.owner_user_id=batch.owner_user_id AND item.state='arrival_removed'
+                    AND track.publication_state NOT IN ('published','cancelled')""", (batch_id,))
+                cursor.execute("""UPDATE vault_tv_resolver_batches batch
+                    SET status='complete', updated_at=CURRENT_TIMESTAMP
+                    WHERE batch.id=%s AND batch.status NOT IN ('superseded','complete')
+                    AND NOT EXISTS (SELECT 1 FROM vault_tv_resolver_tracks track
+                        WHERE track.batch_id=batch.id
+                        AND track.publication_state NOT IN ('published','cancelled'))""", (batch_id,))
+
     def reconcile(self) -> list[UUID]:
         """Mirror durable Arrival Hall progress; return batches newly ready for one Jellyfin handoff."""
+        self.retire_removed()
         ready: list[UUID] = []
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute("SELECT to_regclass('vault_tv_episodes') AS relation")
@@ -326,9 +354,9 @@ class PostgresTvResolverStore:
                             OR (track.classification='likely_extra' AND extra.asset_id IS NOT NULL AND episode.id IS NULL))
                     ) THEN 'published' WHEN item.state='move_failed' THEN 'failed' ELSE 'queued' END,
                     failure_detail=CASE WHEN item.state='move_failed' THEN 'Arrival Hall managed publication failed' ELSE NULL END
-                    FROM vault_master_items item WHERE track.batch_id=%s AND item.id=track.arrival_item_id
+                    FROM vault_master_items item WHERE track.batch_id=%s AND item.id=track.arrival_item_id AND track.publication_state <> 'cancelled'
                     AND (track.classification='likely_episode' OR (track.classification='likely_extra' AND track.publication_state IN ('queued','failed','published')))""", (batch_id,))
-                cursor.execute("SELECT classification,publication_state FROM vault_tv_resolver_tracks WHERE batch_id=%s", (batch_id,))
+                cursor.execute("SELECT classification,publication_state FROM vault_tv_resolver_tracks WHERE batch_id=%s AND publication_state <> 'cancelled'", (batch_id,))
                 tracks = cursor.fetchall()
                 episode_states = {t['publication_state'] for t in tracks if t['classification'] == EPISODE_CLASSIFICATION}
                 if episode_states == {'published'}:

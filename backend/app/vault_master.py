@@ -1529,7 +1529,18 @@ def safely_remove_rejected_arrival_item(
 ) -> None:
     if item.source_kind != INCOMING_SOURCE or item.state != "rejected":
         raise ValueError("Only a rejected Arrival Hall file can be removed")
-    source = require_file_within_root(Path(item.source_path), incoming_root)
+    # Absence is success only for an explicitly removed, safely bounded source.
+    candidate = Path(item.source_path)
+    resolved_root = incoming_root.resolve(strict=True)
+    if candidate.is_symlink():
+        raise ValueError("Symbolic links are not valid Vault Master inputs")
+    resolved_source = candidate.resolve(strict=False)
+    if resolved_source == resolved_root or resolved_root not in resolved_source.parents:
+        raise ValueError("File is outside the configured Vault root")
+    try:
+        source = require_file_within_root(candidate, incoming_root)
+    except FileNotFoundError:
+        return
     if source.stat().st_size != item.size_bytes:
         raise ValueError("The Arrival Hall file size has changed")
     if sha256_file(source) != item.sha256:
@@ -6799,7 +6810,7 @@ class PostgresVaultMasterStore:
                         decision TEXT NOT NULL
                             CHECK (decision IN (
                                 'proposal_edited', 'metadata_edited',
-                                'approved', 'rejected'
+                                'approved', 'rejected', 'arrival_removed'
                             )),
                         username TEXT NOT NULL,
                         detail TEXT NOT NULL DEFAULT '',
@@ -6877,7 +6888,7 @@ class PostgresVaultMasterStore:
                     ADD CONSTRAINT vault_master_decisions_decision_check
                     CHECK (decision IN (
                         'proposal_edited', 'metadata_edited',
-                        'approved', 'rejected'
+                        'approved', 'rejected', 'arrival_removed'
                     ))
                     """
                 )

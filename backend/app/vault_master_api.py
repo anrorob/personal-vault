@@ -5234,6 +5234,10 @@ def remove_rejected_arrival_item(
 ) -> VaultMasterItem:
     del confirmation
     item = require_owned_arrival_item(item_id, username, store)
+    if item.state == "arrival_removed":
+        if not isinstance(store, MemoryVaultMasterStore):
+            PostgresTvResolverStore(get_database_conninfo()).retire_removed(item.id)
+        return to_api_item(item)
     try:
         safely_remove_rejected_arrival_item(item, incoming_path)
     except (OSError, ValueError) as error:
@@ -5244,6 +5248,8 @@ def remove_rejected_arrival_item(
     removed = store.record_decision(item_id, "arrival_removed", username)
     if removed is None:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    if not isinstance(store, MemoryVaultMasterStore):
+        PostgresTvResolverStore(get_database_conninfo()).retire_removed(item.id)
     return to_api_item(removed)
 
 
