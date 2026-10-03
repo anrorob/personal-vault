@@ -2,7 +2,6 @@
 
 ## Branding
 
-Do not introduce Lovable, template, or placeholder branding. Personal Vault branding derivatives must originate from the approved house/vault mark; filenames alone do not establish a favicon or logo's canonical visual source.
 
 Personal Vault is a self-hosted digital archive for privately owned media and documents. It is designed around data ownership, long-lived filesystems, replaceable supporting services, and a catalogue that remains under the Vault owner's control.
 
