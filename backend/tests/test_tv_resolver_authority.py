@@ -109,10 +109,15 @@ def test_request_and_legacy_move_reject_resolver_generic_destination(setup, tmp_
     memory.items[item.source_path] = item
     original = next(s for s in scans if s.source_path == item.source_path)
     assert memory.record_file(uuid4(), INCOMING_SOURCE, original) == item
-    with pytest.raises(ValueError, match="Rescan conflicts"):
-        memory.record_file(uuid4(), INCOMING_SOURCE, replace(original, sha256="f" * 64))
-    with pytest.raises(ValueError, match="Rescan conflicts"):
-        vault.record_file(uuid4(), INCOMING_SOURCE, replace(original, sha256="f" * 64))
+    changed_scan = replace(original, sha256="f" * 64)
+    # Queued publication owns an immutable snapshot; rescans cannot rewrite it.
+    assert memory.record_file(uuid4(), INCOMING_SOURCE, changed_scan) == item
+    rescanned = vault.record_file(uuid4(), INCOMING_SOURCE, changed_scan)
+    assert rescanned.id == item.id and rescanned.state == item.state
+    assert rescanned.sha256 == original.sha256
+    assert rescanned.metadata == item.metadata
+    assert rescanned.proposed_destination == item.proposed_destination
+    assert ArrivalManagedPublicationRequest.create(item=rescanned).expected_sha256 == original.sha256
 
 
 def test_disc_filename_receipts_reconcile_three_seasons_before_one_handoff(setup, tmp_path):
