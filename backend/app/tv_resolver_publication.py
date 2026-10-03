@@ -373,12 +373,15 @@ class PostgresTvResolverStore:
                 return ready
             # SKIP LOCKED serialises reconciliation with owner actions without
             # making the worker block an approval transaction.
-            cursor.execute("SELECT id AS batch_id FROM vault_tv_resolver_batches WHERE status IN ('publishing','failed','published') FOR UPDATE SKIP LOCKED")
+            cursor.execute("SELECT id AS batch_id FROM vault_tv_resolver_batches WHERE status IN ('publishing','failed','published','complete') FOR UPDATE SKIP LOCKED")
             for row in cursor.fetchall():
                 batch_id = row["batch_id"]
+                # Resolver progress is a projection of receipt/catalogue truth.
+                # Resetting it never requeues an Arrival item or touches bytes.
                 cursor.execute(
-                    """UPDATE vault_tv_resolver_tracks track SET
-                        publication_state=CASE WHEN item.state='moved' AND EXISTS (
+                    """WITH evidence AS (
+                        SELECT track.id, item.state AS item_state,
+                          item.state='moved' AND EXISTS (
                           SELECT 1 FROM vault_arrival_managed_publications publication
                           JOIN vault_files file ON file.id=publication.file_id AND file.asset_id=publication.asset_id
                           JOIN vault_assets asset ON asset.id=file.asset_id
@@ -389,6 +392,7 @@ class PostgresTvResolverStore:
                           JOIN vault_tv_shows show ON show.id=season.show_id
                           JOIN vault_tv_resolver_batches batch ON batch.id=track.batch_id
                           WHERE publication.item_id=item.id AND publication.owner_user_id=batch.owner_user_id
+                            AND item.owner_user_id=batch.owner_user_id AND item.sha256=track.checksum
                             AND asset.owner_user_id=batch.owner_user_id AND show.owner_user_id=batch.owner_user_id
                             AND asset.lifecycle_state='active' AND asset.asset_type='TV Shows'
                             AND file.vault_path=track.canonical_destination AND file.sha256=track.checksum
@@ -398,14 +402,26 @@ class PostgresTvResolverStore:
                             AND show.title=batch.proposed_show_title AND season.season_number=track.proposed_season_number
                             AND ((track.classification='likely_episode' AND episode.episode_number=track.proposed_episode_number)
                               OR (track.classification='likely_extra' AND extra.asset_id IS NOT NULL AND episode.id IS NULL))
-                        ) THEN 'published' WHEN item.state='move_failed' THEN 'failed' ELSE track.publication_state END,
-                        failure_detail=CASE WHEN item.state='move_failed' THEN 'Arrival Hall managed publication failed' ELSE NULL END
-                       FROM vault_master_items item WHERE track.batch_id=%s AND item.id=track.arrival_item_id AND track.publication_state <> 'cancelled'
-                         AND (track.classification='likely_episode' OR track.publication_state IN ('queued','failed','published'))""",
+                          ) AS canonical
+                        FROM vault_tv_resolver_tracks track
+                        JOIN vault_master_items item ON item.id=track.arrival_item_id
+                        WHERE track.batch_id=%s AND track.publication_state <> 'cancelled'
+                          AND (track.classification='likely_episode' OR track.publication_state IN ('queued','failed','published'))
+                    ) UPDATE vault_tv_resolver_tracks track SET
+                        publication_state=CASE WHEN evidence.canonical THEN 'published'
+                          WHEN evidence.item_state='move_failed' THEN 'failed' ELSE 'queued' END,
+                        failure_detail=CASE WHEN evidence.canonical THEN NULL
+                          WHEN evidence.item_state='move_failed' THEN 'Arrival Hall managed publication failed'
+                          WHEN evidence.item_state='moved' OR track.publication_state='published' OR track.failure_detail IS NOT NULL
+                            THEN 'Canonical TV publication evidence is missing; review required'
+                          ELSE NULL END
+                    FROM evidence WHERE track.id=evidence.id""",
                     (batch_id,),
                 )
                 cursor.execute("SELECT classification, publication_state FROM vault_tv_resolver_tracks WHERE batch_id=%s AND publication_state <> 'cancelled'", (batch_id,))
                 tracks = cursor.fetchall()
+                if not tracks:
+                    continue
                 episode_states = {track["publication_state"] for track in tracks if track["classification"] == EPISODE_CLASSIFICATION}
                 if episode_states == {"published"}:
                     cursor.execute("UPDATE vault_tv_resolver_batches SET jellyfin_handoff_requested_at=CURRENT_TIMESTAMP WHERE id=%s AND jellyfin_handoff_requested_at IS NULL RETURNING id", (batch_id,))

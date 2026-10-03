@@ -104,7 +104,7 @@ def test_people_api_lists_searches_details_and_returns_only_safe_asset_summaries
     people.associate(asset.id, person_id, "user")
 
     assert len(client.get("/api/people").json()) == 2
-    assert len(client.get("/api/people", params={"query": "kowalski"}).json()) == 2
+    assert len(client.get("/api/people", params={"query": "owner"}).json()) == 2
     for query in ("rob", "bobby"):
         assert str(person_id) in {
             item["person_id"]

@@ -5,7 +5,7 @@
 - Theatre: Original, Auto, FHD and 720p quality modes; quality-first negotiation, more responsive seeking and buffering; persistent watched/progress state; Continue Series and Play Next Episode using episode identity.
 - Movies: search, responsive browsing, manual franchises with Release/Timeline ordering, rotating artwork and grouped top-level presentation.
 - Gallery: paginated browsing, restored navigation position, Year/Month date rail, and recoverable Delete/Restore.
-- Arrival Hall: Vault-wide existing-asset recovery search, restoration of deleted assets, and safer recheck/retry/cancellation of unfinished intake.
+- Arrival Hall: Vault-wide existing-asset recovery search, restoration of deleted assets, and safer recheck/retry/cancellation of unfinished intake. TV resolver items must use managed publication; published status now requires canonical receipt and catalogue evidence.
 - Responsive layouts across Gallery, Movies, Music and Home Videos.
 
 ## Upgrade notes

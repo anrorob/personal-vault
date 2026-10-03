@@ -20,6 +20,10 @@ Jellyfin mapping is optional: keep `PV_JELLYFIN_MEDIA_PATH_MAP_JSON` absent for 
 
 The generic signed host publisher in `ops/storage/arrival-managed-publisher.py` needs the matching application coordination modules importable via `PYTHONPATH` pointing to `backend`, the same protected HMAC key and queues used by the backend, and its commissioned active-slot manifest. Set host `PV_STORAGE_SLOT_ROOT` to the exact commissioned resolver-root parent; its generic default is `/var/lib/personal-vault-storage/slots`. Preserve restrictive key/queue permissions. Install `backend/app/arrival_publication_coordination.py` and `backend/app/arrival_publisher_loop.py` from the same release with it. Coordinate publication shutdown with backend shutdown; do not copy example roots over existing operator configuration.
 
+## TV publication reconciliation
+
+Resolver-tagged TV intake must use managed publication. Reconciliation checks the existing managed receipt, canonical catalogue/file placement, ownership and episode/extra relationships before reporting published. Historical flags without that evidence return to a recoverable queued/failed projection with a review diagnostic; reconciliation does not move bytes, invent receipts or silently republish content. Review ambiguous historical items through the existing recovery workflow. No broad backfill or additional migration is required for this correction.
+
 ## Rollback
 
 An older application is not a safe rollback against upgraded data: it may not understand new lifecycle states, UUID progress keys, or signed routing/coordination contracts. Stop all writers and restore the matching pre-upgrade database, application/executor artifacts, configuration, and filesystem state from your backup. Do not delete new catalogue rows or reverse constraints manually. Retaining extra environment settings alone does not reverse schema changes.

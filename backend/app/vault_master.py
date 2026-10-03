@@ -1544,6 +1544,8 @@ def safely_move_approved_file(
     incoming_root: Path,
     destination_root: Path,
 ) -> Path:
+    if item.metadata.get("tv_resolver_batch_id"):
+        raise ValueError("TV resolver items require managed publication to their canonical TV destination")
     if item.proposed_category == "Ledger":
         raise ValueError("Ledger is a derived view, not a canonical file destination")
     if item.state not in {"approved", "move_failed"}:

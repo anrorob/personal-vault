@@ -28,7 +28,7 @@ def test_build_info_reports_safe_development_metadata(monkeypatch: pytest.Monkey
     reported = build_info()
 
     assert reported == {
-        "version": "1.0.0",
+        "version": "1.1.0",
         "commit": "abc1234",
         "environment": "development",
         "repository": "unknown",

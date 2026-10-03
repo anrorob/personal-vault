@@ -19,8 +19,8 @@ def test_person_foundation_keeps_uuid_and_supports_duplicate_names_search_and_do
     assert first.id != duplicate.id
     assert people.get_person(first.id, owner).date_of_birth == date(1980, 1, 2)  # type: ignore[union-attr]
     assert people.get_person(first.id, owner).profile_asset_id == profile_asset_id  # type: ignore[union-attr]
-    assert [person.id for person in people.search_people(owner, "kowalski")] == [first.id, duplicate.id]
-    assert [person.id for person in people.search_people(owner, "rob")] == [first.id, duplicate.id]
+    assert [person.id for person in people.search_people(owner, "owner")] == [first.id, duplicate.id]
+    assert [person.id for person in people.search_people(owner, "example")] == [first.id, duplicate.id]
     assert [person.id for person in people.search_people(owner, "bobby")] == [first.id]
 
     updated = people.update_person(first.id, owner, full_name="Example J. Owner", clear_date_of_birth=True)

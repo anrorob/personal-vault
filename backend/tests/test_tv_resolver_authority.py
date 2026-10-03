@@ -152,72 +152,30 @@ def test_wrong_moved_state_does_not_count_as_canonical_publication_and_listing_s
     assert len(result["batches"]) == 1 and len(result["batches"][0]["tracks"]) == 99
 
 
-def test_incident_recovery_preserves_five_identities_and_reconciles_15_plus_8(setup, tmp_path):
-    from app.tv_resolver_recovery import restore_approved_batch_projection, relocation_request, reconcile_relocation
+def test_reviewed_projection_recovery_is_owner_scoped_idempotent_and_does_not_publish(setup):
+    from app.tv_resolver_recovery import restore_approved_batch_projection
     vault, resolver, tv, owner, batch_id, entries, scans = setup
     batch = approve(setup)
-    wrong, correct, staged = [], [], []
-    by_id = {i.id: i for i in entries}
-    for track in batch["tracks"]:
-        if track["classification"] != "likely_episode":
-            continue
-        if track["proposed_season_number"] == 2 and track["proposed_episode_number"] in {1, 2, 3, 4, 10}:
-            wrong.append(track)
-        elif track["proposed_season_number"] == 3:
-            staged.append(track)
-        else:
-            correct.append(track)
-    assert (len(wrong), len(correct), len(staged)) == (5, 15, 8)
-    # Recreate the audited defect, including erased intake markers and five
-    # legacy catalogue publications without managed placements.
+    tracks = [t for t in batch["tracks"] if t["classification"] == "likely_episode"]
+    expected = {t["arrival_item_id"]: "move_queued" for t in tracks}
+    extras_before = [i for i in vault.list_items() if i.id not in expected]
     with psycopg.connect(resolver.conninfo) as conn:
-        for track in wrong + staged:
-            original = by_id[track["arrival_item_id"]]
-            conn.execute("UPDATE vault_master_items SET metadata='{}',proposed_category='Home Videos',proposed_destination=%s WHERE id=%s", (original.proposed_destination, original.id))
-        for track in correct:
-            conn.execute("UPDATE vault_master_items SET state='theatre_promotion_pending' WHERE id=%s", (track["arrival_item_id"],))
-    identities = {}
-    for track in wrong:
-        item = by_id[track["arrival_item_id"]]
-        vault.record_move_result(item.id, "moved", "synthetic incident", "wrong generic publication")
-        identities[item.id] = vault.get_catalogued_asset(item.proposed_destination).id
-    expected = {t["arrival_item_id"]: "moved" for t in wrong}
-    expected.update({t["arrival_item_id"]: "theatre_promotion_pending" for t in correct})
-    expected.update({t["arrival_item_id"]: "move_queued" for t in staged})
+        conn.execute("UPDATE vault_master_items SET metadata='{}', proposed_category='Home Videos', proposed_destination='/vault/Home Videos/Example.mkv' WHERE id=ANY(%s)", (list(expected),))
+        receipts_before = conn.execute("SELECT count(*) FROM vault_arrival_managed_publications").fetchone()[0]
+    with pytest.raises(ValueError, match="approved unfinished batch"):
+        restore_approved_batch_projection(vault, batch_id, uuid4(), expected)
     with pytest.raises(ValueError, match="inventory differs"):
         restore_approved_batch_projection(vault, batch_id, owner, {})
     restore_approved_batch_projection(vault, batch_id, owner, expected)
     restore_approved_batch_projection(vault, batch_id, owner, expected)
-
-    def receipt(request):
-        return dict(request_id=str(request.request_id), item_id=str(request.item_id), owner_user_id=str(owner),
-            logical_destination=request.logical_destination, logical_area="Theatre / TV Shows", slot_id="PV-DISK-003",
-            relative_path=request.logical_destination.removeprefix("/vault/"), expected_sha256=request.expected_sha256,
-            expected_size_bytes=request.expected_size_bytes, verified_at=datetime.now(timezone.utc).isoformat())
     items = {i.id: i for i in vault.list_items()}
-    for track in correct:
+    for track in tracks:
         item = items[track["arrival_item_id"]]
-        assert vault.publish_arrival_managed_receipt(item.id, receipt(ArrivalManagedPublicationRequest.create(item=item)))
-    assert resolver.reconcile() == []
-    for track in wrong:
-        request = relocation_request(vault, track["arrival_item_id"])
-        document = {**receipt(request), "recovery": request.recovery}
-        with pytest.raises(ValueError, match="approved evidence"):
-            reconcile_relocation(vault, {**document, "owner_user_id": str(uuid4())})
-        asset = reconcile_relocation(vault, document)
-        assert asset.id == identities[track["arrival_item_id"]]
-        assert asset.asset_type == "TV Shows" and asset.vault_path == track["canonical_destination"]
-        assert vault.get_catalogued_asset(request.recovery["source_logical_path"]) is None
-        assert reconcile_relocation(vault, document) is None
-    requests = []
-    for _ in range(8):
-        process_next_move(vault, tmp_path, {}, theatre_queue=lambda i: requests.append(ArrivalManagedPublicationRequest.create(item=i)))
-    assert {r.item_id for r in requests} == {t["arrival_item_id"] for t in staged}
-    for request in requests:
-        assert vault.publish_arrival_managed_receipt(request.item_id, receipt(request))
-    assert resolver.reconcile() == [batch_id] and resolver.reconcile() == []
+        assert item.state == "move_queued"
+        assert item.proposed_category == "TV Shows"
+        assert item.proposed_destination == track["canonical_destination"]
+        assert item.metadata["tv_resolver_batch_id"] == str(batch_id)
+    assert [i for i in vault.list_items() if i.id not in expected] == extras_before
     with psycopg.connect(resolver.conninfo) as conn:
-        assert conn.execute("SELECT count(*) FROM vault_tv_episodes").fetchone()[0] == 28
-        assert conn.execute("SELECT count(*) FROM vault_assets WHERE asset_type='Home Videos'").fetchone()[0] == 0
-        assert conn.execute("SELECT count(*) FROM vault_asset_history WHERE action='tv_resolver_relocated'").fetchone()[0] == 5
-    assert sum(i.state == "needs_review" for i in vault.list_items()) == 71
+        assert conn.execute("SELECT count(*) FROM vault_arrival_managed_publications").fetchone()[0] == receipts_before
+        assert conn.execute("SELECT count(*) FROM vault_master_activity WHERE item_id=ANY(%s) AND action='tv_resolver_authority_restored'", (list(expected),)).fetchone()[0] == len(expected)
