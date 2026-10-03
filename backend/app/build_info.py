@@ -8,6 +8,7 @@ from pathlib import Path
 
 SEMVER_RE = re.compile(r"\d+\.\d+\.\d+")
 COMMIT_RE = re.compile(r"[0-9a-f]{7,64}")
+REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 KNOWN_ENVIRONMENTS = frozenset({"development", "production", "test"})
 
 
@@ -49,10 +50,18 @@ def get_build_commit(environment: str | None = None) -> str:
     raise RuntimeError("PV_COMMIT must be a Git commit identifier or a permitted non-production marker")
 
 
+def get_repository() -> str:
+    value = os.getenv("PV_REPOSITORY", "unknown").strip()
+    if value == "unknown" or REPOSITORY_RE.fullmatch(value):
+        return value
+    raise RuntimeError("PV_REPOSITORY must be an owner/repository identifier or unknown")
+
+
 def build_info() -> dict[str, str]:
     environment = get_environment()
     return {
         "version": load_project_version(),
         "commit": get_build_commit(environment),
         "environment": environment,
+        "repository": get_repository(),
     }

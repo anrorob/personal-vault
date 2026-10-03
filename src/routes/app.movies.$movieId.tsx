@@ -1,7 +1,10 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { ArrowLeft, Clock3, Download, Film, Play, RotateCcw, Star, UserRound } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { PlaybackStateIndicator, WatchedAction } from "@/components/pv/PlaybackState";
+import { useTheatreProgress, resumePosition } from "@/lib/theatre-progress";
 import { MoviePlayer } from "@/components/pv/MoviePlayer";
+import { MovieFranchiseMembership } from "@/components/pv/MovieFranchises";
 import {
   Dialog,
   DialogContent,
@@ -137,7 +140,15 @@ function MovieDetailsPage() {
   const [playerOpen, setPlayerOpen] = useState(false);
   const [playingFeature, setPlayingFeature] = useState<MovieExtra | null>(null);
   const [playbackError, setPlaybackError] = useState(false);
-  const [resumeSeconds, setResumeSeconds] = useState(0);
+  const {
+    progress,
+    error: progressError,
+    pending: progressPending,
+    save,
+    mark,
+  } = useTheatreProgress("movies");
+  const movieProgress = progress[movieId];
+  const resumeSeconds = resumePosition(movieProgress);
   const [resumeRequested, setResumeRequested] = useState(false);
   const [exclusiveError, setExclusiveError] = useState<string | null>(null);
   const [exclusiveSubmitting, setExclusiveSubmitting] = useState(false);
@@ -188,24 +199,6 @@ function MovieDetailsPage() {
   }, [movieId, navigate]);
 
   useEffect(() => {
-    void fetch(`/api/user-state/movies/${movieId}`, { credentials: "include" })
-      .then(async (response) => (response.ok ? response.json() : null))
-      .then(
-        (
-          progress: {
-            position_seconds: number;
-            duration_seconds: number;
-            completed: boolean;
-          } | null,
-        ) => {
-          if (progress && !progress.completed && progress.position_seconds >= 30) {
-            setResumeSeconds(progress.position_seconds);
-          }
-        },
-      );
-  }, [movieId]);
-
-  useEffect(() => {
     if (!playerOpen || playingFeature) {
       setPlaybackSubtitles([]);
       setSelectedSubtitleIndex(null);
@@ -245,23 +238,9 @@ function MovieDetailsPage() {
 
   const savePlaybackProgress = useCallback(
     (positionSeconds: number, durationSeconds: number, completed: boolean) => {
-      void fetch(`/api/user-state/movies/${movieId}`, {
-        method: "PUT",
-        credentials: "include",
-        keepalive: true,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          position_seconds: positionSeconds,
-          duration_seconds: durationSeconds,
-          completed,
-        }),
-      });
-      if (completed) setResumeSeconds(0);
-      else if (positionSeconds >= 30) {
-        setResumeSeconds(positionSeconds);
-      }
+      save(movieId, positionSeconds, durationSeconds, completed);
     },
-    [movieId],
+    [movieId, save],
   );
 
   const toggleExclusive = useCallback(async () => {
@@ -468,7 +447,7 @@ function MovieDetailsPage() {
               >
                 <Play size={18} fill="currentColor" /> Play movie
               </button>
-              {resumeSeconds >= 30 && (
+              {resumeSeconds > 0 && (
                 <button
                   type="button"
                   className="pv-btn-ghost inline-flex items-center gap-2"
@@ -481,6 +460,19 @@ function MovieDetailsPage() {
                 >
                   <RotateCcw size={16} /> Continue at {formatPlaybackTime(resumeSeconds)}
                 </button>
+              )}
+              {movieProgress?.state === "watched" && (
+                <PlaybackStateIndicator progress={movieProgress} />
+              )}
+              <WatchedAction
+                progress={movieProgress}
+                pending={progressPending}
+                onChange={(watched) => void mark(movieId, watched)}
+              />
+              {progressError && (
+                <p role="alert" className="text-sm text-red-300">
+                  {progressError}
+                </p>
               )}
               <details className="relative">
                 <summary className="pv-btn-ghost flex cursor-pointer list-none items-center gap-2">
@@ -520,6 +512,8 @@ function MovieDetailsPage() {
           </div>
         </div>
       </section>
+
+      <MovieFranchiseMembership movieId={details.id} />
 
       {cast.length > 0 && (
         <section className="space-y-4">
@@ -632,7 +626,7 @@ function MovieDetailsPage() {
                 className="text-xs uppercase tracking-wider"
                 style={{ color: "var(--pv-text-dim)" }}
               >
-                Collections
+                Provider collections
               </h3>
               <p className="text-sm leading-6 mt-2" style={{ color: "var(--pv-silver)" }}>
                 {details.collections.join(" · ")}
@@ -855,6 +849,7 @@ function MovieDetailsPage() {
             >
               {!playbackError ? (
                 <MoviePlayer
+                  bufferPlayback
                   key={playingFeature?.id ?? details.id}
                   source={
                     playingFeature
@@ -878,6 +873,11 @@ function MovieDetailsPage() {
                   }
                   selectedSubtitleIndex={playingFeature ? null : selectedSubtitleIndex}
                   onSubtitleChange={playingFeature ? undefined : setSelectedSubtitleIndex}
+                  playbackPlanUrl={
+                    playingFeature
+                      ? undefined
+                      : `/api/movies/${details.id}/playback-plan${selectedSubtitleIndex === null ? "" : `?subtitle_index=${selectedSubtitleIndex}`}`
+                  }
                 />
               ) : (
                 <div className="px-6 text-center">

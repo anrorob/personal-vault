@@ -1,3 +1,4 @@
+from tests.managed_arrival import complete_gallery_receipt
 import os
 import hashlib
 import hmac
@@ -66,6 +67,8 @@ import app.video_intelligence as video_intelligence
 from app.video_intelligence import PostgresVideoIntelligenceStore, process_next_video_analysis_job
 from app.vault_master_api import get_catalogue_preview_roots
 from app.tv_shows import PostgresTvShowStore
+from app.tv_disc_resolver import resolve_tv_disc_batch
+from app.tv_resolver_publication import PostgresTvResolverStore
 
 
 @pytest.fixture
@@ -89,7 +92,21 @@ def _reset_auxiliary_postgres_state(conninfo: str) -> None:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
+                DO $$
+                BEGIN
+                    IF to_regclass('vault_tv_resolver_batches') IS NOT NULL THEN
+                        DELETE FROM vault_tv_resolver_tracks;
+                        DELETE FROM vault_tv_resolver_seasons;
+                        DELETE FROM vault_tv_resolver_batches;
+                    END IF;
+                END $$
+                """
+            )
+            cursor.execute(
+                """
                 TRUNCATE TABLE
+                    vault_routing_authorizations,
+                    vault_routing_decisions,
                     vault_autopilot_policies,
                     vault_intake_sources,
                     vault_ingestion_ai_jobs,
@@ -174,6 +191,167 @@ def _arrival_hall_owner_user_id(conninfo: str, username: str = "owner") -> UUID:
     account = PostgresAuthenticationStore(conninfo).get_account(username)
     assert account is not None
     return account.user_id
+
+
+def test_catalogue_prefix_bulk_preserves_preferred_file_and_asset_fields(
+    postgres_store: PostgresVaultMasterStore, postgres_conninfo: str,
+) -> None:
+    prefix = "/vault/Gallery/"
+    assert postgres_store.list_catalogued_assets_by_vault_path_prefix(prefix) == []
+    first = postgres_store.restore_catalogued_asset(
+        _catalogued_asset(UUID("10000000-0000-0000-0000-000000000001"),
+                          prefix + "first.jpg", "owner"), "owner")
+    assert postgres_store.list_catalogued_assets_by_vault_path_prefix(prefix) == [first]
+
+    second = postgres_store.restore_catalogued_asset(
+        _catalogued_asset(UUID("10000000-0000-0000-0000-000000000002"),
+                          "/vault/Documents/primary.pdf", "son"), "son")
+    with psycopg.connect(postgres_conninfo) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO vault_files (id, asset_id, vault_path, filename, size_bytes, mime_type, sha256, file_role) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, 'alternate')",
+                (uuid4(), second.id, prefix + "alternate.jpg", "alternate.jpg", 7,
+                 "image/jpeg", "b" * 64),
+            )
+            cursor.execute(
+                "UPDATE vault_assets SET visibility='shared', shared_with=%s, "
+                "lifecycle_state='hidden', metadata=%s, effective_metadata=%s, "
+                "user_overrides=%s WHERE id=%s",
+                (Jsonb(["owner"]), Jsonb({"storage_placement": {"slot_id": "PV-DEV-DISK-001"}}),
+                 Jsonb({"artist": "Example Artist"}), Jsonb({"title": "Example Album"}),
+                 second.id),
+            )
+    expected = [postgres_store.get_catalogued_asset_by_id(asset_id)
+                for asset_id in (first.id, second.id)]
+    assert all(asset is not None for asset in expected)
+    assert postgres_store.list_catalogued_assets_by_vault_path_prefix(prefix) == expected
+    assert expected[1].vault_path == "/vault/Documents/primary.pdf"
+    assert expected[1].owner_user_id is not None
+    assert expected[1].visibility == "shared"
+    assert expected[1].lifecycle_state == "hidden"
+    assert expected[1].metadata["storage_placement"]["slot_id"] == "PV-DEV-DISK-001"
+    assert expected[1].effective_metadata["artist"] == "Example Artist"
+    assert postgres_store.list_catalogued_assets_by_vault_path_prefix("/vault/Music/") == []
+    candidates = postgres_store.list_catalogued_placement_candidates_by_vault_path_prefix(prefix)
+    assert [entry.vault_path for entry in candidates] == [asset.vault_path for asset in expected]
+    assert candidates[0].has_storage_placement is False
+    assert candidates[1].has_storage_placement is True
+    assert candidates[1].storage_placement == {"slot_id": "PV-DEV-DISK-001"}
+
+
+@pytest.mark.parametrize("asset_count", [0, 1, 100, 3000])
+def test_catalogue_prefix_query_count_does_not_grow_with_assets(
+    monkeypatch: pytest.MonkeyPatch, asset_count: int,
+) -> None:
+    rows = [
+        {
+            "id": UUID(int=index + 1), "asset_type": "Gallery",
+            "display_title": f"Example Photo {index}", "captured_on": None,
+            "location": None, "metadata": {}, "metadata_provenance": {},
+            "detected_metadata": {}, "imported_metadata": {},
+            "user_overrides": {}, "effective_metadata": {},
+            "owner_username": "owner", "owner_user_id": UUID(int=9001),
+            "origin_vault_id": UUID(int=9002), "visibility": "private",
+            "shared_with": [], "lifecycle_state": "active",
+            "vault_path": f"/vault/Gallery/example-{index}.jpg",
+            "filename": f"example-{index}.jpg", "size_bytes": 8,
+            "mime_type": "image/jpeg", "sha256": "a" * 64,
+        }
+        for index in range(asset_count)
+    ]
+    statements: list[str] = []
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, query, _params):
+            statements.append(query)
+
+        def fetchall(self):
+            return rows
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def cursor(self):
+            return Cursor()
+
+    store = PostgresVaultMasterStore("unused")
+    monkeypatch.setattr(store, "_connect", lambda: Connection())
+    result = store.list_catalogued_assets_by_vault_path_prefix("/vault/Gallery/")
+    assert len(result) == asset_count
+    assert len(statements) == 1
+    assert "JOIN LATERAL" in statements[0]
+
+
+@pytest.mark.parametrize("asset_count", [0, 1, 3000])
+def test_placement_candidate_query_remains_narrow_and_bounded(
+    monkeypatch: pytest.MonkeyPatch, asset_count: int,
+) -> None:
+    rows = [
+        {"vault_path": f"/vault/Gallery/example-{index}.jpg",
+         "asset_type": "Gallery", "has_storage_placement": True,
+         "storage_placement": {"slot_id": "PV-DEV-DISK-001", "relative_path": f"Gallery/example-{index}.jpg"}}
+        for index in range(asset_count)
+    ]
+    statements: list[str] = []
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, query, _params):
+            statements.append(query)
+
+        def fetchall(self):
+            return rows
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def cursor(self):
+            return Cursor()
+
+    store = PostgresVaultMasterStore("unused")
+    monkeypatch.setattr(store, "_connect", lambda: Connection())
+    result = store.list_catalogued_placement_candidates_by_vault_path_prefix("/vault/Gallery/")
+    assert len(result) == asset_count
+    assert len(statements) == 1
+    assert "JOIN LATERAL" in statements[0]
+    assert "effective_metadata" not in statements[0]
+
+
+def test_gallery_historical_source_dates_survive_read_edit_clear_and_restart(postgres_store, postgres_conninfo):
+    asset = postgres_store.restore_catalogued_asset(
+        _catalogued_asset(uuid4(), "/vault/Gallery/gallery-date-003-fixture.jpg", "owner"), "owner")
+    with psycopg.connect(postgres_conninfo) as connection:
+        connection.execute("UPDATE vault_assets SET captured_on=NULL,detected_metadata=%s WHERE id=%s",
+            (Jsonb({"source_created_at": "2018-06-12", "source_modified_at": "2024-02-18"}), asset.id))
+    reopened = PostgresVaultMasterStore(postgres_conninfo)
+    assert reopened.get_catalogued_asset_by_id(asset.id).captured_on == date(2018, 6, 12)
+    edited = reopened.update_catalogued_asset_metadata(asset.id, {"captured_on": "2018-06-09"}, "owner")
+    assert edited.captured_on == date(2018, 6, 9)
+    cleared = reopened.update_catalogued_asset_metadata(asset.id, {"captured_on": None}, "owner")
+    assert cleared.captured_on == date(2018, 6, 12)
+    with psycopg.connect(postgres_conninfo) as connection:
+        persisted = connection.execute("SELECT captured_on,effective_metadata->>'captured_on' FROM vault_assets WHERE id=%s", (asset.id,)).fetchone()
+    assert persisted == (date(2018, 6, 12), "2018-06-12")
 
 
 def test_postgres_duplicate_detection_is_owner_scoped_and_ignores_rejected_arrivals(
@@ -2168,7 +2346,7 @@ def test_ingestion_ai_queue_and_evidence_survive_restart(
     final = PostgresIngestionAiStore(postgres_conninfo)
     evidence = final.list_evidence(item.id, "owner")
     assert evidence[0].ocr_text == "BANK STATEMENT"
-    assert evidence[0].recommended_destination == "Ledger"
+    assert evidence[0].recommended_destination == "Documents"
     assert evidence[0].decision_model_version == "intelligent-routing-v5"
     assert final.list_evidence(item.id, "someone-else") == []
 
@@ -2198,7 +2376,7 @@ def test_routing_memory_survives_restart_and_never_crosses_users(
             claimed.id, "financial_document", "A statement", "BANK STATEMENT",
             0.95, ("Financial statement indicator",), 20, assessment,
         )
-        rule = first.remember_decision(item, "Ledger", "approved", "owner")
+        rule = first.remember_decision(item, "Documents", "approved", "owner")
     assert rule is not None and rule.maturity == "suggestion"
 
     restarted = PostgresIngestionAiStore(postgres_conninfo)
@@ -3031,7 +3209,7 @@ def test_approved_move_publishes_permanent_catalogue_record(
     postgres_store.queue_move(item.id, "owner")
 
     assert (
-        process_next_move(
+        complete_gallery_receipt(
             postgres_store,
             incoming,
             {"Gallery": gallery},
@@ -4099,3 +4277,239 @@ def test_swap_snapshot_uses_canonical_slot_hardware_not_inventory_wwn(
     assert snapshot["source_hardware_id"] == "serial:canonical"
     assert snapshot["source_filesystem_uuid"] == "canonical-fs"
     assert snapshot["old_hardware"] == canonical_hardware
+
+
+def test_postgres_supplier_named_episodes_form_one_review_group_without_publication(
+    postgres_store: PostgresVaultMasterStore,
+    postgres_conninfo: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi import Response
+    from tests.test_tv_episode_grouping import episode
+
+    owner = _arrival_hall_owner_user_id(postgres_conninfo)
+    batch_id = postgres_store.create_batch(INCOMING_SOURCE, "/arrival")
+    entries = []
+    for number in range(1, 11):
+        template = episode(number)
+        entries.append(postgres_store.record_file(
+            batch_id, INCOMING_SOURCE,
+            ScannedFile(
+                template.source_path, template.filename, template.relative_path,
+                template.size_bytes, template.mime_type, template.modified_at,
+                template.sha256, template.metadata, owner_user_id=owner,
+            ),
+        ))
+    resolver = PostgresTvResolverStore(postgres_conninfo)
+    resolver.initialize()
+    monkeypatch.setattr(vault_master_api, "get_database_conninfo", lambda: postgres_conninfo)
+    result = vault_master_api.list_tv_resolver_batches(Response(), SimpleNamespace(user_id=owner), postgres_store)
+    assert len(result["batches"]) == 1
+    grouped = result["batches"][0]
+    assert grouped["status"] == "proposed"
+    assert len(grouped["seasons"]) == 1
+    assert grouped["seasons"][0]["episode_candidate_count"] == 10
+    assert sorted(track["proposed_episode_number"] for track in grouped["tracks"]) == list(range(1, 11))
+    for entry in entries:
+        assert postgres_store.get_item(entry.id) == entry
+        track = next(track for track in grouped["tracks"] if track["arrival_item_id"] == entry.id)
+        assert track["source_provenance"] == entry.metadata["source_context"]
+        assert track["publication_state"] == "proposed"
+    repeated = vault_master_api.list_tv_resolver_batches(Response(), SimpleNamespace(user_id=owner), postgres_store)
+    assert repeated["batches"][0]["id"] == grouped["id"]
+
+
+def test_postgres_tv_resolver_supersedes_only_unapproved_member_subsets(
+    postgres_store: PostgresVaultMasterStore,
+    postgres_conninfo: str,
+) -> None:
+    """A fuller proposal replaces its unapproved subset, never a protected one."""
+    account = PostgresAuthenticationStore(postgres_conninfo).get_account("owner")
+    assert account is not None
+    resolver = PostgresTvResolverStore(postgres_conninfo)
+    resolver.initialize()
+    batch = postgres_store.create_batch(INCOMING_SOURCE, "/arrival")
+    members = []
+    for number in range(1, 6):
+        filename = f"Example Show Season 1 - Disc 1_t{number:02d}.mkv"
+        members.append(postgres_store.record_file(
+            batch,
+            INCOMING_SOURCE,
+            ScannedFile(
+                f"/arrival/Example Show/Season 1/{filename}", filename,
+                f"Example Show/Season 1/{filename}", number, "video/x-matroska",
+                datetime.now(timezone.utc), f"{number:064x}",
+                {"duration_seconds": 3500 + number, "source_context": {
+                    "source_id": "supplier-example" if number % 2 else None,
+                    "source_label": "Example Show",
+                    "relative_path": f"Example Show/Season 1/{filename}",
+                }}, owner_user_id=account.user_id,
+            ),
+        ))
+    old = resolver.sync_proposal(account.user_id, members[:3], resolve_tv_disc_batch(members[:3]))
+    current = resolver.sync_proposal(account.user_id, members, resolve_tv_disc_batch(members))
+    assert current.id != old.id
+    assert [entry["id"] for entry in resolver.list_for_owner(account.user_id)] == [current.id]
+    assert resolver.sync_proposal(account.user_id, members, resolve_tv_disc_batch(members)).id == current.id
+    with psycopg.connect(postgres_conninfo) as connection:
+        connection.execute("UPDATE vault_tv_resolver_batches SET status='published' WHERE id=%s", (current.id,))
+    expanded = members + [members[0].__class__(**{**members[0].__dict__, "id": uuid4(), "sha256": "f" * 64})]
+    with pytest.raises(ValueError, match="protected publication batch"):
+        resolver.sync_proposal(account.user_id, expanded, resolve_tv_disc_batch(expanded))
+    # The shared Vault Master reset fixture predates the additive resolver
+    # tables, so this focused test removes its own durable FK rows.
+    with psycopg.connect(postgres_conninfo) as connection:
+        connection.execute("DELETE FROM vault_tv_resolver_tracks")
+        connection.execute("DELETE FROM vault_tv_resolver_seasons")
+        connection.execute("DELETE FROM vault_tv_resolver_batches")
+
+def test_bulk_scan_checkpoint_persists_and_gallery_receipt_is_idempotent(postgres_store, postgres_conninfo, tmp_path):
+    from app.arrival_incremental_scan import scan_arrival_incrementally
+    from PIL import Image
+    arrival = tmp_path / 'arrival'; arrival.mkdir()
+    gallery = tmp_path / 'gallery'; gallery.mkdir()
+    source = arrival / 'synthetic-camera.jpg'
+    Image.new('RGB', (16,16), 'blue').save(source)
+    owner = _arrival_hall_owner_user_id(postgres_conninfo)
+    assert scan_arrival_incrementally(postgres_store, arrival, lambda _:owner)
+    item = next(x for x in postgres_store.list_items() if x.source_path == str(source.resolve()))
+    restarted = PostgresVaultMasterStore(postgres_conninfo)
+    assert scan_arrival_incrementally(restarted, arrival, lambda _:owner) is None
+    assert scan_arrival_incrementally(restarted, arrival, lambda _:owner, version='technical-v-next')
+    assert restarted.get_item(item.id).id == item.id
+    assert restarted.record_decision(item.id, 'approved', 'owner')
+    assert restarted.queue_move(item.id, 'owner')
+    request_id = uuid4()
+    assert process_next_move(restarted, arrival, {'Gallery':gallery}, theatre_queue=lambda _:request_id) == item.id
+    assert source.exists() and not list(gallery.iterdir())
+    pending = restarted.get_item(item.id)
+    scan_root(restarted, arrival, INCOMING_SOURCE, owner_lookup=lambda _:owner)
+    assert restarted.get_item(item.id) == pending
+    receipt = dict(request_id=str(request_id),item_id=str(item.id),owner_user_id=str(owner),logical_destination=item.proposed_destination,logical_area='Gallery',slot_id='PV-DISK-002',relative_path=item.proposed_destination.removeprefix('/vault/'),expected_sha256=item.sha256,expected_size_bytes=item.size_bytes)
+    with psycopg.connect(postgres_conninfo) as conn:
+        conn.execute("INSERT INTO vault_storage_slots(slot_id,state,assigned_areas) VALUES('PV-DISK-002','active','[\"Music\"]') ON CONFLICT(slot_id) DO UPDATE SET assigned_areas=EXCLUDED.assigned_areas")
+    asset = restarted.publish_arrival_managed_receipt(item.id,receipt)
+    assert asset and asset.visibility == 'private'
+    fresh = PostgresVaultMasterStore(postgres_conninfo)
+    assert fresh.publish_arrival_managed_receipt(item.id,receipt) is None
+    assert fresh.get_catalogued_asset_by_id(asset.id).id == asset.id
+    assert str(request_id) in fresh.completed_arrival_request_ids()
+    with psycopg.connect(postgres_conninfo) as conn:
+        assert set(conn.execute("SELECT assigned_areas FROM vault_storage_slots WHERE slot_id='PV-DISK-002'").fetchone()[0]) == {'Music','Gallery'}
+        assert conn.execute('SELECT count(*) FROM vault_arrival_managed_publications WHERE item_id=%s',(item.id,)).fetchone()[0] == 1
+        assert conn.execute('SELECT count(*) FROM vault_files WHERE asset_id=%s',(asset.id,)).fetchone()[0] == 1
+
+def test_bulk_gallery_atomic_approval_duplicate_and_rule_audit(postgres_store, postgres_conninfo, tmp_path):
+    from app.arrival_photo_approval import queue_automatic_gallery_photo
+    from app.intake_bulk_recovery import incident_metrics
+    from psycopg.rows import dict_row
+    from PIL import Image
+    arrival=tmp_path/'arrival';arrival.mkdir()
+    owner=_arrival_hall_owner_user_id(postgres_conninfo)
+    for name in ('first.jpg','second.jpg'):
+        Image.new('RGB',(16,16),'blue').save(arrival/name)
+    scan_root(postgres_store,arrival,INCOMING_SOURCE,owner_lookup=lambda _:owner)
+    first,second=sorted(postgres_store.list_items(),key=lambda x:x.filename)
+    policies=PostgresAutopilotStore(postgres_conninfo)
+    policy=policies.upsert_policy(owner,'owner','personal_photo','Gallery',80,50,2,5)
+    policy=policies.set_policy_status(policy.id,owner,'enabled')
+    assert queue_automatic_gallery_photo(postgres_store,first,policy,'camera-photo-v1','worker') is None
+    # Manual approval remains available when deterministic score authority is absent.
+    assert postgres_store.record_decision(first.id,'approved','owner')
+    queued=postgres_store.queue_move(first.id,'owner')
+    assert queued and queued.state=='move_queued'
+    restarted=PostgresVaultMasterStore(postgres_conninfo)
+    assert queue_automatic_gallery_photo(restarted,second,policy,'camera-photo-v1','worker') is None
+    assert (arrival/'second.jpg').exists() and restarted.get_item(second.id).state=='needs_review'
+    with psycopg.connect(postgres_conninfo,row_factory=dict_row) as conn:
+        metrics=incident_metrics(conn,[first.id,second.id])
+        assert metrics['states']=={'move_queued':1,'needs_review':1}
+        assert metrics['missing']==0 and metrics['receipts']==0
+        assert conn.execute("SELECT count(*) AS n FROM vault_master_decisions WHERE item_id=%s AND decision='approved'",(first.id,)).fetchone()['n']==1
+    assert queue_automatic_gallery_photo(restarted,first,policy,'camera-photo-v1','worker') is None
+
+
+def test_scored_documents_authorization_survives_signed_receipt_reconciliation(
+    postgres_store, postgres_conninfo, tmp_path,
+):
+    from types import SimpleNamespace
+    from app.vault_master_ai import AI_MODEL_ID, AI_MODEL_REVISION
+    from app.vault_master_ingestion_ai import INGESTION_TASK_VERSION
+    from app.vault_master_autopilot import _authorize_scored_item
+    from app.vault_master_routing_score import build_routing_decision
+
+    arrival = tmp_path / 'arrival'; arrival.mkdir()
+    (arrival / 'example.pdf').write_bytes(b'synthetic receipt document')
+    owner = _arrival_hall_owner_user_id(postgres_conninfo)
+    scan_root(postgres_store, arrival, INCOMING_SOURCE, owner_lookup=lambda _: owner)
+    item = postgres_store.list_items()[0]
+    evidence = SimpleNamespace(
+        id=uuid4(), item_id=item.id, owner_user_id=owner,
+        source_sha256=item.sha256,
+        caption='A purchase receipt', ocr_text='RECEIPT subtotal VAT amount paid change due',
+        model_id=AI_MODEL_ID, model_revision=AI_MODEL_REVISION,
+        task_version=INGESTION_TASK_VERSION,
+    )
+    policies = PostgresAutopilotStore(postgres_conninfo)
+    policy = policies.upsert_policy(owner, 'owner', 'receipt', 'Documents', 80, 50, 2, 5)
+    policy = policies.set_policy_status(policy.id, owner, 'enabled')
+    decision = policies.save_routing_decision(build_routing_decision(
+        item, evidence, policy, {'source_and_destination_preflight': True}))
+    assert decision.automatic_eligible
+    queued = _authorize_scored_item(policies, postgres_store, item, decision, arrival,
+                                    {'Documents': tmp_path})
+    assert queued is not None and queued.proposed_category == 'Documents'
+    request_id = uuid4()
+    assert process_next_move(postgres_store, arrival, {'Documents': tmp_path},
+                             theatre_queue=lambda _: request_id) == item.id
+    pending = postgres_store.get_item(item.id)
+    from app.arrival_managed_publisher import ArrivalManagedPublicationRequest
+    request = ArrivalManagedPublicationRequest.create(item=pending)
+    authorization = request.routing_authorization
+    assert authorization is not None and authorization['decision_id'] == str(decision.id)
+    receipt = dict(
+        request_id=str(request_id), item_id=str(item.id), owner_user_id=str(owner),
+        logical_destination=pending.proposed_destination, logical_area='Documents',
+        slot_id='PV-DISK-002',
+        relative_path=pending.proposed_destination.removeprefix('/vault/'),
+        expected_sha256=item.sha256, expected_size_bytes=item.size_bytes,
+        routing_authorization=authorization,
+    )
+    asset = postgres_store.publish_arrival_managed_receipt(item.id, receipt)
+    assert asset is not None and asset.vault_path.startswith('/vault/Documents/')
+    with psycopg.connect(postgres_conninfo) as connection:
+        assert connection.execute(
+            'SELECT routing_decision_id,routing_authorization_id '
+            'FROM vault_arrival_managed_publications WHERE item_id=%s',
+            (item.id,),
+        ).fetchone() == (decision.id, UUID(authorization['authorization_id']))
+
+
+def test_postgres_gallery_page_query_is_bounded_ordered_and_owner_scoped(
+    postgres_store: PostgresVaultMasterStore, postgres_conninfo: str,
+) -> None:
+    """Use synthetic catalogue rows in the disposable PostgreSQL test DB."""
+    for index in range(65):
+        asset = _catalogued_asset(
+            uuid4(), f"/vault/Gallery/Synthetic-Example-{index:03d}.jpg", "owner",
+        )
+        postgres_store.restore_catalogued_asset(
+            replace(asset, captured_on=date(2024, 1, index % 28 + 1)), "owner",
+        )
+    other = _catalogued_asset(uuid4(), "/vault/Gallery/Synthetic-Other-Owner.jpg", "son")
+    postgres_store.restore_catalogued_asset(other, "son")
+    account = PostgresAuthenticationStore(postgres_conninfo).get_account("owner")
+    assert account is not None
+    first = postgres_store.gallery_page_paths(
+        account.user_id, [], "active", "newest", None, None, None, None, 61,
+    )
+    assert len(first) == 61
+    last = postgres_store.get_catalogued_asset(first[59])
+    assert last is not None
+    second = postgres_store.gallery_page_paths(
+        account.user_id, [], "active", "newest", None, None, None,
+        (last.captured_on, last.filename.casefold(), last.vault_path), 61,
+    )
+    assert len(second) == 5
+    assert len(set(first[:60] + second)) == 65
+    assert other.vault_path not in first + second

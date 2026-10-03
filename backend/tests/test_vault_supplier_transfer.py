@@ -1,4 +1,6 @@
+from tests.conftest import pairing_secret
 from base64 import urlsafe_b64decode, urlsafe_b64encode
+from datetime import datetime, timezone
 import hashlib
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,12 +12,25 @@ from fastapi.testclient import TestClient
 
 from app.auth_store import MemoryAuthenticationStore
 import app.incoming as incoming_module
-from app.incoming import get_arrival_hall_file_source_context, get_incoming_path
+from app.incoming import get_arrival_hall_file_source_context, get_incoming_path, record_arrival_hall_file_owner
 from app.main import app
-from app.vault_master import INCOMING_SOURCE, MemoryVaultMasterStore, enqueue_root, process_next_batch
+from app.vault_master import (
+    INCOMING_SOURCE,
+    MemoryVaultMasterStore,
+    get_vault_master_store,
+    enqueue_root,
+    process_next_batch,
+    process_next_move,
+)
+from app.arrival_managed_publisher import ArrivalManagedPublicationRequest
+from app.vault_master_api import get_destination_paths
 from app.vault_supplier import get_vault_supplier_store
-from app.vault_supplier_transfer import backfill_arrival_hall_source_context, get_transfer_store
-from tests.conftest import pairing_secret
+from app.vault_supplier_transfer import (
+    MemoryTransferStore,
+    TransferSession,
+    backfill_arrival_hall_source_context,
+    get_transfer_store,
+)
 
 
 def _login(client: TestClient) -> None:
@@ -39,12 +54,14 @@ def _authorized_headers(client: TestClient, authentication_store: MemoryAuthenti
     assert authenticated.status_code == 200, authenticated.text
     token = authenticated.json()["authorization_token"]
     assert isinstance(token, str)
-    return {"Authorization": f"Bearer {token}", "X-PV-Supplier-Installation-ID": str(installation_id), "X-PV-Supplier-User-ID": str(user.user_id)}
+    return {"Authorization": f"Bearer {token}", "X-PV-Supplier-Installation-ID": str(installation_id), "X-PV-Supplier-User-ID": str(user.user_id), "Host": "vault-server.local"}
 
 
 def _configure_arrival_hall(tmp_path: Path) -> None:
     arrival = tmp_path / "Arrival Hall"
     arrival.mkdir()
+    catalogue = MemoryVaultMasterStore()
+    app.dependency_overrides[get_vault_master_store] = lambda: catalogue
     app.dependency_overrides[get_incoming_path] = lambda: arrival
 
 
@@ -59,7 +76,7 @@ def test_resumable_transfer_finalizes_once_and_hidden_part_is_not_scanned(client
     headers = _authorized_headers(client, authentication_store)
     payload = b"supplier-resume-payload"
     digest = hashlib.sha256(payload).hexdigest()
-    created = client.post("/api/vault-supplier/transfers", headers=headers, json={"protocol_version": 1, "filename": "video.mp4", "total_size": len(payload), "sha256": digest, "source_context": {"source_kind": "automatic_source", "source_id": "sample-series-rips", "source_label": "Sample Series", "relative_path": "Season 1\\video.mp4"}})
+    created = client.post("/api/vault-supplier/transfers", headers=headers, json={"protocol_version": 1, "filename": "video.mp4", "total_size": len(payload), "sha256": digest, "source_created_at": "2025-01-02T03:04:05Z", "source_modified_at": "2025-01-03T04:05:06Z", "source_context": {"source_kind": "automatic_source", "source_id": "westworld-rips", "source_label": "Westworld", "relative_path": "Season 1\\video.mp4"}})
     assert created.status_code == 201, created.text
     transfer_id = created.json()["transfer_id"]
     first = payload[:7]
@@ -67,6 +84,9 @@ def test_resumable_transfer_finalizes_once_and_hidden_part_is_not_scanned(client
     assert uploaded.status_code == 200, uploaded.text
     status_response = client.get(f"/api/vault-supplier/transfers/{transfer_id}", headers=headers)
     assert status_response.json()["bytes_received"] == len(first)
+    public_status = client.get(f"/api/vault-supplier/transfers/{transfer_id}", headers={**headers, "Host": "testserver"})
+    assert public_status.status_code == 404
+    assert public_status.json()["detail"]["code"] == "receiver_unavailable"
     bad_offset = client.put(f"/api/vault-supplier/transfers/{transfer_id}/data", headers={**headers, "X-PV-Upload-Offset": "0", "Content-Length": str(len(payload) - len(first))}, content=payload[len(first):])
     assert bad_offset.status_code == 409
     resumed = client.put(f"/api/vault-supplier/transfers/{transfer_id}/data", headers={**headers, "X-PV-Upload-Offset": str(len(first)), "Content-Length": str(len(payload) - len(first))}, content=payload[len(first):])
@@ -79,10 +99,13 @@ def test_resumable_transfer_finalizes_once_and_hidden_part_is_not_scanned(client
     assert (arrival / body["arrival_hall_filename"]).read_bytes() == payload
     assert get_arrival_hall_file_source_context(arrival, arrival / body["arrival_hall_filename"]) == {
         "transfer_id": transfer_id,
+        "original_filename": "video.mp4",
         "source_kind": "automatic_source",
-        "source_id": "sample-series-rips",
-        "source_label": "Sample Series",
+        "source_id": "westworld-rips",
+        "source_label": "Westworld",
         "relative_path": "Season 1/video.mp4",
+        "source_created_at": "2025-01-02T03:04:05+00:00",
+        "source_modified_at": "2025-01-03T04:05:06+00:00",
     }
     user = authentication_store.get_account("owner")
     assert user is not None
@@ -90,7 +113,16 @@ def test_resumable_transfer_finalizes_once_and_hidden_part_is_not_scanned(client
     transfer_store = client.app.dependency_overrides[get_transfer_store]()
     assert backfill_arrival_hall_source_context(arrival, transfer_store) == 1
     assert backfill_arrival_hall_source_context(arrival, transfer_store) == 1
-    assert get_arrival_hall_file_source_context(arrival, arrival / body["arrival_hall_filename"])["source_label"] == "Sample Series"
+    assert get_arrival_hall_file_source_context(arrival, arrival / body["arrival_hall_filename"]) == {
+        "transfer_id": transfer_id,
+        "original_filename": "video.mp4",
+        "source_kind": "automatic_source",
+        "source_id": "westworld-rips",
+        "source_label": "Westworld",
+        "relative_path": "Season 1/video.mp4",
+        "source_created_at": "2025-01-02T03:04:05+00:00",
+        "source_modified_at": "2025-01-03T04:05:06+00:00",
+    }
     vault_store = MemoryVaultMasterStore(default_asset_owner="owner")
     batch_id = enqueue_root(vault_store, arrival, INCOMING_SOURCE)
     assert process_next_batch(
@@ -98,12 +130,136 @@ def test_resumable_transfer_finalizes_once_and_hidden_part_is_not_scanned(client
         owner_lookup=lambda _: user.user_id,
         source_context_lookup=lambda path: get_arrival_hall_file_source_context(arrival, path),
     ) == batch_id
-    assert vault_store.list_items()[0].metadata["source_context"]["source_id"] == "sample-series-rips"
+    assert vault_store.list_items()[0].metadata["source_context"]["source_id"] == "westworld-rips"
+    item = vault_store.list_items()[0]
+    assert item.filename == body["arrival_hall_filename"]
+    assert item.metadata["logical_filename"] == "video.mp4"
     assert not list((arrival / ".pv-vault-supplier-transfers").glob("*.part"))
     assert signals == ["arrival_hall"]
     assert client.post("/api/vault-supplier/intake/check-hashes", headers=headers, json={"protocol_version": 1, "sha256": [digest]}).json()["hashes"] == [{"sha256": digest, "duplicate": True}]
     duplicate = client.post("/api/vault-supplier/transfers", headers=headers, json={"protocol_version": 1, "filename": "renamed.mp4", "total_size": len(payload), "sha256": digest})
     assert duplicate.status_code == 409 and duplicate.json()["detail"]["code"] == "duplicate_content"
+
+
+def test_backfill_legacy_context_does_not_invent_original_filename(tmp_path: Path) -> None:
+    arrival = tmp_path / "Arrival Hall"
+    arrival.mkdir()
+    filename = "legacy (Vault Supplier 12345678).mkv"
+    destination = arrival / filename
+    destination.write_bytes(b"legacy")
+    user_id = uuid4()
+    record_arrival_hall_file_owner(arrival, destination, SimpleNamespace(user_id=user_id))
+    now = datetime.now(timezone.utc)
+    transfer = TransferSession(
+        uuid4(), uuid4(), user_id, uuid4(), filename, filename, 6, "0" * 64,
+        None, {"source_kind": "automatic_source", "relative_path": "Season 1/legacy.mkv"},
+        1, "finalized", 6, now, now, now, finalized_at=now,
+        arrival_hall_filename=filename,
+    )
+    transfers = MemoryTransferStore()
+    transfers.sessions[transfer.transfer_id] = transfer
+
+    assert backfill_arrival_hall_source_context(arrival, transfers) == 1
+    assert backfill_arrival_hall_source_context(arrival, transfers) == 1
+    assert get_arrival_hall_file_source_context(arrival, destination) == {
+        "transfer_id": str(transfer.transfer_id),
+        "source_kind": "automatic_source",
+        "relative_path": "Season 1/legacy.mkv",
+    }
+
+
+def test_supplier_finalized_pdf_moves_to_documents_with_shared_safe_move(
+    client: TestClient,
+    authentication_store: MemoryAuthenticationStore,
+    tmp_path: Path,
+) -> None:
+    _configure_arrival_hall(tmp_path)
+    headers = _authorized_headers(client, authentication_store)
+    payload = b"supplier-document"
+    digest = hashlib.sha256(payload).hexdigest()
+    created = client.post(
+        "/api/vault-supplier/transfers",
+        headers=headers,
+        json={
+            "protocol_version": 1,
+            "filename": "phone receipt.pdf",
+            "total_size": len(payload),
+            "sha256": digest,
+        },
+    )
+    assert created.status_code == 201, created.text
+    transfer_id = created.json()["transfer_id"]
+    assert client.put(
+        f"/api/vault-supplier/transfers/{transfer_id}/data",
+        headers={
+            **headers,
+            "X-PV-Upload-Offset": "0",
+            "Content-Length": str(len(payload)),
+        },
+        content=payload,
+    ).status_code == 200
+    finalized = client.post(f"/api/vault-supplier/transfers/{transfer_id}/finalize", headers=headers)
+    assert finalized.status_code == 200, finalized.text
+
+    arrival = tmp_path / "Arrival Hall"
+    documents = tmp_path / "Documents"
+    documents.mkdir()
+    store = MemoryVaultMasterStore(default_asset_owner="owner")
+    batch_id = enqueue_root(store, arrival, INCOMING_SOURCE)
+    assert process_next_batch(
+        store,
+        source_context_lookup=lambda path: get_arrival_hall_file_source_context(arrival, path),
+    ) == batch_id
+    item = store.list_items()[0]
+    assert item.filename == finalized.json()["arrival_hall_filename"]
+    assert item.metadata["logical_filename"] == "phone receipt.pdf"
+    assert item.proposed_category == "Documents"
+    assert store.record_decision(item.id, "approved", "owner") is not None
+    assert store.queue_move(item.id, "owner") is not None
+    requests = []
+    def queue(current):
+        requests.append(ArrivalManagedPublicationRequest.create(item=current))
+        return requests[-1].request_id
+    assert process_next_move(store, arrival, {"Documents": documents}, theatre_queue=queue) == item.id
+
+    assert store.get_item(item.id).state == "theatre_promotion_pending"
+    assert requests[0].logical_destination == "/vault/Documents/phone receipt.pdf"
+    assert requests[0].expected_sha256 == digest
+    assert (arrival / finalized.json()["arrival_hall_filename"]).read_bytes() == payload
+    assert not (documents / "phone receipt.pdf").exists()
+
+
+def test_supplier_collision_uses_safe_arrival_filename_but_preserves_original_identity(
+    client: TestClient, authentication_store: MemoryAuthenticationStore, tmp_path: Path,
+) -> None:
+    _configure_arrival_hall(tmp_path)
+    headers = _authorized_headers(client, authentication_store)
+    arrival = tmp_path / "Arrival Hall"
+    for payload in (b"first supplier file", b"second supplier file"):
+        digest = hashlib.sha256(payload).hexdigest()
+        created = client.post("/api/vault-supplier/transfers", headers=headers, json={"protocol_version": 1, "filename": "video.mkv", "total_size": len(payload), "sha256": digest})
+        assert created.status_code == 201, created.text
+        transfer_id = created.json()["transfer_id"]
+        assert client.put(f"/api/vault-supplier/transfers/{transfer_id}/data", headers={**headers, "X-PV-Upload-Offset": "0", "Content-Length": str(len(payload))}, content=payload).status_code == 200
+        finalized = client.post(f"/api/vault-supplier/transfers/{transfer_id}/finalize", headers=headers)
+        assert finalized.status_code == 200, finalized.text
+        visible = arrival / finalized.json()["arrival_hall_filename"]
+        assert get_arrival_hall_file_source_context(arrival, visible)["original_filename"] == "video.mkv"
+    names = [path.name for path in arrival.glob("video (Vault Supplier *).mkv")]
+    assert len(names) == 2 and len(set(names)) == 2
+    user = authentication_store.get_account("owner")
+    assert user is not None
+    store = MemoryVaultMasterStore(default_asset_owner="owner")
+    batch_id = enqueue_root(store, arrival, INCOMING_SOURCE)
+    assert process_next_batch(
+        store,
+        owner_lookup=lambda _: user.user_id,
+        source_context_lookup=lambda path: get_arrival_hall_file_source_context(arrival, path),
+    ) == batch_id
+    assert len({item.filename for item in store.list_items()}) == 2
+    assert {item.metadata["logical_filename"] for item in store.list_items()} == {"video.mkv"}
+
+
 
 
 def test_transfer_auth_revocation_checksum_failure_and_abort_are_fail_closed(client: TestClient, authentication_store: MemoryAuthenticationStore, tmp_path: Path, monkeypatch) -> None:
@@ -115,7 +271,7 @@ def test_transfer_auth_revocation_checksum_failure_and_abort_are_fail_closed(cli
     )
     _configure_arrival_hall(tmp_path)
     headers = _authorized_headers(client, authentication_store)
-    assert client.get("/api/vault-supplier/intake/state").status_code == 401
+    assert client.get("/api/vault-supplier/intake/state", headers={"Host": "vault-server.local"}).status_code == 401
     payload = b"bad-checksum"
     created = client.post("/api/vault-supplier/transfers", headers=headers, json={"protocol_version": 1, "filename": "safe.bin", "total_size": len(payload), "sha256": "0" * 64})
     transfer_id = created.json()["transfer_id"]
@@ -141,12 +297,13 @@ def test_receiver_validation_errors_and_source_context_is_safely_normalized(clie
     malformed = client.post("/api/vault-supplier/transfers", headers=headers, json={"protocol_version": 1, "filename": "safe.bin", "total_size": 19})
     assert malformed.status_code == 422
     assert malformed.json() == {"detail": {"code": "invalid_request", "message": "Vault Supplier receiver request is malformed."}}
-    source_context = {"source_kind": "automatic_source", "source_label": "Sample Series", "relative_path": "Season 1\\Disc 1_t01.mkv"}
+    source_context = {"source_kind": "automatic_source", "source_label": "Westworld", "relative_path": "Season 1\\Disc 1_t01.mkv"}
     created = client.post("/api/vault-supplier/transfers", headers=headers, json={"protocol_version": 1, "filename": "safe.bin", "total_size": 19, "sha256": digest, "source_context": source_context})
     assert created.status_code == 201, created.text
     transfer = client.app.dependency_overrides[get_transfer_store]().get(UUID(created.json()["transfer_id"]))
     assert transfer is not None and transfer.source_context == {
-        "source_kind": "automatic_source", "source_label": "Sample Series", "relative_path": "Season 1/Disc 1_t01.mkv"
+        "source_kind": "automatic_source", "source_label": "Westworld", "relative_path": "Season 1/Disc 1_t01.mkv"
+        , "original_filename": "safe.bin"
     }
     assert client.delete(f"/api/vault-supplier/transfers/{created.json()['transfer_id']}", headers=headers).status_code == 200
     for unsafe in ("../OtherShow/file.mkv", "C:\\OtherShow\\file.mkv", "\\\\server\\share\\file.mkv"):
@@ -173,3 +330,16 @@ def test_large_lan_transfer_over_100mb_streams_and_finalizes(client: TestClient,
         assert response.status_code == 200, response.text
         offset += len(chunk)
     assert client.post(f"/api/vault-supplier/transfers/{transfer_id}/finalize", headers=headers).json()["state"] == "finalized"
+
+
+
+
+def test_provenance_reconciliation_is_an_explicit_lan_post_route() -> None:
+    from app.vault_supplier_transfer import router
+
+    route = next(
+        route
+        for route in router.routes
+        if route.path == "/api/vault-supplier/provenance/reconcile"
+    )
+    assert route.methods == {"POST"}

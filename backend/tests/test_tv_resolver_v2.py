@@ -59,7 +59,7 @@ def test_discovery_excludes_terminal_arrival_items(state):
     assert discover_tv_disc_batches(entries) == ()
 
 
-def test_memory_api_reports_v2_and_keeps_owner_scope(monkeypatch):
+def test_memory_api_reports_current_version_and_keeps_owner_scope(monkeypatch):
     from types import SimpleNamespace
     from fastapi import Response
     from app.vault_master import MemoryVaultMasterStore
@@ -72,7 +72,7 @@ def test_memory_api_reports_v2_and_keeps_owner_scope(monkeypatch):
     response = Response()
     result = list_tv_resolver_batches(response, SimpleNamespace(user_id=owner), store)
     assert len(result["batches"]) == 1
-    assert result["batches"][0]["resolver_version"] == "pv-tv-disc-resolver.v2"
+    assert result["batches"][0]["resolver_version"] == "pv-tv-disc-resolver.v3"
     assert len(result["batches"][0]["tracks"]) == 3
     assert response.headers["Cache-Control"] == "private, no-store"
 

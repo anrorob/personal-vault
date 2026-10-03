@@ -274,7 +274,7 @@ function HomePage() {
   }, [navigate]);
 
   return (
-    <div className="max-w-6xl mx-auto space-y-10">
+    <div className="max-w-7xl mx-auto space-y-10">
       <section>
         <h2 className="pv-display-title text-2xl md:text-3xl tracking-tight">
           Greetings, Vault Hunter.

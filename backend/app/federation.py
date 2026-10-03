@@ -590,6 +590,8 @@ class FederationStore:
             cursor.execute("SELECT 1 FROM vaults WHERE vault_id=%s AND is_local=FALSE AND trust_state='trusted'", (target_vault_id,))
             if local is None or cursor.fetchone() is None:
                 raise ValueError("Select a trusted paired Vault")
+            from app.home_video_privacy import require_collection_shareable
+            require_collection_shareable(cursor, collection_id)
             cursor.execute("""SELECT 1 FROM vault_shared_collections
                 WHERE collection_id=%s AND owner_user_id=%s AND origin_vault_id=%s AND archived_at IS NULL""", (collection_id, owner_user_id, local["vault_id"]))
             if cursor.fetchone() is None:
@@ -814,6 +816,8 @@ class FederationStore:
             if local is None: raise RuntimeError("Missing local Vault identity")
             local_id=UUID(str(local['vault_id'])); quick=share_mode=='quick'; created=[]
             for asset_id in asset_ids:
+                from app.home_video_privacy import require_shareable
+                require_shareable(cursor, [asset_id])
                 cursor.execute("SELECT id FROM vault_assets WHERE id=%s AND owner_user_id=%s AND origin_vault_id=%s",(asset_id,owner_user_id,local_id))
                 if cursor.fetchone() is None: raise ValueError("Federation shares require an owned local asset")
                 share_id=uuid4()
@@ -1187,12 +1191,14 @@ class FederationStore:
             cursor.execute("SELECT pairing_key,trust_state FROM vaults WHERE vault_id=%s AND is_local=FALSE",(requester_vault_id,)); peer=cursor.fetchone()
             if peer is None or peer['trust_state']!='trusted' or not peer['pairing_key'] or not verify_envelope(request,signature,str(peer['pairing_key'])): return False
             cursor.execute("""SELECT 1 WHERE EXISTS (
-                SELECT 1 FROM vault_federation_outgoing_shares
-                WHERE federation_share_id=%s AND origin_asset_id=%s AND target_vault_id=%s AND state='active'
+                SELECT 1 FROM vault_federation_outgoing_shares share
+                JOIN vault_assets asset ON asset.id=share.origin_asset_id AND asset.lifecycle_state='active'
+                WHERE share.federation_share_id=%s AND share.origin_asset_id=%s AND share.target_vault_id=%s AND share.state='active'
             ) OR EXISTS (
                 SELECT 1 FROM vault_federation_outgoing_collection_shares collection_share
                 JOIN vault_shared_collections collection ON collection.collection_id=collection_share.origin_collection_id AND collection.archived_at IS NULL
                 JOIN vault_shared_collection_members member ON member.collection_id=collection.collection_id
+                JOIN vault_assets asset ON asset.id=member.asset_id AND asset.lifecycle_state='active'
                 WHERE collection_share.federation_collection_share_id=%s AND member.asset_id=%s
                   AND collection_share.target_vault_id=%s AND collection_share.state='active'
             )""",(origin_share_id,origin_asset_id,requester_vault_id,origin_share_id,origin_asset_id,requester_vault_id))

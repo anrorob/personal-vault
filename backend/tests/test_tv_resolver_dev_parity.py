@@ -1,4 +1,4 @@
-"""Discovery contract shared with accepted Development b89d3b6."""
+"""Synthetic logical source-identity discovery contract."""
 from types import SimpleNamespace
 
 from app.tv_resolver_publication import _source_identity

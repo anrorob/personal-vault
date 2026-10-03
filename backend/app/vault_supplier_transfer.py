@@ -25,16 +25,18 @@ from psycopg.rows import dict_row
 
 from app.incoming import (
     complete_arrival_hall_publication,
+    record_arrival_hall_file_owner,
     record_arrival_hall_file_source_context,
     get_arrival_hall_path,
-    get_available_name,
     require_incoming_path,
     validate_filename,
 )
 from app.auth import get_authentication_store
 from app.auth_store import AuthenticationStore
 from app.config import get_database_conninfo
+from app.config import supplier_lan_host_allowed
 from app.vault_master_intake import IntakeStore, get_intake_store
+from app.vault_master import VaultMasterStore, get_vault_master_store, apply_source_timestamp_provenance
 from app.vault_supplier import SupplierInstallation, VaultSupplierStore, get_vault_supplier_store
 
 
@@ -84,6 +86,20 @@ def _source_context(value: dict[str, object] | None) -> dict[str, object]:
     if not isinstance(value, dict):
         raise _error("invalid_source_context", "Source context must be an object.")
     result: dict[str, object] = {}
+    if "content_type" in value:
+        from app.music_video_identity import declared_intent
+        try:
+            # Media is independently validated against the transfer below.
+            intent = declared_intent(value, "video/declared")
+        except ValueError as error:
+            raise _error("invalid_music_video", str(error)) from error
+        result.update(content_type="music_video", **intent)
+    if "music_album" in value:
+        from app.music_groups import album_intent
+        try:
+            result["music_album"] = album_intent(value["music_album"])
+        except (ValueError, TypeError) as error:
+            raise _error("invalid_music_album", str(error)) from error
     for name, maximum in (("source_kind", 64), ("source_id", 128), ("source_label", 256)):
         raw = value.get(name)
         if raw is None:
@@ -102,6 +118,19 @@ def _source_context(value: dict[str, object] | None) -> dict[str, object]:
         if not parts or any(part == ".." or any(ord(char) < 32 for char in part) for part in parts):
             raise _error("invalid_source_context", "relative_path must be a safe relative path.")
         result["relative_path"] = "/".join(parts)
+    original_filename = value.get("original_filename")
+    if original_filename is not None:
+        if not isinstance(original_filename, str):
+            raise _error("invalid_source_context", "original_filename is invalid.")
+        try:
+            result["original_filename"] = validate_filename(original_filename)
+        except HTTPException as error:
+            raise _error("invalid_source_context", "original_filename is invalid.") from error
+    normalized_timestamps = apply_source_timestamp_provenance({}, value)
+    for field in ("source_created_at", "source_modified_at"):
+        timestamp = normalized_timestamps.get(field)
+        if isinstance(timestamp, str):
+            result[field] = timestamp
     encoded = __import__("json").dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     if len(encoded) > MAX_SOURCE_CONTEXT_BYTES:
         raise _error("invalid_source_context", "Source context exceeds the protocol limit.")
@@ -115,6 +144,7 @@ class TransferSession:
     user_id: UUID
     vault_id: UUID
     filename: str
+    original_filename: str
     total_size: int
     expected_sha256: str
     media_type: str | None
@@ -128,7 +158,6 @@ class TransferSession:
     finalized_at: datetime | None = None
     arrival_hall_filename: str | None = None
     failure_code: str | None = None
-
 
 class TransferStore(Protocol):
     def initialize(self) -> None: ...
@@ -234,7 +263,7 @@ class MemoryTransferStore:
 def _session_from_row(row: dict[str, object]) -> TransferSession:
     return TransferSession(
         transfer_id=UUID(str(row["transfer_id"])), installation_id=UUID(str(row["installation_id"])), user_id=UUID(str(row["user_id"])), vault_id=UUID(str(row["vault_id"])),
-        filename=str(row["filename"]), total_size=int(row["total_size"]), expected_sha256=str(row["expected_sha256"]), media_type=str(row["media_type"]) if row["media_type"] else None,
+        filename=str(row["filename"]), original_filename=str(row.get("original_filename") or row["filename"]), total_size=int(row["total_size"]), expected_sha256=str(row["expected_sha256"]), media_type=str(row["media_type"]) if row["media_type"] else None,
         source_context=dict(row["source_context"] or {}), protocol_version=int(row["protocol_version"]), state=str(row["state"]), bytes_received=int(row["bytes_received"]),
         created_at=row["created_at"], updated_at=row["updated_at"], expires_at=row["expires_at"], finalized_at=row["finalized_at"],
         arrival_hall_filename=str(row["arrival_hall_filename"]) if row["arrival_hall_filename"] else None, failure_code=str(row["failure_code"]) if row["failure_code"] else None,
@@ -255,7 +284,7 @@ class PostgresTransferStore:
                 installation_id UUID NOT NULL REFERENCES vault_supplier_installations(installation_id),
                 user_id UUID NOT NULL REFERENCES auth_accounts(user_id),
                 vault_id UUID NOT NULL REFERENCES vaults(vault_id),
-                filename TEXT NOT NULL, total_size BIGINT NOT NULL CHECK(total_size >= 0),
+                filename TEXT NOT NULL, original_filename TEXT NOT NULL, total_size BIGINT NOT NULL CHECK(total_size >= 0),
                 expected_sha256 CHAR(64) NOT NULL, media_type TEXT, source_context JSONB NOT NULL DEFAULT '{}'::jsonb,
                 protocol_version INTEGER NOT NULL CHECK(protocol_version = 1),
                 state TEXT NOT NULL CHECK(state IN ('created','receiving','paused','verifying','finalized','failed','aborted')),
@@ -287,8 +316,8 @@ class PostgresTransferStore:
             cursor.execute("SELECT 1 FROM vault_supplier_transfer_sessions WHERE state IN ('created','receiving','paused','verifying') AND expires_at>CURRENT_TIMESTAMP LIMIT 1")
             if cursor.fetchone() is not None:
                 raise ValueError("intake_busy")
-            cursor.execute("""INSERT INTO vault_supplier_transfer_sessions(transfer_id,installation_id,user_id,vault_id,filename,total_size,expected_sha256,media_type,source_context,protocol_version,state,bytes_received,created_at,updated_at,expires_at)
-                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""", (session.transfer_id,session.installation_id,session.user_id,session.vault_id,session.filename,session.total_size,session.expected_sha256,session.media_type,__import__('json').dumps(session.source_context),session.protocol_version,session.state,session.bytes_received,session.created_at,session.updated_at,session.expires_at))
+            cursor.execute("""INSERT INTO vault_supplier_transfer_sessions(transfer_id,installation_id,user_id,vault_id,filename,original_filename,total_size,expected_sha256,media_type,source_context,protocol_version,state,bytes_received,created_at,updated_at,expires_at)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""", (session.transfer_id,session.installation_id,session.user_id,session.vault_id,session.filename,session.original_filename,session.total_size,session.expected_sha256,session.media_type,__import__('json').dumps(session.source_context),session.protocol_version,session.state,session.bytes_received,session.created_at,session.updated_at,session.expires_at))
             return _session_from_row(cursor.fetchone())
 
     def get(self, transfer_id: UUID) -> TransferSession | None:
@@ -333,6 +362,16 @@ class PostgresTransferStore:
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute("SELECT * FROM vault_supplier_transfer_sessions WHERE state='finalized' AND arrival_hall_filename IS NOT NULL AND source_context <> '{}'::jsonb")
             return [_session_from_row(row) for row in cursor.fetchall()]
+
+
+def migrate_transfer_original_filename(conninfo: str) -> None:
+    """Explicit additive migration; legacy rows stay unknown rather than guessed."""
+    with psycopg.connect(conninfo) as connection, connection.cursor() as cursor:
+        cursor.execute("CREATE TABLE IF NOT EXISTS pv_schema_migrations (version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+        cursor.execute("SELECT 1 FROM pv_schema_migrations WHERE version='pv-vs-fix-006-original-filename'")
+        if cursor.fetchone() is None:
+            cursor.execute("ALTER TABLE vault_supplier_transfer_sessions ADD COLUMN IF NOT EXISTS original_filename TEXT")
+            cursor.execute("INSERT INTO pv_schema_migrations(version) VALUES ('pv-vs-fix-006-original-filename')")
 
 
 def get_transfer_store() -> TransferStore:
@@ -392,6 +431,13 @@ def require_supplier_transfer_authorization(request: Request, supplier_store: Va
     return SupplierTransferPrincipal(installation, user_id)
 
 
+def require_lan_receiver_host(request: Request) -> None:
+    """Refuse payload routes unless they entered through the LAN listener."""
+    hosts = request.headers.getlist("Host")
+    if len(hosts) != 1 or not supplier_lan_host_allowed(hosts[0]):
+        raise _error("receiver_unavailable", "Vault Supplier transfer routes are available only on the LAN receiver.", status.HTTP_404_NOT_FOUND)
+
+
 class TransferCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     protocol_version: int
@@ -400,12 +446,23 @@ class TransferCreate(BaseModel):
     sha256: str
     media_type: str | None = Field(default=None, max_length=255)
     source_context: dict[str, object] | None = None
+    source_modified_at: str | None = None
+    source_created_at: str | None = None
 
 
 class HashCheck(BaseModel):
     model_config = ConfigDict(extra="forbid")
     protocol_version: int
     sha256: list[str] = Field(min_length=1, max_length=MAX_HASH_BATCH)
+
+
+class SourceProvenanceReconcile(BaseModel):
+    """Metadata-only repair; the authenticated immutable owner is the boundary."""
+    model_config = ConfigDict(extra="forbid")
+    protocol_version: int
+    sha256: str
+    source_modified_at: str | None = None
+    source_created_at: str | None = None
 
 
 def _require_protocol(version: int) -> None:
@@ -451,14 +508,16 @@ def _response(session: TransferSession) -> dict[str, object]:
 
 
 @router.get("/intake/state")
-def intake_state(principal: SupplierTransferPrincipal = Depends(require_supplier_transfer_authorization), intake: IntakeStore = Depends(get_intake_store), transfers: TransferStore = Depends(get_transfer_store)) -> dict[str, object]:
+def intake_state(lan_receiver: None = Depends(require_lan_receiver_host), principal: SupplierTransferPrincipal = Depends(require_supplier_transfer_authorization), intake: IntakeStore = Depends(get_intake_store), transfers: TransferStore = Depends(get_transfer_store)) -> dict[str, object]:
+    del lan_receiver
     del principal
     value = _gate_state(intake, transfers)
     return {"protocol_version": TRANSFER_PROTOCOL_VERSION, "state": value, "reason": None if value == "READY" else value.casefold()}
 
 
 @router.post("/intake/check-hashes")
-def check_hashes(body: HashCheck, principal: SupplierTransferPrincipal = Depends(require_supplier_transfer_authorization), transfers: TransferStore = Depends(get_transfer_store)) -> dict[str, object]:
+def check_hashes(body: HashCheck, lan_receiver: None = Depends(require_lan_receiver_host), principal: SupplierTransferPrincipal = Depends(require_supplier_transfer_authorization), transfers: TransferStore = Depends(get_transfer_store)) -> dict[str, object]:
+    del lan_receiver
     _require_protocol(body.protocol_version)
     if len(set(body.sha256)) != len(body.sha256) or any(SHA256_RE.fullmatch(value) is None for value in body.sha256):
         raise _error("invalid_checksum", "SHA-256 values must be unique lowercase hexadecimal digests.")
@@ -466,7 +525,8 @@ def check_hashes(body: HashCheck, principal: SupplierTransferPrincipal = Depends
 
 
 @router.post("/transfers", status_code=status.HTTP_201_CREATED)
-def create_transfer(body: TransferCreate, principal: SupplierTransferPrincipal = Depends(require_supplier_transfer_authorization), intake: IntakeStore = Depends(get_intake_store), transfers: TransferStore = Depends(get_transfer_store), arrival_hall: Path = Depends(require_incoming_path), auth: AuthenticationStore = Depends(get_authentication_store)) -> dict[str, object]:
+def create_transfer(body: TransferCreate, lan_receiver: None = Depends(require_lan_receiver_host), principal: SupplierTransferPrincipal = Depends(require_supplier_transfer_authorization), intake: IntakeStore = Depends(get_intake_store), transfers: TransferStore = Depends(get_transfer_store), arrival_hall: Path = Depends(require_incoming_path), auth: AuthenticationStore = Depends(get_authentication_store), catalogue: VaultMasterStore = Depends(get_vault_master_store)) -> dict[str, object]:
+    del lan_receiver
     _require_protocol(body.protocol_version)
     _require_ready(intake, transfers)
     if SHA256_RE.fullmatch(body.sha256) is None:
@@ -476,10 +536,38 @@ def create_transfer(body: TransferCreate, principal: SupplierTransferPrincipal =
     except HTTPException as error:
         raise _error("invalid_filename", "Filename is invalid.", error.status_code) from error
     source_context = _source_context(body.source_context)
+    source_context = {**source_context, "original_filename": filename}
+    for field in ("source_modified_at", "source_created_at"):
+        if getattr(body, field) is not None:
+            source_context[field] = getattr(body, field)
+    # Use the same strict parsing as final canonical date resolution.
+    normalized_times = apply_source_timestamp_provenance({}, source_context)
+    source_context = {
+        **{key: value for key, value in source_context.items() if key not in {"source_modified_at", "source_created_at"}},
+        **{key: value for key, value in normalized_times.items() if key in {"source_modified_at", "source_created_at"}},
+    }
     if transfers.has_duplicate(principal.user_id, body.sha256):
         raise _error("duplicate_content", "This checksum already has active duplicate authority.", status.HTTP_409_CONFLICT)
+    from app.music_groups import supplier_manual_album
+    try:
+        source_context = supplier_manual_album(source_context, body.media_type, principal.installation.installation_id)
+    except ValueError as error:
+        raise _error("invalid_music_album", str(error)) from error
+    if source_context.get("content_type") == "music_video":
+        from app.music_video_identity import declared_intent
+        try:
+            declared_intent(source_context, body.media_type or "")
+        except ValueError as error:
+            raise _error("invalid_music_video", str(error)) from error
+    if "music_album" in source_context:
+        if not (body.media_type or "").startswith("audio/"):
+            raise _error("invalid_music_album", "Declared Music transfers require audio media_type.")
+        try:
+            catalogue.declare_music_album(principal.user_id, source_context["music_album"])
+        except ValueError as error:
+            raise _error("invalid_music_album", str(error), 409) from error
     now = _now()
-    session = TransferSession(uuid4(), principal.installation.installation_id, principal.user_id, principal.installation.vault_id, filename, body.total_size, body.sha256, body.media_type, source_context, TRANSFER_PROTOCOL_VERSION, "created", 0, now, now, now + SESSION_LIFETIME)
+    session = TransferSession(uuid4(), principal.installation.installation_id, principal.user_id, principal.installation.vault_id, filename, filename, body.total_size, body.sha256, body.media_type, source_context, TRANSFER_PROTOCOL_VERSION, "created", 0, now, now, now + SESSION_LIFETIME)
     try:
         session = transfers.create(session)
         part = _part_path(_staging_root(arrival_hall), session.transfer_id)
@@ -494,8 +582,50 @@ def create_transfer(body: TransferCreate, principal: SupplierTransferPrincipal =
     return {**_response(session), "chunk_size_min": MIN_CHUNK_BYTES, "chunk_size_recommended": RECOMMENDED_CHUNK_BYTES, "chunk_size_max": MAX_CHUNK_BYTES}
 
 
+@router.post("/provenance/reconcile")
+def reconcile_source_provenance(
+    body: SourceProvenanceReconcile,
+    lan_receiver: None = Depends(require_lan_receiver_host),
+    principal: SupplierTransferPrincipal = Depends(require_supplier_transfer_authorization),
+    vault_master: VaultMasterStore = Depends(get_vault_master_store),
+) -> dict[str, object]:
+    """Enrich existing owner-scoped assets without touching canonical files."""
+    del lan_receiver
+    _require_protocol(body.protocol_version)
+    if SHA256_RE.fullmatch(body.sha256) is None:
+        raise _error("invalid_checksum", "sha256 must be 64 lowercase hexadecimal characters.")
+    normalized = apply_source_timestamp_provenance({}, body.model_dump())
+    source_times = {key: value for key, value in normalized.items() if key in {"source_modified_at", "source_created_at"}}
+    if not source_times:
+        raise _error("invalid_source_timestamp", "At least one valid original-source timestamp is required.")
+    updated_ids: list[str] = []
+    for asset in vault_master.list_owned_catalogued_assets_by_user_id(principal.user_id):
+        if asset.sha256 != body.sha256:
+            continue
+        # Identical replay is an explicit no-op, including its audit footprint.
+        if all(asset.imported_metadata.get(key) == value for key, value in source_times.items()):
+            updated_ids.append(str(asset.id))
+            continue
+        metadata: dict[str, object] = dict(source_times)
+        provenance_source = "source_file_modified"
+        if asset.metadata_provenance.get("captured_on") not in {"embedded", "user_override"}:
+            resolved = apply_source_timestamp_provenance(
+                {"capture_date_source": asset.metadata_provenance.get("captured_on")}, source_times
+            )
+            if resolved.get("captured_at"):
+                metadata["captured_on"] = str(resolved["captured_at"])[:10]
+                provenance_source = str(resolved.get("capture_date_source", provenance_source))
+        changed = vault_master.import_catalogued_asset_metadata(
+            asset.id, metadata, provenance_source
+        )
+        if changed is not None:
+            updated_ids.append(str(changed.id))
+    return {"protocol_version": TRANSFER_PROTOCOL_VERSION, "sha256": body.sha256, "matched": len(updated_ids), "asset_ids": updated_ids, "idempotent": bool(updated_ids)}
+
+
 @router.get("/transfers/{transfer_id}")
-def transfer_status(transfer_id: UUID, principal: SupplierTransferPrincipal = Depends(require_supplier_transfer_authorization), transfers: TransferStore = Depends(get_transfer_store), arrival_hall: Path = Depends(require_incoming_path)) -> dict[str, object]:
+def transfer_status(transfer_id: UUID, lan_receiver: None = Depends(require_lan_receiver_host), principal: SupplierTransferPrincipal = Depends(require_supplier_transfer_authorization), transfers: TransferStore = Depends(get_transfer_store), arrival_hall: Path = Depends(require_incoming_path)) -> dict[str, object]:
+    del lan_receiver
     session = _owned(transfers.get(transfer_id), principal)
     if session.state in ACTIVE_STATES:
         session = _reconcile_part(session, _staging_root(arrival_hall), transfers)
@@ -503,7 +633,8 @@ def transfer_status(transfer_id: UUID, principal: SupplierTransferPrincipal = De
 
 
 @router.put("/transfers/{transfer_id}/data")
-async def upload_data(transfer_id: UUID, request: Request, principal: SupplierTransferPrincipal = Depends(require_supplier_transfer_authorization), intake: IntakeStore = Depends(get_intake_store), transfers: TransferStore = Depends(get_transfer_store), arrival_hall: Path = Depends(require_incoming_path), auth: AuthenticationStore = Depends(get_authentication_store)) -> dict[str, object]:
+async def upload_data(transfer_id: UUID, request: Request, lan_receiver: None = Depends(require_lan_receiver_host), principal: SupplierTransferPrincipal = Depends(require_supplier_transfer_authorization), intake: IntakeStore = Depends(get_intake_store), transfers: TransferStore = Depends(get_transfer_store), arrival_hall: Path = Depends(require_incoming_path), auth: AuthenticationStore = Depends(get_authentication_store)) -> dict[str, object]:
+    del lan_receiver
     session = _owned(transfers.get(transfer_id), principal)
     if intake.gate_status()["state"] != "open":
         raise _error("intake_paused", "Vault intake is paused.", status.HTTP_503_SERVICE_UNAVAILABLE)
@@ -551,13 +682,15 @@ async def upload_data(transfer_id: UUID, request: Request, principal: SupplierTr
     return _response(updated)
 
 
-def _final_filename(session: TransferSession) -> str:
-    path = Path(session.filename)
-    return f"{path.stem} (Vault Supplier {session.transfer_id.hex[:8]}){path.suffix}"
+def _physical_arrival_hall_filename(session: TransferSession) -> str:
+    """A deterministic internal Arrival Hall name; never a content title."""
+    path = Path(session.original_filename)
+    return f"{path.stem} (Vault Supplier {session.transfer_id}){path.suffix}"
 
 
 @router.post("/transfers/{transfer_id}/finalize")
-def finalize_transfer(transfer_id: UUID, principal: SupplierTransferPrincipal = Depends(require_supplier_transfer_authorization), intake: IntakeStore = Depends(get_intake_store), transfers: TransferStore = Depends(get_transfer_store), arrival_hall: Path = Depends(require_incoming_path), auth: AuthenticationStore = Depends(get_authentication_store)) -> dict[str, object]:
+def finalize_transfer(transfer_id: UUID, lan_receiver: None = Depends(require_lan_receiver_host), principal: SupplierTransferPrincipal = Depends(require_supplier_transfer_authorization), intake: IntakeStore = Depends(get_intake_store), transfers: TransferStore = Depends(get_transfer_store), arrival_hall: Path = Depends(require_incoming_path), auth: AuthenticationStore = Depends(get_authentication_store)) -> dict[str, object]:
+    del lan_receiver
     session = _owned(transfers.get(transfer_id), principal)
     if intake.gate_status()["state"] != "open":
         raise _error("intake_paused", "Vault intake is paused.", status.HTTP_503_SERVICE_UNAVAILABLE)
@@ -578,28 +711,24 @@ def finalize_transfer(transfer_id: UUID, principal: SupplierTransferPrincipal = 
         transfers.fail(session.transfer_id, "checksum_mismatch")
         auth.record_security_event("vault_supplier_transfer_checksum_failed", user_id=principal.user_id, actor_user_id=principal.user_id, metadata={"installation_id": str(principal.installation.installation_id), "transfer_id": str(session.transfer_id)})
         raise _error("checksum_mismatch", "Staged content did not match the expected SHA-256 checksum.", status.HTTP_422_UNPROCESSABLE_ENTITY)
-    filename = session.arrival_hall_filename or _final_filename(session)
+    filename = session.arrival_hall_filename or _physical_arrival_hall_filename(session)
     if session.state != "verifying":
         session = transfers.begin_verification(session.transfer_id, filename)
         if session is None:
             raise _error("invalid_transfer_state", "Transfer finalization changed concurrently.", status.HTTP_409_CONFLICT)
     destination = arrival_hall / filename
     if not destination.exists():
-        # The final link is atomic on this same Arrival Hall filesystem and is
-        # never a .part file.  Only the visible completed item reaches the
-        # shared Arrival Hall publication boundary below.
+        # Record ownership before publication so a crash leaves a recoverable
+        # transfer-to-path association. The deterministic full UUID prevents
+        # unrelated arrivals from being mistaken for this transfer on retry.
         try:
+            record_arrival_hall_file_owner(arrival_hall, destination, SimpleNamespace(user_id=session.user_id))
+            record_arrival_hall_file_source_context(arrival_hall, destination, session.user_id, session.source_context, session.transfer_id)
             os.link(part, destination)
             part.unlink()
         except OSError as error:
             raise _error("receiver_unavailable", "Arrival Hall could not atomically publish the verified file.", status.HTTP_503_SERVICE_UNAVAILABLE) from error
-        complete_arrival_hall_publication(
-            arrival_hall,
-            destination,
-            SimpleNamespace(user_id=session.user_id),
-            source_context=session.source_context,
-            supplier_transfer_id=session.transfer_id,
-        )
+        complete_arrival_hall_publication(arrival_hall, destination, SimpleNamespace(user_id=session.user_id))
     finalized = transfers.finalize(session.transfer_id)
     if finalized is None:
         raise _error("invalid_transfer_state", "Transfer finalization could not be recorded.", status.HTTP_409_CONFLICT)
@@ -608,7 +737,8 @@ def finalize_transfer(transfer_id: UUID, principal: SupplierTransferPrincipal = 
 
 
 @router.delete("/transfers/{transfer_id}")
-def abort_transfer(transfer_id: UUID, principal: SupplierTransferPrincipal = Depends(require_supplier_transfer_authorization), transfers: TransferStore = Depends(get_transfer_store), arrival_hall: Path = Depends(require_incoming_path), auth: AuthenticationStore = Depends(get_authentication_store)) -> dict[str, object]:
+def abort_transfer(transfer_id: UUID, lan_receiver: None = Depends(require_lan_receiver_host), principal: SupplierTransferPrincipal = Depends(require_supplier_transfer_authorization), transfers: TransferStore = Depends(get_transfer_store), arrival_hall: Path = Depends(require_incoming_path), auth: AuthenticationStore = Depends(get_authentication_store)) -> dict[str, object]:
+    del lan_receiver
     session = _owned(transfers.get(transfer_id), principal)
     if session.state == "finalized":
         raise _error("invalid_transfer_state", "A finalized Arrival Hall transfer cannot be aborted.", status.HTTP_409_CONFLICT)

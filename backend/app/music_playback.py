@@ -1,71 +1,44 @@
+"""Native Music playback with private, disposable lossless preparation."""
 from typing import Annotated
-import time
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
 
 from app.auth import AuthenticatedUsername
-from app.jellyfin import JellyfinAudio, JellyfinClient, JellyfinUnavailableError
-from app.movie_playback import get_jellyfin_client
 from app.music import MusicCatalogue, MusicLibraryPath, resolve_visible_track
-
+from app.music_playback_cache import get_cache_root, playback_file
 
 router = APIRouter(prefix="/api/music", tags=["music playback"])
-MusicPlaybackClient = Annotated[JellyfinClient, Depends(get_jellyfin_client)]
+PRIVATE_HEADERS = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"}
 
 
-def resolve_audio_with_index_retry(
-    client: JellyfinClient,
-    path: Path,
-    *,
-    attempts: int = 3,
-    delay_seconds: float = 1,
-) -> JellyfinAudio | None:
-    audio = client.find_audio_by_path(path)
-    if audio is not None:
-        return audio
-    client.notify_media_updated((path,))
-    client.refresh_library()
-    for _ in range(attempts):
-        if delay_seconds:
-            time.sleep(delay_seconds)
-        audio = client.find_audio_by_path(path)
-        if audio is not None:
-            return audio
-    return None
+class MusicResponse(FileResponse):
+    def __init__(self, path, mime, claim):
+        super().__init__(path, media_type=mime, headers=PRIVATE_HEADERS)
+        self.claim = claim
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            if self.claim is not None:
+                self.claim.close()
 
 
 @router.get("/{track_id}/stream")
 def stream_music(
     track_id: str,
-    request: Request,
     username: AuthenticatedUsername,
     library_path: MusicLibraryPath,
     store: MusicCatalogue,
-    client: MusicPlaybackClient,
-) -> StreamingResponse:
-    path, _ = resolve_visible_track(track_id, username, library_path, store)
+    cache_root: Annotated[Path, Depends(get_cache_root)],
+) -> FileResponse:
+    # The same current UUID visibility and commissioned placement resolver guards
+    # both canonical sources and cache hits. Cache keys are never public URLs.
+    source, asset = resolve_visible_track(track_id, username, library_path, store)
     try:
-        audio = resolve_audio_with_index_retry(client, path)
-        if audio is None:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Track is not indexed by the playback service",
-            )
-        stream = client.open_audio_stream(audio, request.headers.get("Range"))
-    except JellyfinUnavailableError:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Music playback is unavailable",
-        ) from None
-    return StreamingResponse(
-        stream.iter_bytes(),
-        status_code=stream.status_code,
-        media_type=stream.content_type or "audio/mpeg",
-        headers={
-            **stream.headers,
-            "Cache-Control": "private, no-store",
-            "X-Content-Type-Options": "nosniff",
-        },
-    )
+        path, mime, claim = playback_file(source, asset.id, asset.sha256, cache_root)
+    except (OSError, ValueError, RuntimeError):
+        raise HTTPException(503, "Music playback preparation is unavailable. Please try again.") from None
+    return MusicResponse(path, mime, claim)

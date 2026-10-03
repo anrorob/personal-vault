@@ -24,6 +24,7 @@ from app.vault_master_jellyfin import (
     person_portrait_id,
     publish_jellyfin_media_update,
     publish_jellyfin_media_updates,
+    request_managed_movie_library_scan,
 )
 from app.theatre_movie_rename import TheatreMovieRenameRequest
 from app import vault_master_jellyfin
@@ -84,26 +85,42 @@ def test_publication_routes_only_jellyfin_served_libraries(
     assert client.refresh_count == 2
 
 
+def test_managed_movie_publication_requests_one_scan(monkeypatch) -> None:
+    scans = []
+    monkeypatch.setattr(
+        vault_master_jellyfin,
+        "get_jellyfin_metadata_client",
+        lambda: type("Client", (), {"refresh_library": lambda self: scans.append(True)})(),
+    )
+
+    assert request_managed_movie_library_scan("Gallery") is False
+    assert request_managed_movie_library_scan("TV Shows") is False
+    assert request_managed_movie_library_scan("Music") is False
+    assert scans == []
+    assert request_managed_movie_library_scan("Movies") is True
+    assert scans == [True]
+
+
 def test_jellyfin_music_import_is_retained_by_vault_master(tmp_path: Path) -> None:
     music_root = tmp_path / "music"
     music_root.mkdir()
-    track_path = music_root / "Teardrop.flac"
+    track_path = music_root / "Example Track.flac"
     track_path.write_bytes(b"audio")
     asset = CataloguedAsset(
         id=uuid4(),
         asset_type="Music",
-        display_title="Teardrop",
+        display_title="Example Track",
         captured_on=None,
         location=None,
-        vault_path="/vault/Music/Teardrop.flac",
-        filename="Teardrop.flac",
+        vault_path="/vault/Music/Example Track.flac",
+        filename="Example Track.flac",
         size_bytes=5,
         mime_type="audio/flac",
         sha256="a" * 64,
         metadata={},
         metadata_provenance={},
-        detected_metadata={"display_title": "Teardrop"},
-        effective_metadata={"display_title": "Teardrop"},
+        detected_metadata={"display_title": "Example Track"},
+        effective_metadata={"display_title": "Example Track"},
     )
     store = MemoryVaultMasterStore()
     store.catalogued_assets[asset.vault_path] = asset
@@ -124,9 +141,9 @@ def test_jellyfin_music_import_is_retained_by_vault_master(tmp_path: Path) -> No
         def get_audio_details(self, audio: JellyfinAudio) -> dict[str, object]:
             assert audio.item_id == "jf-audio"
             return {
-                "display_title": "Teardrop",
-                "artist": "Massive Attack",
-                "album": "Mezzanine",
+                "display_title": "Example Track",
+                "artist": "Example Band",
+                "album": "Example Collection",
                 "genres": ["Trip-hop"],
                 "provider_ids": {"MusicBrainzTrack": "recording-id"},
             }
@@ -173,7 +190,7 @@ def test_jellyfin_music_import_is_retained_by_vault_master(tmp_path: Path) -> No
     updated = store.get_catalogued_asset(asset.vault_path)
     assert (imported, failed) == (1, 0)
     assert updated is not None
-    assert updated.effective_metadata["artist"] == "Massive Attack"
+    assert updated.effective_metadata["artist"] == "Example Band"
     assert updated.imported_metadata["provider_ids"] == {
         "MusicBrainzTrack": "recording-id"
     }
@@ -193,17 +210,17 @@ def test_jellyfin_music_import_supports_wma_and_preserves_user_title(
     tmp_path: Path,
 ) -> None:
     music_root = tmp_path / "music"
-    album = music_root / "Imagine Dragons" / "Mercury - Act 1"
+    album = music_root / "Example Artist" / "Example Album - Act 1"
     album.mkdir(parents=True)
-    track_path = album / "13 One Day.wma"
+    track_path = album / "13 Example Song Thirteen.wma"
     track_path.write_bytes(b"wma")
     asset = CataloguedAsset(
         id=uuid4(),
         asset_type="Music",
-        display_title="One day",
+        display_title="Example Song",
         captured_on=None,
         location=None,
-        vault_path="/vault/Music/Imagine Dragons/Mercury - Act 1/13 One Day.wma",
+        vault_path="/vault/Music/Example Artist/Example Album - Act 1/13 Example Song Thirteen.wma",
         filename=track_path.name,
         size_bytes=3,
         mime_type="audio/x-ms-wma",
@@ -217,14 +234,14 @@ def test_jellyfin_music_import_supports_wma_and_preserves_user_title(
             "genres": ["Alternative rock"],
         },
         user_overrides={
-            "display_title": "One day",
-            "artist": "Imagine Dragons",
-            "album": "Mercury - Act 1",
+            "display_title": "Example Song",
+            "artist": "Example Artist",
+            "album": "Example Album - Act 1",
         },
         effective_metadata={
-            "display_title": "One day",
-            "artist": "Imagine Dragons",
-            "album": "Mercury - Act 1",
+            "display_title": "Example Song",
+            "artist": "Example Artist",
+            "album": "Example Album - Act 1",
             "genres": ["Alternative rock"],
         },
     )
@@ -238,7 +255,7 @@ def test_jellyfin_music_import_supports_wma_and_preserves_user_title(
 
         def get_audio_details(self, audio: JellyfinAudio) -> dict[str, object]:
             return {
-                "display_title": "One Day",
+                "display_title": "Example Song Thirteen",
                 "artist": "Wrong Jellyfin artist",
                 "album": "Wrong Jellyfin album",
                 "genres": [],
@@ -249,10 +266,10 @@ def test_jellyfin_music_import_supports_wma_and_preserves_user_title(
 
     assert (imported, failed) == (1, 0)
     assert updated is not None
-    assert updated.display_title == "One day"
-    assert updated.effective_metadata["display_title"] == "One day"
-    assert updated.effective_metadata["artist"] == "Imagine Dragons"
-    assert updated.effective_metadata["album"] == "Mercury - Act 1"
+    assert updated.display_title == "Example Song"
+    assert updated.effective_metadata["display_title"] == "Example Song"
+    assert updated.effective_metadata["artist"] == "Example Artist"
+    assert updated.effective_metadata["album"] == "Example Album - Act 1"
     assert updated.effective_metadata["genres"] == ["Alternative rock"]
     assert updated.imported_metadata["provider"]["name"] == "musicbrainz"
     assert updated.imported_metadata["jellyfin"]["name"] == "jellyfin"

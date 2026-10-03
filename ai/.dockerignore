@@ -1,0 +1,5 @@
+# Only generic service source enters this build context.
+**
+!Dockerfile
+!app.py
+!download_helper.py

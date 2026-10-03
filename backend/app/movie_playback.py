@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import hashlib
+import os
 from pathlib import Path
 from typing import Annotated, Literal
 from uuid import UUID
@@ -20,6 +21,7 @@ from app.jellyfin import (
     JellyfinUnavailableError,
     rewrite_hls_playlist,
 )
+from app.jellyfin_paths import JellyfinPathMappingError, jellyfin_media_path
 from app.movies import (
     MoviesLibraryPath,
     MovieLibraryRoots,
@@ -28,6 +30,8 @@ from app.movies import (
     _asset_for_movie_id,
     resolve_catalogued_movie_path,
 )
+from app.playback_diagnostics import playback_info, require_development
+from app.playback_policy import PlaybackPlanRequest, create_plan, require_playback_enabled
 
 
 router = APIRouter(prefix="/api/movies", tags=["movie playback"])
@@ -107,9 +111,9 @@ def _resolve_playback_movie(
 
     try:
         playback_movie = jellyfin_client.find_movie_by_path(
-            source_path,
+            jellyfin_media_path(source_path, "movies"),
         )
-    except JellyfinUnavailableError:
+    except (JellyfinUnavailableError, JellyfinPathMappingError):
         logger.exception(
             "Playback lookup failed for movie_id=%s user=%r",
             movie_id,
@@ -230,6 +234,7 @@ def get_movie_playback_readiness(
         store=store,
     )
 
+
     return MoviePlaybackReadiness(
         movie_id=movie_id,
         status="ready",
@@ -251,6 +256,46 @@ def get_movie_playback_readiness(
             for track in playback_movie.subtitle_tracks
         ],
     )
+
+
+@router.get("/{movie_id}/playback-info")
+def get_movie_playback_info(
+    movie_id: str,
+    username: AuthenticatedUsername,
+    library_path: MoviesLibraryPath,
+    library_roots: MovieLibraryRoots,
+    store: VaultMasterCatalogue,
+    subtitle_index: Annotated[int | None, Query(ge=0)] = None,
+    h264_supported: bool | None = Query(default=None),
+) -> dict[str, object]:
+    require_development()
+    source_path = _resolve_original_movie_path(movie_id, username, library_path, library_roots, store)
+    if os.getenv("PV_JELLYFIN_ENABLED", "true").lower() not in {"1", "true", "yes", "on"}:
+        return {"availability": "jellyfin_disabled", "source": None, "playback": None}
+    client = get_jellyfin_client()
+    try:
+        movie = client.find_movie_by_path(jellyfin_media_path(source_path, "movies"))
+    except (JellyfinUnavailableError, JellyfinPathMappingError):
+        raise HTTPException(status_code=503, detail="Playback diagnostics are unavailable") from None
+    if movie is None:
+        raise HTTPException(status_code=503, detail="Movie is not indexed by the playback service")
+    try:
+        source_info = client.playback_source_info(movie)
+        decision = client.playback_decision(movie, h264_supported=h264_supported is True)
+    except JellyfinUnavailableError:
+        raise HTTPException(status_code=503, detail="Playback diagnostics are unavailable") from None
+    return {"availability": "ready", **playback_info(movie, source_info, subtitle_index, decision, h264_supported)}
+
+
+@router.post("/{movie_id}/playback-plan")
+def movie_playback_plan(movie_id: str, payload: PlaybackPlanRequest, username: AuthenticatedUsername,
+                        library_path: MoviesLibraryPath, library_roots: MovieLibraryRoots,
+                        jellyfin_client: JellyfinPlaybackClient, store: VaultMasterCatalogue) -> dict:
+    _resolve_original_movie_path(movie_id, username, library_path, library_roots, store)
+    require_playback_enabled()
+    item = _resolve_playback_movie(movie_id, username, library_path, library_roots, jellyfin_client, store)
+    return create_plan(jellyfin_client, item, payload, private_resources, authenticated_user_id(username),
+                       movie_id, f"/api/movies/{movie_id}/hls")
 
 
 @router.get("/{movie_id}/stream.mp4")
@@ -378,7 +423,7 @@ def _proxy_hls_response(
             stream.response.close()
 
         def proxy_url_for(upstream_url: str) -> str:
-            token = private_resources.issue(user_id, upstream_url)
+            token = private_resources.issue(user_id, upstream_url, scope=movie_id)
             return f"/api/movies/{movie_id}/hls/{token}"
 
         return PlainTextResponse(
@@ -535,11 +580,16 @@ def stream_movie_feature_hls(
 def stream_movie_hls_resource(
     movie_id: str,
     resource_token: str,
+    request: Request,
     username: AuthenticatedUsername,
+    library_path: MoviesLibraryPath,
+    library_roots: MovieLibraryRoots,
+    store: VaultMasterCatalogue,
     jellyfin_client: JellyfinPlaybackClient,
 ) -> PlainTextResponse | StreamingResponse:
     user_id = authenticated_user_id(username)
-    upstream_url = private_resources.resolve(user_id, resource_token)
+    _resolve_original_movie_path(movie_id, username, library_path, library_roots, store)
+    upstream_url = private_resources.resolve(user_id, resource_token, scope=movie_id)
     if upstream_url is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -547,7 +597,7 @@ def stream_movie_hls_resource(
         )
 
     try:
-        stream = jellyfin_client.open_hls_resource(upstream_url)
+        stream = jellyfin_client.open_resource(upstream_url, range_header=request.headers.get("Range"))
         return _proxy_hls_response(movie_id, user_id, stream)
     except JellyfinUnavailableError:
         logger.exception(

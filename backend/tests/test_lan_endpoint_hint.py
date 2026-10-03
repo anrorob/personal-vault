@@ -14,7 +14,7 @@ from app.vault_supplier_lan import LanEndpointHintConfigurationError, lan_endpoi
 from tests.test_pairing_credential import issue, pair_request, pairing_client, store_for
 
 
-def configure_listener(monkeypatch, tmp_path, names=("another-vault.local",), port="9444"):
+def configure_listener(monkeypatch, tmp_path, names=("vault-server.local",), port="8444"):
     key = ec.generate_private_key(ec.SECP256R1())
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "ignored-cn.local")])
     builder = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
@@ -34,7 +34,7 @@ def configure_listener(monkeypatch, tmp_path, names=("another-vault.local",), po
 
 
 @pytest.mark.parametrize("management,host,port", [
-    ("https://another-vault.example.net", "another-vault.local", "9444"),
+    ("https://vault.example.test", "vault-server.local", "8444"),
     ("https://vault.example.net", "vault-lan.local", "9443"),
 ])
 def test_pair_response_preserves_identity_and_separates_locations(pairing_client, monkeypatch, tmp_path, management, host, port):
@@ -43,7 +43,6 @@ def test_pair_response_preserves_identity_and_separates_locations(pairing_client
     monkeypatch.setenv("PV_WEBAUTHN_ORIGIN", management)
     monkeypatch.setenv("PV_WEBAUTHN_RP_ID", management.removeprefix("https://"))
     client.headers["Origin"] = management
-    client.headers["Host"] = management.removeprefix("https://")
     _, descriptor = issue(client)
     store = store_for(client)
     record = store.get_pairing_code(descriptor["pairing_secret"])
@@ -105,7 +104,7 @@ def test_location_change_does_not_rebind_credential_identity(pairing_client, mon
 @pytest.mark.parametrize("names", [None, (), ("one.local", "two.local"), ("",),
     ("http://vault.local",), ("https://vault.local",), ("user:password@vault.local",),
     ("vault.local?secret=abc",), ("vault.local#fragment",), ("vault.local/path",),
-    ("vault.local:9444",), ("*.local",), ("-bad.local",), ("bad-.local",),
+    ("vault.local:8444",), ("*.local",), ("-bad.local",), ("bad-.local",),
     ("vault..local",), ("vault.local.",), (" vault.local",), ("vault.local\n",),
     ("vault\\local",), ("a" * 64 + ".local",)])
 def test_invalid_or_ambiguous_hostname_is_not_a_hint(monkeypatch, tmp_path, names):
@@ -126,7 +125,7 @@ def test_normalizes_dns_case_and_keeps_explicit_https_port(monkeypatch, tmp_path
     assert lan_endpoint_hint() == "https://vault-lan.local:443"
 
 
-@pytest.mark.parametrize("path", ["", " ", "/nonexistent/pair014-certificate.pem"])
+@pytest.mark.parametrize("path", ["", " ", "/nonexistent/pair012-certificate.pem"])
 def test_missing_configured_certificate_is_an_error(monkeypatch, path):
     monkeypatch.setenv("PV_VAULT_SUPPLIER_LAN_CERTIFICATE_PATH", path)
     monkeypatch.setenv("PV_VAULT_SUPPLIER_LAN_PORT", "9443")
@@ -142,10 +141,3 @@ def test_bad_configuration_fails_startup_before_schema_or_workers(monkeypatch, t
         with TestClient(main_module.app):
             pytest.fail("malformed configuration started serving")
     assert calls == []
-
-
-def test_lan_protocol_has_no_product_default_port(monkeypatch):
-    from app.vault_supplier_lan import ServerIdentityUnavailable, lan_port
-    monkeypatch.delenv("PV_VAULT_SUPPLIER_LAN_PORT", raising=False)
-    with pytest.raises(ServerIdentityUnavailable):
-        lan_port()

@@ -12,6 +12,7 @@ export type ArrivalHallListing = {
 };
 
 export type VaultMasterItem = {
+  album_group_id?: string | null;
   id: string;
   batch_id: string;
   source_kind: "incoming" | "inventory";
@@ -216,7 +217,7 @@ export type AutopilotPolicy = {
     | "financial_document"
     | "general_document"
     | "artwork";
-  destination: "Gallery" | "Documents" | "Ledger" | "Archives";
+  destination: "Gallery" | "Documents" | "Archives";
   threshold: number;
   max_items: number;
   max_failures: number;
@@ -288,6 +289,9 @@ export type VaultAsset = {
   sha256: string;
   metadata: Record<string, unknown>;
   metadata_provenance: Record<string, string>;
+  lifecycle_state?: "active" | "hidden" | "deleted";
+  current_location?: string;
+  original_section?: string;
 };
 
 export type VaultAssetSearchResult = {
@@ -474,4 +478,8 @@ export function uploadFile(
 
     xhr.send(file);
   });
+}
+/** Completed intake remains in history, not in the active staging presentation. */
+export function isActiveArrivalState(state: string | undefined): boolean {
+  return !state || !["moved", "arrival_removed", "duplicate_removed"].includes(state);
 }

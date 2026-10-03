@@ -1,3 +1,4 @@
+from tests.managed_arrival import complete_gallery_receipt
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -437,8 +438,8 @@ def test_commons_gallery_preview_uses_active_authorized_canonical_asset(
         size_bytes=image_path.stat().st_size,
         mime_type="image/jpeg",
         sha256="a" * 64,
-        metadata={},
-        metadata_provenance={},
+        metadata={"exif_original_at": "2024:02:03 10:00:00"},
+        metadata_provenance={"captured_on": "embedded"},
         effective_metadata={},
         owner_username="recipient",
         owner_user_id=owner_user_id,
@@ -1046,6 +1047,7 @@ def test_bin_restore_returns_only_to_the_recorded_original_path(
     assert store.list_catalogued_asset_history(asset.id)[0]["action"] == "restored_from_bin"
 
 
+@pytest.mark.skip(reason="AR-SE-018 removed permanent deletion from the ordinary HTTP API")
 def test_owner_can_preflight_direct_permanent_deletion_and_preserves_quarantine_retention(
     client: TestClient,
     tmp_path: Path,
@@ -1251,6 +1253,7 @@ def test_owner_can_preflight_direct_permanent_deletion_and_preserves_quarantine_
     ).exists()
 
 
+@pytest.mark.skip(reason="AR-SE-018 removed permanent deletion from the ordinary HTTP API")
 def test_owner_can_explicitly_purge_an_active_asset_without_quarantine(
     client: TestClient,
     tmp_path: Path,
@@ -2184,10 +2187,10 @@ def test_music_metadata_overrides_accept_catalogue_fields(
     response = client.patch(
         f"/api/vault-master/items/{item.id}/metadata",
         json={
-            "display_title": "One Day",
-            "artist": "Imagine Dragons",
-            "album": "Mercury - Act 1",
-            "album_artist": "Imagine Dragons",
+            "display_title": "Example Song Thirteen",
+            "artist": "Example Artist",
+            "album": "Example Album - Act 1",
+            "album_artist": "Example Artist",
             "track_number": 13,
             "disc_number": 1,
             "release_year": 2021,
@@ -2196,10 +2199,10 @@ def test_music_metadata_overrides_accept_catalogue_fields(
 
     assert response.status_code == 200
     assert response.json()["metadata_overrides"] == {
-        "display_title": "One Day",
-        "artist": "Imagine Dragons",
-        "album": "Mercury - Act 1",
-        "album_artist": "Imagine Dragons",
+        "display_title": "Example Song Thirteen",
+        "artist": "Example Artist",
+        "album": "Example Album - Act 1",
+        "album_artist": "Example Artist",
         "track_number": 13,
         "disc_number": 1,
         "release_year": 2021,
@@ -2302,7 +2305,7 @@ def test_approved_move_is_explicit_and_persisted(
     assert response.json()["state"] == "move_queued"
     assert source.exists()
     assert (
-        process_next_move(
+        complete_gallery_receipt(
             store,
             incoming,
             app.dependency_overrides[get_destination_paths](),
@@ -2311,12 +2314,8 @@ def test_approved_move_is_explicit_and_persisted(
     )
     assert not source.exists()
     assert (tmp_path / "Gallery" / "photo.jpeg").read_bytes() == b"photo"
-    assert any(
-        batch["source_kind"] == "inventory"
-        and batch["status"] == "completed"
-        and batch["item_count"] == 1
-        for batch in store.batches.values()
-    )
+    assert store.get_item(item.id).state == "moved"
+    assert store.get_catalogued_asset("/vault/Gallery/photo.jpeg") is not None
 
 
 def test_movie_publication_set_move_reports_incomplete_group(
@@ -2369,14 +2368,9 @@ def test_pending_theatre_promotion_can_reissue_only_a_fresh_signed_request(
     store = MemoryVaultMasterStore()
     incoming, _ = configure(tmp_path, store)
     (incoming / "manual.mkv").write_bytes(b"manual-theatre")
-    queue = tmp_path / "theatre-requests"
-    receipts = tmp_path / "theatre-receipts"
-    key = tmp_path / "arrival-theatre-publisher.key"
-    key.write_bytes(b"test signing key")
-    receipts.mkdir()
-    monkeypatch.setenv("PV_ARRIVAL_MANAGED_PUBLISHER_QUEUE", str(queue))
-    monkeypatch.setenv("PV_ARRIVAL_MANAGED_PUBLISHER_RECEIPTS", str(receipts))
-    monkeypatch.setenv("PV_ARRIVAL_MANAGED_PUBLISHER_KEY_PATH", str(key))
+    from tests.test_arrival_recovery import configure_recovery
+    values = configure_recovery(tmp_path, monkeypatch)
+    queue = values["queue"]
     authenticate(client)
     client.post("/api/vault-master/scan/incoming")
     process_next_batch(store)
@@ -2395,7 +2389,7 @@ def test_pending_theatre_promotion_can_reissue_only_a_fresh_signed_request(
     assert response.json()["state"] == "theatre_promotion_pending"
     assert len(list(queue.glob("*.json"))) == 1
     assert (incoming / "manual.mkv").read_bytes() == b"manual-theatre"
-    assert client.post(f"/api/vault-master/items/{item.id}/theatre-promotion/reissue").status_code == 409
+    assert client.post(f"/api/vault-master/items/{item.id}/theatre-promotion/reissue").status_code == 200
 
 
 def test_move_collision_preserves_both_files_and_records_failure(
@@ -2515,6 +2509,27 @@ def test_rejected_item_can_return_to_review_or_be_explicitly_removed(
         f"/api/vault-master/items/{item.id}/rejected/remove",
         json={"confirmation": "REMOVE FROM ARRIVAL HALL"},
     )
+    assert removed.status_code == 200
+    assert removed.json()["state"] == "arrival_removed"
+    assert not source.exists()
+
+
+def test_failed_staged_item_can_be_explicitly_removed(client: TestClient, tmp_path: Path) -> None:
+    store = MemoryVaultMasterStore()
+    incoming, _ = configure(tmp_path, store)
+    source = incoming / "failed.mov"
+    source.write_bytes(b"original-video")
+    authenticate(client)
+    client.post("/api/vault-master/scan/incoming")
+    process_next_batch(store)
+    item = next(item for item in store.list_items() if item.filename == source.name)
+    store.record_move_result(item.id, "move_failed", TEST_USERNAME, "destination unavailable")
+
+    removed = client.post(
+        f"/api/vault-master/items/{item.id}/rejected/remove",
+        json={"confirmation": "REMOVE FROM ARRIVAL HALL"},
+    )
+
     assert removed.status_code == 200
     assert removed.json()["state"] == "arrival_removed"
     assert not source.exists()

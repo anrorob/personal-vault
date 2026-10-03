@@ -295,6 +295,18 @@ class MemoryVaultSupplierStore:
             record = validate_pairing_record(self.get_pairing_code(code), binding)
             if record.user_id != user_id or self.vault_id != binding.vault_id:
                 raise ValueError("pairing_identity_mismatch")
+            existing = self.installations.get(installation.installation_id)
+            if existing and existing.revoked_at:
+                if existing.vault_id != installation.vault_id or existing.public_key != installation.public_key or existing.key_algorithm != installation.key_algorithm:
+                    raise ValueError("invalid_installation_identity")
+                if (existing.installation_id, user_id) not in self.authorized_users:
+                    raise ValueError("installation_revoked")
+                # Only a validated, fresh credential can restore this same identity.
+                # Other users and pre-revocation authentication remain invalid.
+                self.authorized_users = {pair for pair in self.authorized_users if pair[0] != existing.installation_id}
+                self.challenges = {key: value for key, value in self.challenges.items() if value.installation_id != existing.installation_id}
+                self.authorizations = {key: value for key, value in self.authorizations.items() if value.installation_id != existing.installation_id}
+                self.installations[existing.installation_id] = replace(existing, revoked_at=None)
             result = self.register_installation(installation, user_id)
             self.codes[record.id] = replace(record, consumed_at=_now())
             return result
@@ -468,7 +480,7 @@ class PostgresVaultSupplierStore:
             cursor.execute("SELECT vault_id FROM vaults WHERE is_local=TRUE FOR SHARE")
             if cursor.fetchall() != [(binding.vault_id,)] or record.user_id != user_id:
                 raise ValueError("pairing_identity_mismatch")
-            result = self._register_installation(cursor, installation, user_id)
+            result = self._register_installation(cursor, installation, user_id, allow_repair=True)
             cursor.execute("UPDATE vault_supplier_pairing_codes SET consumed_at=%s WHERE id=%s", (_now(), record.id))
             return result
 
@@ -477,7 +489,7 @@ class PostgresVaultSupplierStore:
             return self._register_installation(cursor, installation, user_id)
 
     @staticmethod
-    def _register_installation(cursor, installation: SupplierInstallation, user_id: UUID) -> SupplierInstallation:
+    def _register_installation(cursor, installation: SupplierInstallation, user_id: UUID, *, allow_repair: bool = False) -> SupplierInstallation:
         cursor.execute("""INSERT INTO vault_supplier_installations(installation_id,vault_id,public_key,key_algorithm,protocol_version,supplier_version,created_at)
             VALUES(%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(installation_id) DO NOTHING""", (installation.installation_id, installation.vault_id, installation.public_key, installation.key_algorithm, installation.protocol_version, installation.supplier_version, installation.created_at))
         cursor.execute("SELECT installation_id,vault_id,public_key,key_algorithm,protocol_version,supplier_version,created_at,last_seen_at,revoked_at FROM vault_supplier_installations WHERE installation_id=%s FOR UPDATE", (installation.installation_id,))
@@ -487,7 +499,14 @@ class PostgresVaultSupplierStore:
         if existing.vault_id != installation.vault_id or existing.public_key != installation.public_key or existing.key_algorithm != installation.key_algorithm:
             raise ValueError("invalid_installation_identity")
         if existing.revoked_at:
-            raise ValueError("installation_revoked")
+            cursor.execute("SELECT 1 FROM vault_supplier_authorized_users WHERE installation_id=%s AND user_id=%s AND revoked_at IS NULL FOR UPDATE", (installation.installation_id, user_id))
+            if not allow_repair or cursor.fetchone() is None:
+                raise ValueError("installation_revoked")
+            cursor.execute("DELETE FROM vault_supplier_authorizations WHERE installation_id=%s", (installation.installation_id,))
+            cursor.execute("UPDATE vault_supplier_challenges SET consumed_at=COALESCE(consumed_at,CURRENT_TIMESTAMP) WHERE installation_id=%s", (installation.installation_id,))
+            cursor.execute("UPDATE vault_supplier_authorized_users SET revoked_at=COALESCE(revoked_at,CURRENT_TIMESTAMP) WHERE installation_id=%s", (installation.installation_id,))
+            cursor.execute("UPDATE vault_supplier_installations SET revoked_at=NULL WHERE installation_id=%s", (installation.installation_id,))
+            existing = replace(existing, revoked_at=None)
         cursor.execute("INSERT INTO vault_supplier_authorized_users(installation_id,user_id) VALUES(%s,%s) ON CONFLICT(installation_id,user_id) DO UPDATE SET revoked_at=NULL", (installation.installation_id, user_id))
         return existing
 

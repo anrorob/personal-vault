@@ -3,8 +3,8 @@
 This is the authoritative Personal Vault receiver contract for the Vault
 Supplier client. It applies only after the Supplier has reached
 `ConnectedVerified` using the pinned server signing key protocol. File payload
-traffic is LAN-only: use `https://pv-srv-001.local:8443`; never send transfer
-payloads to `dev-vault.pv-hq.com` or through Cloudflare.
+traffic is LAN-only: use `https://vault-server.local:8443`; never send transfer
+payloads to `vault.example.test` or through Cloudflare.
 
 Protocol version is the JSON integer `1`. A different value receives HTTP 400
 with `{"detail":{"code":"protocol_mismatch","message":"..."}}`.

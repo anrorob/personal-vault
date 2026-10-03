@@ -23,3 +23,5 @@ no contributor licence agreement or copyright assignment is required.
 Never include credentials, private media, real user identities, production URLs, database exports, host-specific operations material, or private diagnostics in commits, pull requests, or issues.
 
 Use normal GitHub issues for reproducible bugs and feature discussions. Use [SECURITY.md](SECURITY.md) for vulnerabilities.
+
+Before contributing, run focused synthetic tests, frontend lint, `git diff --check`, and `python scripts/check_source_privacy.py`. Never commit runtime evidence, personal media/metadata, credentials, environment overlays or private deployment instructions. Required CI exercises PostgreSQL bootstrap/regression and frontend tests/build; release security checks run Gitleaks and privacy validation.

@@ -125,6 +125,7 @@ class AuthenticatedIdentity(str):
     display_name: str
     role: str
     active: bool
+    hidden_videos_authorized: bool = False
 
     def __new__(cls, account: Account) -> "AuthenticatedIdentity":
         value = super().__new__(cls, account.username)
@@ -154,7 +155,9 @@ def require_authenticated_user(request: Request, store: AuthenticationStore = De
             status_code=status.HTTP_403_FORBIDDEN,
             detail="A password change is required before accessing Personal Vault",
         )
-    return AuthenticatedIdentity(account)
+    identity = AuthenticatedIdentity(account)
+    identity.hidden_videos_authorized = bool(token and store.has_hidden_videos_authorization(token, user_id))
+    return identity
 
 
 AuthenticatedUsername = Annotated[AuthenticatedIdentity, Depends(require_authenticated_user)]
@@ -206,6 +209,36 @@ def _vault_control_session_token(request: Request) -> str:
     if not token:
         raise HTTPException(status_code=403, detail="Vault Control re-authentication is required")
     return token
+
+
+def _hidden_photos_session_token(request: Request) -> str:
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if not token:
+        raise HTTPException(status_code=403, detail="Hidden Photos passkey re-authentication is required")
+    return token
+
+
+def _hidden_videos_session_token(request: Request) -> str:
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if not token:
+        raise HTTPException(status_code=403, detail="Hidden Videos passkey re-authentication is required")
+    return token
+
+
+def require_hidden_photos_authorized_user(
+    request: Request,
+    identity: AuthenticatedUsername,
+    store: AuthenticationStore = Depends(get_authentication_store),
+) -> AuthenticatedIdentity:
+    token = _hidden_photos_session_token(request)
+    if not store.has_hidden_photos_authorization(token, authenticated_user_id(identity)):
+        raise HTTPException(status_code=403, detail="Hidden Photos passkey re-authentication is required")
+    return identity
+
+
+HiddenPhotosAuthorizedUser = Annotated[
+    AuthenticatedIdentity, Depends(require_hidden_photos_authorized_user)
+]
 
 
 def require_vault_control_elevated_administrator(
@@ -711,6 +744,96 @@ def finish_vault_control_elevation(
     store.clear_failed_attempts(rate_key)
     logger.info("Vault Control session elevated for user_id=%s", administrator.user_id)
     return {"elevated": True}
+
+
+@router.get("/hidden-photos/authorization")
+def hidden_photos_authorization_status(request: Request, response: Response, user: AuthenticatedUser, store: AuthenticationStore = Depends(get_authentication_store)) -> dict[str, bool]:
+    response.headers["Cache-Control"] = "private, no-store"
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    return {"authorized": bool(token and store.has_hidden_photos_authorization(token, user.user_id))}
+
+
+@router.post("/hidden-photos/authorization/options")
+def begin_hidden_photos_authorization(request: Request, user: AuthenticatedUser, store: AuthenticationStore = Depends(get_authentication_store), passkeys: PasskeyStore = Depends(get_passkey_store)) -> dict[str, object]:
+    rate_key = _passkey_rate_limit_key(request)
+    lockout = store.get_lockout_seconds(rate_key)
+    if lockout:
+        raise HTTPException(status_code=429, detail="Too many passkey attempts. Try again later.", headers={"Retry-After": str(lockout)})
+    credentials = passkeys.list_credentials(user.user_id)
+    if not credentials:
+        raise HTTPException(status_code=400, detail="An active passkey is required for Hidden Photos")
+    challenge = secrets.token_bytes(32)
+    ceremony = passkeys.create_challenge("authentication", user.user_id, challenge, purpose="hidden_photos_step_up")
+    options = generate_authentication_options(rp_id=get_webauthn_rp_id(), challenge=challenge, timeout=PASSKEY_TIMEOUT_MS, allow_credentials=[PublicKeyCredentialDescriptor(id=item.credential_id) for item in credentials], user_verification=UserVerificationRequirement.REQUIRED)
+    return _passkey_options(options, ceremony.id)
+
+
+@router.post("/hidden-photos/authorization/verify")
+def finish_hidden_photos_authorization(body: PasskeyVerifyRequest, request: Request, user: AuthenticatedUser, store: AuthenticationStore = Depends(get_authentication_store), passkeys: PasskeyStore = Depends(get_passkey_store)) -> dict[str, bool]:
+    rate_key = _passkey_rate_limit_key(request)
+    challenge = passkeys.consume_challenge(body.challenge_id, "authentication", user.user_id, purpose="hidden_photos_step_up")
+    if challenge is None:
+        raise HTTPException(status_code=400, detail="Hidden Photos authentication challenge is invalid or expired")
+    try:
+        credential = passkeys.get_credential(_credential_raw_id(body.credential))
+        if credential is None or credential.user_id != user.user_id:
+            raise ValueError("Passkey does not belong to the current user")
+        verified = verify_authentication_response(credential=body.credential, expected_challenge=challenge.challenge, expected_rp_id=get_webauthn_rp_id(), expected_origin=get_webauthn_origin(), credential_public_key=credential.public_key, credential_current_sign_count=credential.sign_count, require_user_verification=True)
+        passkeys.record_authentication(credential.id, verified.new_sign_count)
+        if not store.authorize_hidden_photos_session(_hidden_photos_session_token(request), user.user_id):
+            raise ValueError("Normal session is no longer valid")
+    except (InvalidAuthenticationResponse, ValueError, TypeError) as error:
+        retry_after = store.record_failed_attempt(rate_key)
+        if retry_after:
+            raise HTTPException(status_code=429, detail="Too many passkey attempts. Try again later.", headers={"Retry-After": str(retry_after)}) from error
+        raise HTTPException(status_code=401, detail="Hidden Photos identity confirmation failed") from error
+    store.clear_failed_attempts(rate_key)
+    return {"authorized": True}
+
+
+@router.get("/hidden-videos/authorization")
+def hidden_videos_authorization_status(request: Request, response: Response, user: AuthenticatedUser, store: AuthenticationStore = Depends(get_authentication_store)) -> dict[str, bool]:
+    response.headers["Cache-Control"] = "private, no-store"
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    return {"authorized": bool(token and store.has_hidden_videos_authorization(token, user.user_id))}
+
+
+@router.post("/hidden-videos/authorization/options")
+def begin_hidden_videos_authorization(request: Request, user: AuthenticatedUser, store: AuthenticationStore = Depends(get_authentication_store), passkeys: PasskeyStore = Depends(get_passkey_store)) -> dict[str, object]:
+    rate_key = _passkey_rate_limit_key(request)
+    lockout = store.get_lockout_seconds(rate_key)
+    if lockout:
+        raise HTTPException(status_code=429, detail="Too many passkey attempts. Try again later.", headers={"Retry-After": str(lockout)})
+    credentials = passkeys.list_credentials(user.user_id)
+    if not credentials:
+        raise HTTPException(status_code=400, detail="An active passkey is required for Hidden Videos")
+    challenge = secrets.token_bytes(32)
+    ceremony = passkeys.create_challenge("authentication", user.user_id, challenge, purpose="hidden_videos_step_up")
+    options = generate_authentication_options(rp_id=get_webauthn_rp_id(), challenge=challenge, timeout=PASSKEY_TIMEOUT_MS, allow_credentials=[PublicKeyCredentialDescriptor(id=item.credential_id) for item in credentials], user_verification=UserVerificationRequirement.REQUIRED)
+    return _passkey_options(options, ceremony.id)
+
+
+@router.post("/hidden-videos/authorization/verify")
+def finish_hidden_videos_authorization(body: PasskeyVerifyRequest, request: Request, user: AuthenticatedUser, store: AuthenticationStore = Depends(get_authentication_store), passkeys: PasskeyStore = Depends(get_passkey_store)) -> dict[str, bool]:
+    rate_key = _passkey_rate_limit_key(request)
+    challenge = passkeys.consume_challenge(body.challenge_id, "authentication", user.user_id, purpose="hidden_videos_step_up")
+    if challenge is None:
+        raise HTTPException(status_code=400, detail="Hidden Videos authentication challenge is invalid or expired")
+    try:
+        credential = passkeys.get_credential(_credential_raw_id(body.credential))
+        if credential is None or credential.user_id != user.user_id:
+            raise ValueError("Passkey does not belong to the current user")
+        verified = verify_authentication_response(credential=body.credential, expected_challenge=challenge.challenge, expected_rp_id=get_webauthn_rp_id(), expected_origin=get_webauthn_origin(), credential_public_key=credential.public_key, credential_current_sign_count=credential.sign_count, require_user_verification=True)
+        passkeys.record_authentication(credential.id, verified.new_sign_count)
+        if not store.authorize_hidden_videos_session(_hidden_videos_session_token(request), user.user_id):
+            raise ValueError("Normal session is no longer valid")
+    except (InvalidAuthenticationResponse, ValueError, TypeError) as error:
+        retry_after = store.record_failed_attempt(rate_key)
+        if retry_after:
+            raise HTTPException(status_code=429, detail="Too many passkey attempts. Try again later.", headers={"Retry-After": str(retry_after)}) from error
+        raise HTTPException(status_code=401, detail="Hidden Videos identity confirmation failed") from error
+    store.clear_failed_attempts(rate_key)
+    return {"authorized": True}
 
 
 @router.get("/session")

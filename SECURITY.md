@@ -11,3 +11,5 @@ vulnerability details through public issues, discussions, or an invented email
 address.
 
 Include the affected component/commit, reproduction steps, impact, and any proposed mitigation. Please allow time for acknowledgement and remediation before public disclosure.
+
+Release checks include Gitleaks over public history and structural source privacy validation. The sole historical fingerprint exception is a test-only pairing placeholder containing only a version field; new credentials and other findings are not ignored.

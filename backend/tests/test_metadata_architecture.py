@@ -22,7 +22,7 @@ EXTRACTOR_MODULE_PREFIXES = (
     "pymediainfo",
 )
 
-PLAYBACK_ADAPTER_MODULES = frozenset({"movie_playback.py", "music_playback.py", "tv_playback.py"})
+PLAYBACK_ADAPTER_MODULES = frozenset({"movie_playback.py", "music_playback.py", "tv_playback.py", "playback_policy.py"})
 
 METADATA_PRODUCER_MODULES = frozenset(
     {
@@ -35,6 +35,9 @@ METADATA_PRODUCER_MODULES = frozenset(
         "tv_jellyfin_import.py",
         "vault_master_music.py",
         "vault_master_reading_extraction.py",
+        # This helper is consumed solely by Vault Master reconciliation and
+        # trusted-title code; it has no product-section route or UI surface.
+        "video_location.py",
     }
 )
 
@@ -126,7 +129,7 @@ def test_music_never_reads_descriptive_metadata_live_from_jellyfin() -> None:
 
 
 def test_music_browser_downloads_one_complete_private_stream_before_playback() -> None:
-    source = (FRONTEND_SOURCE / "routes" / "app.music.tsx").read_text(
+    source = (FRONTEND_SOURCE / "hooks" / "useMusicPlayer.tsx").read_text(
         encoding="utf-8"
     )
 
@@ -137,7 +140,7 @@ def test_music_browser_downloads_one_complete_private_stream_before_playback() -
 
 
 def test_music_player_is_inline_and_advances_after_a_two_second_gap() -> None:
-    source = (FRONTEND_SOURCE / "routes" / "app.music.tsx").read_text(
+    source = (FRONTEND_SOURCE / "hooks" / "useMusicPlayer.tsx").read_text(
         encoding="utf-8"
     )
 
@@ -148,25 +151,30 @@ def test_music_player_is_inline_and_advances_after_a_two_second_gap() -> None:
     assert "void player.play()" in source
     assert 'type="range"' in source
     assert "setPlaybackPosition" in source
-    assert "ring-[var(--pv-gold)]" in source
+    assert 'aria-label="Now playing"' in source
     assert 'className="fixed bottom-0' not in source
 
 
-def test_gallery_state_is_server_side_and_timeline_uses_photo_anchors() -> None:
+def test_gallery_preferences_are_server_side_and_date_rail_uses_direct_photo_anchors() -> None:
     source = (FRONTEND_SOURCE / "routes" / "app.gallery.index.tsx").read_text(encoding="utf-8")
+    rail = (FRONTEND_SOURCE / "components" / "pv" / "GallerySortMenu.tsx").read_text(encoding="utf-8")
 
     assert 'fetch("/api/user-state/gallery"' in source
     assert "sessionStorage" not in source
     assert "localStorage" not in source
     assert "data-gallery-id" in source
-    assert "Gallery timeline" in source
+    assert "GallerySortMenu" in source
+    assert "/api/gallery/chronology?" in source
+    assert 'query.set("anchor_asset_id"' in source
+    assert 'query.set("start"' in source
+    assert 'aria-label="Gallery dates"' in rail
     assert "if (!openingPhoto.current) persistState(sort, true)" in source
 
 
 def test_movie_page_exposes_resume_and_two_authenticated_download_modes() -> None:
     source = (FRONTEND_SOURCE / "routes" / "app.movies.$movieId.tsx").read_text(encoding="utf-8")
 
-    assert "/api/user-state/movies/" in source
+    assert 'useTheatreProgress("movies")' in source
     assert "/download/original" in source
     assert "/download/compressed.mp4" in source
     assert "Continue at" in source
@@ -186,12 +194,16 @@ def test_theatre_subtitle_control_is_track_scoped_and_preserves_position() -> No
     assert "is_default" in page
     assert "is_hearing_impaired" in page
     assert 'aria-label="Subtitles"' not in page
-    assert '<option value="off">Off</option>' in player
-    assert 'aria-label="Subtitles"' in player
-    assert 'controlsList="nofullscreen"' in player
-    assert "requestFullscreen" in player
+    assert '{ value: "off", label: "Off" }' in player
+    assert 'label="Subtitles"' in player
+    fullscreen = (FRONTEND_SOURCE / "lib" / "player-fullscreen.ts").read_text(encoding="utf-8")
+    assert "        controls\n" not in player
+    assert "<PlayerTransport" in player
+    assert "attachPlayerFullscreen(player, setIsFullscreen" in player
+    assert "player.requestFullscreen()" in fullscreen
+    assert "available: nativeAvailable || viewportAvailable" in fullscreen
     assert 'aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}' in player
-    assert 'document.fullscreenElement === playerRef.current' in player
+    assert 'document.fullscreenElement === player' in fullscreen
     assert "preservedPosition.current = video.currentTime" in player
     assert "OpenSubtitles" not in page
 
@@ -229,12 +241,13 @@ def test_arrival_semantic_analysis_remains_review_only_and_backend_orchestrated(
     assert '@app.post("/gallery-classify")' not in service
     assert '@app.post("/tag")' in rampp_service
     assert "<MORE_DETAILED_CAPTION>" in service
-    assert 'INGESTION_TASK_VERSION = "semantic-intake-v5"' in backend
+    assert 'INGESTION_TASK_VERSION = "semantic-intake-v9"' in backend
     assert "MAX_SEMANTIC_PDF_PAGES = 3" in backend
     assert "sha256_file(source) != item.sha256" in backend
     assert "private_review_evidence_only" in frontend
-    assert "confidence_components" in frontend
-    assert "automatic_disqualifiers" in frontend
+    assert "Semantic evidence for Vault Master review" in frontend
+    assert "confidence_components" not in frontend
+    assert "automatic_disqualifiers" not in frontend
     assert 'ROUTING_MODEL_VERSION = "intelligent-routing-v5"' in backend
     assert "pv-florence2" not in frontend
 
@@ -278,7 +291,7 @@ def test_mediapipe_face_detector_is_separate_internal_box_only_service() -> None
     assert ":/models/face-detector:ro" in detector_service
 
 
-def test_frontend_analysis_copy_is_direct_and_uses_analyse_action() -> None:
+def test_frontend_analysis_copy_preserves_florence_without_per_photo_controls() -> None:
     frontend = "\n".join(
         path.read_text(encoding="utf-8") for path in FRONTEND_SOURCE.rglob("*.tsx")
     )
@@ -296,12 +309,12 @@ def test_frontend_analysis_copy_is_direct_and_uses_analyse_action() -> None:
     ):
         assert removed_copy not in frontend
     assert "Analyse" in gallery
-    assert "Analyse photo" in gallery
-    assert "Analyse text / OCR" in gallery
-    assert "No text found." in gallery
-    assert 'setDialog("ocr")' in gallery
+    assert "Analyse photo" not in gallery
+    assert "Analyse text / OCR" not in gallery
+    assert 'setDialog("ocr")' not in gallery
     assert "/api/gallery/intelligence/assets/${photo.asset_id}/reanalyse" in gallery
-    assert "/api/vault-master/assets/${assetId}/ai/ocr" in gallery
+    assert "/api/vault-master/assets/${assetId}/ai/ocr" not in gallery
+    assert "Analyse existing photos" in (FRONTEND_SOURCE / "routes" / "app.gallery.index.tsx").read_text(encoding="utf-8")
     assert "Florence visual description" in gallery
     assert "GalleryVisualDescription" in gallery
     assert "if (!photo.can_edit || !photo.asset_id)" in gallery
@@ -343,8 +356,9 @@ def test_arrival_hall_item_mutations_keep_the_scoped_list_visible() -> None:
     assert 'itemAction === "approving" ? "Approving…"' in frontend
     assert "await responseError(response" in frontend
     assert "itemActionErrors[analysis.id]" in frontend
-    assert "{listing && listing.files.length > 0 && (" in frontend
-    assert "{!error && listing && listing.files.length > 0 && (" not in frontend
+    assert "{listing && activeStagedFiles.length > 0 && (" in frontend
+    assert "isActiveArrivalState(incomingAnalysis.get(file.relative_path)?.state)" in frontend
+    assert "{!error && listing && activeStagedFiles.length > 0 && (" not in frontend
     assert "if (loadVersion !== loadVersionRef.current) return;" in frontend
 
 

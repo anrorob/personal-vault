@@ -5,7 +5,6 @@ import os
 import time
 from pathlib import Path
 from typing import Callable
-from uuid import UUID
 
 from app.jellyfin import JellyfinClient, JellyfinUnavailableError
 from app.tv_shows import PendingTvEpisode, PostgresTvShowStore
@@ -80,7 +79,6 @@ def import_pending_tv_metadata(
     *,
     discovery_wait_seconds: float = 15.0,
     sleep: Callable[[float], None] = time.sleep,
-    episode_ids: set[UUID] | None = None,
 ) -> int:
     """Use discovery, then one full-refresh fallback, then fail closed.
 
@@ -89,9 +87,6 @@ def import_pending_tv_metadata(
     """
     metadata_pending = store.pending_metadata_episodes()
     artwork_pending = store.pending_episode_artwork() if isinstance(store, PostgresTvShowStore) else []
-    if episode_ids is not None:
-        metadata_pending = [entry for entry in metadata_pending if entry.id in episode_ids]
-        artwork_pending = [entry for entry in artwork_pending if entry.id in episode_ids]
     metadata_ids = {entry.id for entry in metadata_pending}
     artwork_ids = {entry.id for entry in artwork_pending}
     pending_by_id = {entry.id: entry for entry in [*metadata_pending, *artwork_pending]}
@@ -119,8 +114,7 @@ def import_pending_tv_metadata(
         details = client.get_tv_item_metadata(indexed_episode.item_id)
         if entry.id in metadata_ids:
             title = details.get("Name") if isinstance(details.get("Name"), str) else f"Episode {entry.episode_number}"
-            # Provider enrichment cannot renumber the owner-approved episode.
-            number = entry.episode_number
+            number = details.get("IndexNumber") if isinstance(details.get("IndexNumber"), int) else entry.episode_number
             provider_ids = details.get("ProviderIds") if isinstance(details.get("ProviderIds"), dict) else {}
             imported = {
                 "display_title": title,
@@ -130,8 +124,6 @@ def import_pending_tv_metadata(
                 "provider_ids": provider_ids,
                 "provider": {"name": "jellyfin", "item_id": indexed_episode.item_id, "media_source_id": indexed_episode.media_source_id},
             }
-            if isinstance(details.get("IndexNumber"), int) and details["IndexNumber"] != number:
-                imported["provider_episode_number"] = details["IndexNumber"]
             store.import_episode_metadata(entry.id, title=title, episode_number=number, imported_metadata=imported, provider_ids={str(key): str(value) for key, value in provider_ids.items() if isinstance(key, str) and isinstance(value, str)})
             # The canonical asset layer owns durable sidecars.  The structural TV
             # tables retain hierarchy identity; this call records the same provider

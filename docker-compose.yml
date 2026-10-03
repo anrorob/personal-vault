@@ -6,6 +6,7 @@ services:
       args:
         PV_ENVIRONMENT: ${PV_ENVIRONMENT:-development}
         PV_COMMIT: ${PV_COMMIT:-unknown}
+        PV_REPOSITORY: ${PV_REPOSITORY:-anrorob/personal-vault}
     container_name: pv-frontend
     restart: unless-stopped
     environment:
@@ -28,6 +29,7 @@ services:
       POSTGRES_USER: pv_vault
       PV_ENVIRONMENT: ${PV_ENVIRONMENT:-development}
       PV_COMMIT: ${PV_COMMIT:-unknown}
+      PV_REPOSITORY: ${PV_REPOSITORY:-anrorob/personal-vault}
       PV_METADATA_STORAGE_PATH: /var/lib/personal-vault/metadata
       PV_VAULT_MASTER_AI_ENABLED: "true"
       PV_FLORENCE_URL: http://pv-florence2:8080/ocr

@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from app.build_info import build_info, get_build_commit, get_environment, load_project_version
+from app.build_info import build_info, get_build_commit, get_environment, get_repository, load_project_version
 
 
 def test_version_loads_from_the_canonical_file(tmp_path: Path) -> None:
@@ -27,7 +27,18 @@ def test_build_info_reports_safe_development_metadata(monkeypatch: pytest.Monkey
 
     reported = build_info()
 
-    assert reported == {"version": "1.0.0", "commit": "abc1234", "environment": "development"}
+    assert reported == {
+        "version": "1.0.0",
+        "commit": "abc1234",
+        "environment": "development",
+        "repository": "unknown",
+    }
+
+
+def test_repository_accepts_a_repository_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PV_REPOSITORY", "example-owner/personal-vault")
+
+    assert get_repository() == "example-owner/personal-vault"
 
 
 def test_production_requires_an_immutable_commit_identifier(monkeypatch: pytest.MonkeyPatch) -> None:

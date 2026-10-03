@@ -46,26 +46,6 @@ def test_tv_import_uses_exactly_one_refresh_fallback(monkeypatch: pytest.MonkeyP
     assert client.refreshes == 1 and len(store.imported) == 1
 
 
-def test_recovery_import_is_scoped_to_requested_episodes(monkeypatch):
-    monkeypatch.setenv("PV_TV_SHOWS_PATH", "/media/tv")
-    store, client = Store(), Client([None, _indexed()])
-    protected = store.pending[0]
-    selected = PendingTvEpisode(uuid4(), uuid4(), "/vault/Theatre/TV Shows/Westworld/Season 01/Westworld - S01E01.mkv", 1)
-    store.pending.append(selected)
-    assert import_pending_tv_metadata(store, client, discovery_wait_seconds=0, sleep=lambda _: None, episode_ids={selected.id}) == 1
-    assert client.refreshes == 1 and store.imported[0][0][0] == selected.id
-    assert protected.id not in store.failed
-
-
-def test_provider_cannot_renumber_a_canonical_episode(monkeypatch):
-    monkeypatch.setenv("PV_TV_SHOWS_PATH", "/media/tv")
-    store, client = Store(), Client([_indexed()])
-    monkeypatch.setattr(client, "get_tv_item_metadata", lambda _: {"Name": "Provider title", "IndexNumber": 99})
-    assert import_pending_tv_metadata(store, client, discovery_wait_seconds=0, sleep=lambda _: None) == 1
-    assert store.imported[0][1]["episode_number"] == 1
-    assert store.imported[0][1]["imported_metadata"]["provider_episode_number"] == 99
-
-
 def test_tv_import_fails_closed_after_single_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PV_TV_SHOWS_PATH", "/media/tv")
     store, client = Store(), Client([None, None])

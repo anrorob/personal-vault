@@ -41,6 +41,10 @@ class AuthenticationStore(Protocol):
     def elevate_vault_control_session(self, token: str, user_id: UUID, expires_at: datetime) -> bool: ...
     def refresh_vault_control_elevation(self, token: str, user_id: UUID, expires_at: datetime) -> bool: ...
     def has_vault_control_elevation(self, token: str, user_id: UUID) -> bool: ...
+    def authorize_hidden_photos_session(self, token: str, user_id: UUID) -> bool: ...
+    def has_hidden_photos_authorization(self, token: str, user_id: UUID) -> bool: ...
+    def authorize_hidden_videos_session(self, token: str, user_id: UUID) -> bool: ...
+    def has_hidden_videos_authorization(self, token: str, user_id: UUID) -> bool: ...
 
     def delete_session(self, token: str) -> None: ...
     def delete_sessions_for_user_id(self, user_id: UUID) -> None: ...
@@ -74,11 +78,15 @@ class AuthenticationStore(Protocol):
 
     def get_movie_progress(self, user_id: UUID, movie_id: str) -> "MovieProgress | None": ...
 
-    def save_movie_progress(self, user_id: UUID, progress: "MovieProgress") -> None: ...
+    def save_movie_progress(self, user_id: UUID, progress: "MovieProgress", *, preserve_completed: bool = False) -> "MovieProgress": ...
+
+    def list_movie_progress(self, user_id: UUID) -> list["MovieProgress"]: ...
 
     def get_episode_progress(self, user_id: UUID, episode_id: UUID) -> "EpisodeProgress | None": ...
 
-    def save_episode_progress(self, user_id: UUID, progress: "EpisodeProgress") -> None: ...
+    def save_episode_progress(self, user_id: UUID, progress: "EpisodeProgress", *, preserve_completed: bool = False) -> "EpisodeProgress": ...
+
+    def list_episode_progress(self, user_id: UUID) -> list["EpisodeProgress"]: ...
 
 
 @dataclass(frozen=True)
@@ -115,6 +123,8 @@ class SessionRecord:
     client_ip: str | None = None
     user_agent: str | None = None
     vault_control_elevated_until: datetime | None = None
+    hidden_photos_authorized: bool = False
+    hidden_videos_authorized: bool = False
 
 
 @dataclass(frozen=True)
@@ -306,6 +316,34 @@ class MemoryAuthenticationStore:
             return bool(session and session.user_id == user_id and session.expires_at > self._now()
                         and session.vault_control_elevated_until and session.vault_control_elevated_until > self._now())
 
+    def authorize_hidden_photos_session(self, token: str, user_id: UUID) -> bool:
+        with self._lock:
+            session = self.sessions.get(token)
+            if not session or session.user_id != user_id or session.expires_at <= self._now():
+                return False
+            self.sessions[token] = replace(session, hidden_photos_authorized=True)
+            return True
+
+    def has_hidden_photos_authorization(self, token: str, user_id: UUID) -> bool:
+        with self._lock:
+            session = self.sessions.get(token)
+            return bool(session and session.user_id == user_id and session.expires_at > self._now()
+                        and session.hidden_photos_authorized)
+
+    def authorize_hidden_videos_session(self, token: str, user_id: UUID) -> bool:
+        with self._lock:
+            session = self.sessions.get(token)
+            if not session or session.user_id != user_id or session.expires_at <= self._now():
+                return False
+            self.sessions[token] = replace(session, hidden_videos_authorized=True)
+            return True
+
+    def has_hidden_videos_authorization(self, token: str, user_id: UUID) -> bool:
+        with self._lock:
+            session = self.sessions.get(token)
+            return bool(session and session.user_id == user_id and session.expires_at > self._now()
+                        and session.hidden_videos_authorized)
+
     def delete_session(self, token: str) -> None:
         with self._lock:
             self.sessions.pop(token, None)
@@ -417,14 +455,32 @@ class MemoryAuthenticationStore:
     def get_movie_progress(self, user_id: UUID, movie_id: str) -> MovieProgress | None:
         return self.movie_progress.get((user_id, movie_id))
 
-    def save_movie_progress(self, user_id: UUID, progress: MovieProgress) -> None:
-        self.movie_progress[(user_id, progress.movie_id)] = progress
+    def save_movie_progress(self, user_id: UUID, progress: MovieProgress, *, preserve_completed: bool = False) -> MovieProgress:
+        with self._lock:
+            previous = self.get_movie_progress(user_id, progress.movie_id)
+            if preserve_completed and previous and previous.completed:
+                progress = replace(progress, completed=True)
+            self.movie_progress[(user_id, progress.movie_id)] = progress
+            return progress
+
+    def list_movie_progress(self, user_id: UUID) -> list[MovieProgress]:
+        with self._lock:
+            return [progress for (viewer, _), progress in self.movie_progress.items() if viewer == user_id]
 
     def get_episode_progress(self, user_id: UUID, episode_id: UUID) -> EpisodeProgress | None:
         return self.episode_progress.get((user_id, episode_id))
 
-    def save_episode_progress(self, user_id: UUID, progress: EpisodeProgress) -> None:
-        self.episode_progress[(user_id, progress.episode_id)] = progress
+    def save_episode_progress(self, user_id: UUID, progress: EpisodeProgress, *, preserve_completed: bool = False) -> EpisodeProgress:
+        with self._lock:
+            previous = self.get_episode_progress(user_id, progress.episode_id)
+            if preserve_completed and previous and previous.completed:
+                progress = replace(progress, completed=True)
+            self.episode_progress[(user_id, progress.episode_id)] = progress
+            return progress
+
+    def list_episode_progress(self, user_id: UUID) -> list[EpisodeProgress]:
+        with self._lock:
+            return [progress for (viewer, _), progress in self.episode_progress.items() if viewer == user_id]
 
 
 class PostgresAuthenticationStore:
@@ -483,6 +539,8 @@ class PostgresAuthenticationStore:
                 cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS auth_accounts_user_id_idx ON auth_accounts (user_id)")
                 cursor.execute("ALTER TABLE auth_sessions ADD COLUMN IF NOT EXISTS user_id UUID")
                 cursor.execute("ALTER TABLE auth_sessions ADD COLUMN IF NOT EXISTS vault_control_elevated_until TIMESTAMPTZ")
+                cursor.execute("ALTER TABLE auth_sessions ADD COLUMN IF NOT EXISTS hidden_photos_authorized BOOLEAN NOT NULL DEFAULT FALSE")
+                cursor.execute("ALTER TABLE auth_sessions ADD COLUMN IF NOT EXISTS hidden_videos_authorized BOOLEAN NOT NULL DEFAULT FALSE")
                 cursor.execute("ALTER TABLE auth_sessions ADD COLUMN IF NOT EXISTS id UUID")
                 cursor.execute("ALTER TABLE auth_sessions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP")
                 cursor.execute("ALTER TABLE auth_sessions ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ")
@@ -557,6 +615,13 @@ class PostgresAuthenticationStore:
                     raise RuntimeError("Movie progress identity migration found an unknown account")
                 cursor.execute("ALTER TABLE user_movie_progress ALTER COLUMN user_id SET NOT NULL")
                 cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS user_movie_progress_user_id_movie_id_idx ON user_movie_progress (user_id, movie_id)")
+                cursor.execute("""DO $$ BEGIN
+                    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='user_movie_progress'::regclass
+                        AND contype='p' AND pg_get_constraintdef(oid)='PRIMARY KEY (username, movie_id)') THEN
+                        ALTER TABLE user_movie_progress DROP CONSTRAINT user_movie_progress_pkey;
+                        ALTER TABLE user_movie_progress ADD PRIMARY KEY (user_id, movie_id);
+                    END IF;
+                END $$""")
                 cursor.execute("ALTER TABLE user_movie_progress DROP CONSTRAINT IF EXISTS user_movie_progress_user_id_fkey")
                 cursor.execute("ALTER TABLE user_movie_progress ADD CONSTRAINT user_movie_progress_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth_accounts(user_id)")
                 cursor.execute(
@@ -802,6 +867,42 @@ class PostgresAuthenticationStore:
             )
             return cursor.fetchone() is not None
 
+    def authorize_hidden_photos_session(self, token: str, user_id: UUID) -> bool:
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """UPDATE auth_sessions SET hidden_photos_authorized=TRUE
+                   WHERE token_hash=%s AND user_id=%s AND expires_at>CURRENT_TIMESTAMP""",
+                (self._digest(token), user_id),
+            )
+            return cursor.rowcount == 1
+
+    def has_hidden_photos_authorization(self, token: str, user_id: UUID) -> bool:
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT 1 FROM auth_sessions WHERE token_hash=%s AND user_id=%s
+                   AND expires_at>CURRENT_TIMESTAMP AND hidden_photos_authorized=TRUE""",
+                (self._digest(token), user_id),
+            )
+            return cursor.fetchone() is not None
+
+    def authorize_hidden_videos_session(self, token: str, user_id: UUID) -> bool:
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """UPDATE auth_sessions SET hidden_videos_authorized=TRUE
+                   WHERE token_hash=%s AND user_id=%s AND expires_at>CURRENT_TIMESTAMP""",
+                (self._digest(token), user_id),
+            )
+            return cursor.rowcount == 1
+
+    def has_hidden_videos_authorization(self, token: str, user_id: UUID) -> bool:
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT 1 FROM auth_sessions WHERE token_hash=%s AND user_id=%s
+                   AND expires_at>CURRENT_TIMESTAMP AND hidden_videos_authorized=TRUE""",
+                (self._digest(token), user_id),
+            )
+            return cursor.fetchone() is not None
+
     def delete_session(self, token: str) -> None:
         with self._connect() as connection:
             with connection.cursor() as cursor:
@@ -962,46 +1063,54 @@ class PostgresAuthenticationStore:
                 row = cursor.fetchone()
         return MovieProgress(movie_id, float(row[0]), float(row[1]), bool(row[2])) if row else None
 
-    def save_movie_progress(self, user_id: UUID, progress: MovieProgress) -> None:
-        with self._connect() as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    INSERT INTO user_movie_progress
-                        (username, user_id, movie_id, position_seconds, duration_seconds, completed)
-                    SELECT username, user_id, %s, %s, %s, %s FROM auth_accounts WHERE user_id = %s
-                    ON CONFLICT (username, movie_id) DO UPDATE SET
-                        position_seconds = EXCLUDED.position_seconds,
-                        duration_seconds = EXCLUDED.duration_seconds,
-                        completed = EXCLUDED.completed,
-                        updated_at = CURRENT_TIMESTAMP
-                    """,
-                    (
-                        progress.movie_id, progress.position_seconds,
-                        progress.duration_seconds, progress.completed, user_id,
-                    ),
-                )
+    def _save_theatre_progress(self, user_id, progress, *, episode, preserve_completed):
+        # Table/column names are fixed internal choices, never request input.
+        table, key = ("user_episode_progress", "episode_id") if episode else ("user_movie_progress", "movie_id")
+        cls = EpisodeProgress if episode else MovieProgress
+        identity = getattr(progress, key)
+        columns = "" if episode else "username, "
+        selection = "%s, %s, %s, %s, %s" if episode else "username, user_id, %s, %s, %s, %s FROM auth_accounts WHERE user_id = %s"
+        insert = f"VALUES ({selection})" if episode else f"SELECT {selection}"
+        values = (user_id, identity, progress.position_seconds, progress.duration_seconds, progress.completed) if episode else (identity, progress.position_seconds, progress.duration_seconds, progress.completed, user_id)
+        completed = f"({table}.completed OR EXCLUDED.completed)" if preserve_completed else "EXCLUDED.completed"
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute(f"""INSERT INTO {table} ({columns}user_id, {key}, position_seconds, duration_seconds, completed)
+                {insert}
+                ON CONFLICT (user_id, {key}) DO UPDATE SET
+                position_seconds=EXCLUDED.position_seconds, duration_seconds=EXCLUDED.duration_seconds,
+                completed={completed}, updated_at=CURRENT_TIMESTAMP
+                WHERE ({table}.position_seconds, {table}.duration_seconds, {table}.completed)
+                  IS DISTINCT FROM (EXCLUDED.position_seconds, EXCLUDED.duration_seconds, {completed})
+                RETURNING position_seconds, duration_seconds, completed""", values)
+            row = cursor.fetchone()
+            if row is None:
+                cursor.execute(f"SELECT position_seconds, duration_seconds, completed FROM {table} WHERE user_id=%s AND {key}=%s", (user_id, identity))
+                row = cursor.fetchone()
+            if row is None:
+                raise ValueError("Playback state requires an existing immutable user")
+        return cls(identity, float(row[0]), float(row[1]), bool(row[2]))
+
+    def save_movie_progress(self, user_id: UUID, progress: MovieProgress, *, preserve_completed: bool = False) -> MovieProgress:
+        return self._save_theatre_progress(user_id, progress, episode=False, preserve_completed=preserve_completed)
 
     def get_episode_progress(self, user_id: UUID, episode_id: UUID) -> EpisodeProgress | None:
         with self._connect() as connection, connection.cursor() as cursor:
-            cursor.execute(
-                """SELECT position_seconds, duration_seconds, completed FROM user_episode_progress
-                   WHERE user_id=%s AND episode_id=%s""", (user_id, episode_id)
-            )
+            cursor.execute("SELECT position_seconds, duration_seconds, completed FROM user_episode_progress WHERE user_id=%s AND episode_id=%s", (user_id, episode_id))
             row = cursor.fetchone()
         return EpisodeProgress(episode_id, float(row[0]), float(row[1]), bool(row[2])) if row else None
 
-    def save_episode_progress(self, user_id: UUID, progress: EpisodeProgress) -> None:
+    def save_episode_progress(self, user_id: UUID, progress: EpisodeProgress, *, preserve_completed: bool = False) -> EpisodeProgress:
+        return self._save_theatre_progress(user_id, progress, episode=True, preserve_completed=preserve_completed)
+
+    def list_movie_progress(self, user_id: UUID) -> list[MovieProgress]:
         with self._connect() as connection, connection.cursor() as cursor:
-            cursor.execute(
-                """INSERT INTO user_episode_progress
-                   (user_id, episode_id, position_seconds, duration_seconds, completed)
-                   VALUES (%s,%s,%s,%s,%s)
-                   ON CONFLICT (user_id, episode_id) DO UPDATE SET
-                   position_seconds=EXCLUDED.position_seconds, duration_seconds=EXCLUDED.duration_seconds,
-                   completed=EXCLUDED.completed, updated_at=CURRENT_TIMESTAMP""",
-                (user_id, progress.episode_id, progress.position_seconds, progress.duration_seconds, progress.completed),
-            )
+            cursor.execute("SELECT movie_id, position_seconds, duration_seconds, completed FROM user_movie_progress WHERE user_id=%s", (user_id,))
+            return [MovieProgress(r[0], float(r[1]), float(r[2]), bool(r[3])) for r in cursor.fetchall()]
+
+    def list_episode_progress(self, user_id: UUID) -> list[EpisodeProgress]:
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT episode_id, position_seconds, duration_seconds, completed FROM user_episode_progress WHERE user_id=%s", (user_id,))
+            return [EpisodeProgress(r[0], float(r[1]), float(r[2]), bool(r[3])) for r in cursor.fetchall()]
 
     def reset(self) -> None:
         with self._connect() as connection:

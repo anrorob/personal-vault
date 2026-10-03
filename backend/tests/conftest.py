@@ -1,15 +1,15 @@
 from collections.abc import Iterator
 from datetime import datetime, timezone
-
+from uuid import uuid4
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-from app.vault_supplier import MemoryVaultSupplierStore, get_vault_supplier_store
 from fastapi.testclient import TestClient
 
 from app.auth import SESSION_COOKIE_NAME, VAULT_CONTROL_ELEVATION_DURATION, get_authentication_store, get_enrolment_store, get_passkey_store
 from app.auth_store import MemoryAuthenticationStore
 from app.passkeys import MemoryPasskeyStore
+from app.vault_supplier import MemoryVaultSupplierStore, get_vault_supplier_store
 from app.vault_supplier_transfer import MemoryTransferStore, get_transfer_store
 from app.vault_master_intake import MemoryIntakeStore, get_intake_store
 from app.enrolment import MemoryEnrolmentStore
@@ -17,11 +17,28 @@ import app.main as main_module
 from app.main import app
 from app.security import hash_password
 from app.vault_master_ingestion_ai import MemoryIngestionAiStore, get_ingestion_ai_store
+from app.gallery_florence import GalleryFlorenceEvidence, get_gallery_florence_store
+from app.vault_master_ai import AI_MODEL_ID, AI_MODEL_REVISION
+from app.gallery_people import MemoryGalleryPeopleStore, get_gallery_people_store
+from app.asset_favorites import MemoryAssetFavorites, get_asset_favorites
+from app.gallery_custom_tags import MemoryGalleryCustomTagStore, get_gallery_custom_tag_store
 
 
 TEST_USERNAME = "owner"
 TEST_PASSWORD = "correct-horse-battery-staple"
 TEST_PASSWORD_HASH = hash_password(TEST_PASSWORD)
+
+
+class MemoryGalleryFlorenceStore:
+    """Unit-API default: existing canonical Florence evidence is retained."""
+
+    def latest_evidence(self, asset_id: object, owner_user_id: object) -> GalleryFlorenceEvidence:
+        return GalleryFlorenceEvidence(
+            uuid4(), uuid4(), asset_id, owner_user_id, "Retained caption", "",
+            AI_MODEL_ID,
+            AI_MODEL_REVISION,
+            "gallery-florence-recovery-v1", 0, datetime.now(timezone.utc),
+        )
 
 
 def elevate_vault_control(client: TestClient, store: MemoryAuthenticationStore) -> None:
@@ -53,14 +70,17 @@ def client(
     monkeypatch.setenv("PV_WEBAUTHN_ORIGIN", "https://testserver")
     monkeypatch.setenv("PV_VAULT_MASTER_WORKER_ENABLED", "false")
     monkeypatch.setenv("PV_ENVIRONMENT", "test")
+    monkeypatch.setenv("PV_REPOSITORY", "example-owner/personal-vault")
+    monkeypatch.setenv("PV_ALLOWED_SOURCE_REPOSITORIES", "example-owner/personal-vault")
+    monkeypatch.setenv("PV_ALLOWED_HOSTS", "testserver,vault-server.local")
+    monkeypatch.setenv("PV_VAULT_SUPPLIER_LAN_ALLOWED_HOSTS", "vault-server.local")
     monkeypatch.setenv("PV_COMMIT", "test")
-
+    monkeypatch.setenv("PV_VAULT_SUPPLIER_LAN_PORT", "8444")
+    monkeypatch.delenv("PV_VAULT_SUPPLIER_LAN_CERTIFICATE_PATH", raising=False)
     server_key = ec.generate_private_key(ec.SECP256R1())
     key_path = tmp_path_factory.mktemp("vault-supplier-lan-key") / "server-key.pem"
     key_path.write_bytes(server_key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
     monkeypatch.setenv("PV_VAULT_SUPPLIER_SERVER_IDENTITY_KEY_PATH", str(key_path))
-    monkeypatch.delenv("PV_VAULT_SUPPLIER_LAN_CERTIFICATE_PATH", raising=False)
-    monkeypatch.setenv("PV_VAULT_SUPPLIER_LAN_PORT", "9443")
 
     app.dependency_overrides[get_authentication_store] = (
         lambda: authentication_store
@@ -77,6 +97,14 @@ def client(
     app.dependency_overrides[get_intake_store] = lambda: intake_store
     ingestion_ai_store = MemoryIngestionAiStore()
     app.dependency_overrides[get_ingestion_ai_store] = lambda: ingestion_ai_store
+    gallery_florence_store = MemoryGalleryFlorenceStore()
+    app.dependency_overrides[get_gallery_florence_store] = lambda: gallery_florence_store
+    people_store = MemoryGalleryPeopleStore()
+    app.dependency_overrides[get_gallery_people_store] = lambda: people_store
+    favorites = MemoryAssetFavorites()
+    app.dependency_overrides[get_asset_favorites] = lambda: favorites
+    custom_tag_store = MemoryGalleryCustomTagStore()
+    app.dependency_overrides[get_gallery_custom_tag_store] = lambda: custom_tag_store
     # Unit API tests deliberately replace every persistent dependency with a
     # memory store.  Production lifespan bootstrap is covered separately with
     # disposable PostgreSQL; it must not attempt an unrelated local database.

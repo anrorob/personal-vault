@@ -1,3 +1,4 @@
+import { SectionHeading } from "./SectionHeading";
 import { Link, Outlet, useNavigate, useRouterState } from "@tanstack/react-router";
 import { useState } from "react";
 import { useEffect } from "react";
@@ -25,6 +26,7 @@ import {
 } from "lucide-react";
 import { PVLogo } from "./Logo";
 import { getAuthSession, type AuthSession } from "@/lib/auth";
+import { fetchBuildInfo, isDevelopmentBuild, type BuildInfo } from "@/lib/build-info";
 
 type NavItem = {
   to: string;
@@ -96,6 +98,7 @@ export function AppShell() {
   const navigate = useNavigate();
   const [mobileOpen, setMobileOpen] = useState(false);
   const [session, setSession] = useState<AuthSession | null>(null);
+  const [buildInfo, setBuildInfo] = useState<BuildInfo | null>(null);
   const isVaultControl = pathname.startsWith("/app/vault-control");
   const secondaryRouteActive = SECONDARY_NAV.some(
     (item) => pathname === item.to || pathname.startsWith(`${item.to}/`),
@@ -110,7 +113,6 @@ export function AppShell() {
     Object.entries(TITLES).find(
       ([path]) => path !== "/app" && pathname.startsWith(`${path}/`),
     )?.[1] ?? { title: "Personal Vault", section: "" };
-  const compactUsesSectionOnly = meta.section === "Library";
 
   const [isSigningOut, setIsSigningOut] = useState(false);
 
@@ -118,6 +120,17 @@ export function AppShell() {
     void getAuthSession()
       .then(setSession)
       .catch(() => setSession(null));
+  }, []);
+
+  useEffect(() => {
+    void fetchBuildInfo()
+      .then((identity) => {
+        setBuildInfo(identity);
+        if (isDevelopmentBuild(identity)) {
+          document.title = "Personal Vault DEV";
+        }
+      })
+      .catch(() => setBuildInfo(null));
   }, []);
 
   const displayName = session?.display_name ?? session?.username ?? "Vault user";
@@ -321,22 +334,18 @@ export function AppShell() {
           </div>
 
           <div className="flex-1 min-w-0">
-            <div className="flex items-baseline gap-3">
-              <h1
-                className={`pv-page-title text-base truncate ${compactUsesSectionOnly ? "hidden md:block" : ""}`}
-              >
-                {meta.title}
-              </h1>
-              {meta.section && (
-                <span
-                  className={`text-xs uppercase tracking-widest ${compactUsesSectionOnly ? "" : "hidden md:inline"}`}
-                  style={{ color: "var(--pv-text-dim)" }}
-                >
-                  {meta.section}
-                </span>
-              )}
-            </div>
+            <SectionHeading title={meta.title} section={meta.section} pathname={pathname} />
           </div>
+
+          {buildInfo?.environment === "development" && (
+            <span
+              className="hidden sm:inline rounded border px-2 py-1 text-[10px] font-semibold uppercase tracking-widest"
+              style={{ borderColor: "var(--pv-gold)", color: "var(--pv-gold)" }}
+              title={`${buildInfo.repository} @ ${buildInfo.commit}`}
+            >
+              DEV · {buildInfo.commit.slice(0, 7)}
+            </span>
+          )}
 
           <div
             className="flex items-center gap-3 pl-4 border-l"
@@ -352,7 +361,7 @@ export function AppShell() {
             >
               {avatarInitial}
             </div>
-            <span className="text-sm" style={{ color: "var(--pv-silver)" }}>
+            <span className="hidden sm:inline text-sm" style={{ color: "var(--pv-silver)" }}>
               {displayName}
             </span>
             {isVaultControl ? (

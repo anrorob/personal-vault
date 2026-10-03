@@ -6,7 +6,16 @@ export type GalleryImage = {
   added_at: string;
   captured_on: string | null;
   captured_at?: string | null;
-  date_source: "embedded" | "filename" | "file_modified" | "user_override" | "unavailable";
+  date_source:
+    | "embedded"
+    | "embedded_file_date"
+    | "source_file_created"
+    | "source_file_modified"
+    | "filename"
+    | "file_modified"
+    | "user_override"
+    | "unavailable"
+    | `import:${string}`;
   location: string | null;
   display_title: string | null;
   description?: string | null;
@@ -19,6 +28,46 @@ export type GalleryImage = {
 };
 
 export type GallerySortOrder = "newest" | "oldest";
+
+export type GalleryReturnPosition = {
+  assetId: string;
+  photoId: string;
+  query: string;
+  offset: number;
+  hidden: boolean;
+};
+
+// Kept only while the Gallery layout is mounted. Leaving Gallery discards it;
+// returning from detail retains it for both browser Back and the Gallery link.
+let returnPosition: GalleryReturnPosition | null = null;
+let galleryPath = "";
+let returningFromPhoto = false;
+export function rememberGalleryPosition(position: GalleryReturnPosition) {
+  returnPosition = position;
+}
+export function visitGalleryPath(path: string) {
+  if (path === galleryPath) return;
+  returningFromPhoto =
+    path.replace(/\/$/, "") === "/app/gallery" &&
+    galleryPath.startsWith("/app/gallery/") &&
+    galleryPath !== "/app/gallery/";
+  galleryPath = path;
+}
+export function galleryReturnPosition() {
+  return returningFromPhoto ? returnPosition : null;
+}
+export function clearGalleryPosition() {
+  returnPosition = null;
+  galleryPath = "";
+  returningFromPhoto = false;
+}
+
+export type GalleryPeriod = {
+  year: number | null;
+  month: number | null;
+  count: number;
+  start: string;
+};
 
 export type GalleryIntelligenceTerm = {
   namespace: "photo_type" | "content_tag";
@@ -41,6 +90,7 @@ export type GalleryLocalAnnotation = {
   tags: string[];
   people: GalleryPerson[];
 };
+export type GalleryCustomTag = { id: string; slug: string; display_name: string };
 
 export const DEFAULT_GALLERY_SORT: GallerySortOrder = "newest";
 
@@ -72,6 +122,7 @@ export type GalleryImageDetails = GalleryImage & {
   unknown_people_count?: number;
   unresolved_person_presence?: boolean;
   face_detections?: GalleryFaceDetection[];
+  custom_tags?: GalleryCustomTag[];
 };
 
 export function getPhotoTitle(filename: string): string {

@@ -56,7 +56,7 @@ export function FileLibraryPage({
   }, [apiPath, navigate, title]);
 
   return (
-    <div className="max-w-6xl mx-auto space-y-6">
+    <div className="max-w-7xl mx-auto space-y-6">
       <div>
         <h2 className="pv-content-title text-xl">{title}</h2>
         <p className="text-xs mt-1" style={{ color: "var(--pv-text-dim)" }}>

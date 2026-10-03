@@ -1,19 +1,23 @@
 from datetime import date, datetime, timedelta, timezone
 from dataclasses import replace
 from io import BytesIO
+import json
 from pathlib import Path
 from uuid import UUID, NAMESPACE_URL, uuid4, uuid5
 
 from fastapi.testclient import TestClient
 from pypdf import PdfWriter
+from PIL import Image
 import pytest
 
 from app.auth import AuthenticatedIdentity, require_authenticated_user
 import app.gallery as gallery_module
 from app.auth_store import Account, MemoryAuthenticationStore
 from app.gallery import get_gallery_path, scan_gallery, to_summary
+from app.gallery_florence import get_gallery_florence_store
 from app.gallery_intelligence import BULK_COMPLETION_GRACE, MemoryGalleryIntelligenceStore, get_gallery_intelligence_store
 from app.gallery_people import MemoryGalleryPeopleStore, get_gallery_people_store
+from app.people import get_share_grant_store
 from app.main import app
 from app.vault_master import (
     CataloguedAsset,
@@ -33,6 +37,15 @@ def authenticate(client: TestClient) -> None:
         },
     )
     assert response.status_code == 200
+
+
+def synthetic_recipient() -> AuthenticatedIdentity:
+    return AuthenticatedIdentity(Account(
+        username="son", display_name="Synthetic recipient", email=None,
+        password_hash=None, role="user", active=True, password_change_required=False,
+        created_at=datetime.now(timezone.utc), last_sign_in_at=None,
+        user_id=uuid5(NAMESPACE_URL, "test:gallery:son"),
+    ))
 
 
 def configure_gallery(tmp_path: Path) -> MemoryVaultMasterStore:
@@ -94,6 +107,49 @@ def catalogue_image(
     )
     store.catalogued_assets[vault_path] = asset
     return asset
+
+
+class GalleryHideShareAuthority:
+    def __init__(self, *, shared: bool = False, failure: Exception | None = None) -> None:
+        self.shared = shared
+        self.failure = failure
+
+    def has_active_share_for_asset(self, asset_id: UUID, owner_user_id: UUID) -> bool:
+        if self.failure is not None:
+            raise self.failure
+        return self.shared
+
+
+def test_gallery_hide_uses_share_authority_and_fails_closed(client: TestClient, tmp_path: Path) -> None:
+    store = configure_gallery(tmp_path)
+    asset = catalogue_image(store, tmp_path, create_image(tmp_path, "hide.jpg"))
+    authenticate(client)
+    app.dependency_overrides[get_share_grant_store] = lambda: GalleryHideShareAuthority()
+    assert client.post(f"/api/vault-master/assets/{asset.id}/lifecycle/hide").status_code == 200
+    assert store.get_catalogued_asset(asset.vault_path).lifecycle_state == "hidden"
+    store.catalogued_assets[asset.vault_path] = replace(asset)
+    app.dependency_overrides[get_share_grant_store] = lambda: GalleryHideShareAuthority(shared=True)
+    shared = client.post(f"/api/vault-master/assets/{asset.id}/lifecycle/hide")
+    assert shared.status_code == 409
+    assert shared.json()["detail"] == "This photo is shared. Unshare it before hiding."
+    app.dependency_overrides[get_share_grant_store] = lambda: GalleryHideShareAuthority(failure=RuntimeError("database unavailable"))
+    unavailable = client.post(f"/api/vault-master/assets/{asset.id}/lifecycle/hide")
+    assert unavailable.status_code == 503
+    assert unavailable.json()["detail"] == "Sharing state could not be confirmed; try again later."
+
+
+def test_gallery_ux_uses_complete_filter_scroll_tile_selection_and_desktop_navigation() -> None:
+    root = Path(__file__).parents[2]
+    gallery_source = (root / "src" / "routes" / "app.gallery.index.tsx").read_text(encoding="utf-8")
+    viewer_source = (root / "src" / "routes" / "app.gallery.$photoId.tsx").read_text(
+        encoding="utf-8"
+    )
+
+    assert "max-h-[calc(100dvh-2rem)]" in gallery_source
+    assert "overflow-x-hidden overflow-y-auto" in gallery_source
+    assert "if (selectionMode && image.asset_id)" in gallery_source
+    assert "event.preventDefault();" in gallery_source
+    assert "hidden md:flex transition-transform" in viewer_source
 
 
 def create_pdf(gallery_path: Path, relative_path: str) -> Path:
@@ -235,6 +291,103 @@ def test_gallery_returns_private_linked_images(
     second_details = client.get(f"/api/gallery/{body[1]['id']}")
     assert second_details.json()["previous_id"] == body[0]["id"]
     assert second_details.json()["next_id"] is None
+
+
+def test_gallery_list_and_detail_reuse_bulk_catalogue_rows(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = configure_gallery(tmp_path)
+    image = create_image(tmp_path, "Example Artist/photo.jpg")
+    asset = catalogue_image(store, tmp_path, image)
+    authenticate(client)
+
+    def unexpected_reload(_paths, _username):
+        raise AssertionError("Gallery reloaded catalogue rows already scanned")
+
+    monkeypatch.setattr(store, "get_visible_catalogued_assets", unexpected_reload)
+    listing = client.get("/api/gallery")
+    assert listing.status_code == 200
+    assert [row["asset_id"] for row in listing.json()] == [str(asset.id)]
+    detail = client.get(f"/api/gallery/{listing.json()[0]['id']}")
+    assert detail.status_code == 200
+    assert detail.json()["asset_id"] == str(asset.id)
+
+
+def test_gallery_metadata_falls_back_for_paths_not_in_bulk_catalogue(
+    tmp_path: Path,
+) -> None:
+    store = MemoryVaultMasterStore()
+    image = create_image(tmp_path, "Example Artist/legacy.jpg")
+    asset = catalogue_image(store, tmp_path, image)
+    images = scan_gallery(tmp_path)
+    metadata = gallery_module.get_gallery_metadata(
+        store, tmp_path, images, asset.owner_user_id, {}
+    )
+    assert metadata[str(image)] == asset
+
+
+def test_gallery_lists_and_serves_catalogued_slot_placement(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    legacy = tmp_path / "legacy"
+    legacy.mkdir()
+    slot = tmp_path / "slot"
+    slot_image = slot / "Gallery" / "example.jpg"
+    slot_image.parent.mkdir(parents=True)
+    picture = BytesIO()
+    Image.new("RGB", (24, 24), "blue").save(picture, format="JPEG")
+    slot_image.write_bytes(picture.getvalue())
+    store = configure_gallery(legacy)
+    asset = CataloguedAsset(
+        id=uuid4(), asset_type="Gallery", display_title="Example",
+        captured_on=date(2024, 5, 6), location=None,
+        vault_path="/vault/Gallery/example.jpg", filename="example.jpg",
+        size_bytes=slot_image.stat().st_size, mime_type="image/jpeg",
+        sha256="a" * 64,
+        metadata={"storage_placement": {
+            "slot_id": "PV-TEST-SLOT-001", "relative_path": "Gallery/example.jpg",
+        }}, metadata_provenance={}, owner_username=TEST_USERNAME,
+        owner_user_id=uuid5(NAMESPACE_URL, f"personal-vault-test:{TEST_USERNAME}"),
+    )
+    store.catalogued_assets[asset.vault_path] = asset
+    monkeypatch.setenv("PV_STORAGE_SLOT_ROOTS_JSON", json.dumps({"PV-TEST-SLOT-001": str(slot)}))
+    monkeypatch.setattr(gallery_module, "gallery_thumbnail", (
+        lambda source, _asset, _cache: (slot_image, "test-key") if source == slot_image else None
+    ))
+    authenticate(client)
+
+    page = client.get("/api/gallery/pages")
+    assert page.status_code == 200
+    assert [image["name"] for image in page.json()["items"]] == ["example.jpg"]
+    image_id = page.json()["items"][0]["id"]
+    full_scan, full_index = gallery_module.find_gallery_image(legacy, image_id, store)
+    assert gallery_module.find_gallery_content_image(legacy, image_id, store) == full_scan[full_index]
+    assert client.get(f"/api/gallery/{image_id}").status_code == 200
+    assert client.get(f"/api/gallery/{image_id}/content").content == picture.getvalue()
+    assert client.get(f"/api/gallery/assets/{asset.id}/preview").status_code == 200
+
+
+def test_gallery_content_lookup_preserves_legacy_first_for_duplicate_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    legacy = tmp_path / "legacy"
+    legacy.mkdir()
+    legacy_image = create_image(legacy, "example.jpg", b"legacy")
+    slot = tmp_path / "slot"
+    slot_image = create_image(slot, "Gallery/example.jpg", b"placed")
+    store = MemoryVaultMasterStore()
+    asset = catalogue_image(store, legacy, legacy_image)
+    store.catalogued_assets[asset.vault_path] = replace(asset, metadata={
+        "storage_placement": {
+            "slot_id": "PV-TEST-SLOT-001", "relative_path": "Gallery/example.jpg",
+        },
+    })
+    monkeypatch.setenv("PV_STORAGE_SLOT_ROOTS_JSON", json.dumps({"PV-TEST-SLOT-001": str(slot)}))
+    image_id = gallery_module.get_image_id(Path("example.jpg"))
+    full_scan, full_index = gallery_module.find_gallery_image(legacy, image_id, store)
+    assert full_scan[full_index].path == legacy_image
+    assert gallery_module.find_gallery_content_image(legacy, image_id, store) == full_scan[full_index]
+    assert slot_image.exists()
 
 
 def test_gallery_orders_and_navigates_by_canonical_capture_date(
@@ -396,7 +549,7 @@ def test_people_data_foundation_supports_manual_no_face_authority_and_owner_isol
     people.add_face_detection(asset.id, bounding_box={"x": 1}, detector_provider="yunet")
     people.add_person_detection(asset.id, bounding_box={"x": 2}, detector_provider="yolox")
     assert people.face_detections and people.person_detections
-    app.dependency_overrides[require_authenticated_user] = lambda: "son"
+    app.dependency_overrides[require_authenticated_user] = lambda: synthetic_recipient()
     assert client.get("/api/gallery/people").json() == []
     assert client.get(f"/api/gallery/people/assets/{asset.id}").status_code == 404
 
@@ -531,7 +684,7 @@ def test_later_face_identification_supersedes_exclusion_and_automatic_evidence_c
 
     owner = client.post("/api/gallery/people", json={"display_name": "Owner"}).json()
     ela = client.post("/api/gallery/people", json={"display_name": "Ela"}).json()
-    robert_face = people.add_face_detection(asset.id, bounding_box={"x": 1}, embedding=b"owner")
+    example_owner_face = people.add_face_detection(asset.id, bounding_box={"x": 1}, embedding=b"owner")
     ela_face = people.add_face_detection(asset.id, bounding_box={"x": 2}, embedding=b"ela")
     # An older manual exclusion suppresses automated evidence.
     people.associate(asset.id, UUID(owner["id"]), "vault_master")
@@ -541,14 +694,14 @@ def test_later_face_identification_supersedes_exclusion_and_automatic_evidence_c
     # Identifying this exact face is later user authority: reference, canonical
     # association and effective photo-level inclusion are established together.
     assert client.post(
-        f"/api/gallery/people/assets/{asset.id}/faces/{robert_face}/identify",
+        f"/api/gallery/people/assets/{asset.id}/faces/{example_owner_face}/identify",
         json={"person_id": owner["id"], "decision": "include"},
     ).status_code == 200
-    assert people.face_detections[robert_face]["reference_person_id"] == UUID(owner["id"])
+    assert people.face_detections[example_owner_face]["reference_person_id"] == UUID(owner["id"])
     assert people.decisions[(asset.id, UUID(owner["id"]))] == "include"
     assert [person.display_name for person in people.effective_people(asset.id, TEST_USERNAME)] == ["Owner"]
     assert any(
-        key == (asset.id, UUID(owner["id"]), "user_face", robert_face)
+        key == (asset.id, UUID(owner["id"]), "user_face", example_owner_face)
         for key in people.associations
     )
 
@@ -615,7 +768,7 @@ def test_shared_gallery_detail_hides_face_boxes_and_unknown_people(client: TestC
     people = MemoryGalleryPeopleStore()
     people.add_face_detection(asset.id, bounding_box={"x": 1, "y": 2, "w": 3, "h": 4})
     app.dependency_overrides[get_gallery_people_store] = lambda: people
-    app.dependency_overrides[require_authenticated_user] = lambda: "son"
+    app.dependency_overrides[require_authenticated_user] = lambda: synthetic_recipient()
 
     detail = client.get(f"/api/gallery/{scan_gallery(tmp_path)[0].id}").json()
     assert "face_detections" not in detail
@@ -748,7 +901,8 @@ def test_gallery_people_filter_uses_compact_searchable_selector() -> None:
     assert "setPeopleOpen" in source
     assert ".sort((left, right) => left.display_name.localeCompare(right.display_name))" in source
     assert "selectedPeople.includes(entry.id)" in source
-    assert "max-h-48" in source
+    assert "max-h-48" not in source
+    assert "max-h-[calc(100dvh-2rem)]" in source
 
 
 def test_owner_can_correct_gallery_intelligence_and_unincluded_shared_view_is_hidden(
@@ -778,7 +932,7 @@ def test_owner_can_correct_gallery_intelligence_and_unincluded_shared_view_is_hi
     store.catalogued_assets[asset.vault_path] = CataloguedAsset(
         **{**asset.__dict__, "visibility": "shared", "shared_with": ("son",)}
     )
-    app.dependency_overrides[require_authenticated_user] = lambda: "son"
+    app.dependency_overrides[require_authenticated_user] = lambda: synthetic_recipient()
     detail = client.get(f"/api/gallery/{image_id}")
     assert detail.status_code == 404
 
@@ -801,6 +955,40 @@ def test_backfill_is_explicit_and_opening_gallery_never_queues_historical_assets
     assert len(intelligence.jobs) == 1
 
 
+def test_backfill_queues_missing_canonical_florence_evidence_without_arrival_reanalysis(
+    client: TestClient, tmp_path: Path
+) -> None:
+    class MissingFlorenceEvidenceStore:
+        def __init__(self) -> None:
+            self.queued: list[tuple[UUID, UUID, str]] = []
+
+        def latest_evidence(self, *_args: object) -> None:
+            return None
+
+        def active_or_latest_job(self, _asset_id: UUID) -> None:
+            return None
+
+        def queue(self, asset_id: UUID, owner_user_id: UUID, requested_by: str) -> object:
+            self.queued.append((asset_id, owner_user_id, requested_by))
+            return object()  # persisted queue contract returns the created job
+
+    image_path = create_image(tmp_path, "missing-florence.jpg")
+    store = configure_gallery(tmp_path)
+    asset = catalogue_image(store, tmp_path, image_path)
+    intelligence = MemoryGalleryIntelligenceStore()
+    florence = MissingFlorenceEvidenceStore()
+    app.dependency_overrides[get_gallery_intelligence_store] = lambda: intelligence
+    app.dependency_overrides[get_gallery_florence_store] = lambda: florence
+    authenticate(client)
+
+    response = client.post("/api/gallery/intelligence/backfill?limit=2")
+
+    assert response.status_code == 200
+    assert response.json()["queued"] == 2
+    assert [job.asset_id for job in intelligence.jobs.values()] == [asset.id]
+    assert florence.queued == [(asset.id, asset.owner_user_id, TEST_USERNAME)]
+
+
 def test_gallery_backfill_status_and_historical_queue_are_owner_uuid_scoped(
     client: TestClient, tmp_path: Path, authentication_store: MemoryAuthenticationStore
 ) -> None:
@@ -816,16 +1004,16 @@ def test_gallery_backfill_status_and_historical_queue_are_owner_uuid_scoped(
         datetime.now(timezone.utc), None,
     )
     authentication_store.create_account(recipient)
-    robert_path = create_image(tmp_path, "owner-historical.jpg")
-    anita_path = create_image(tmp_path, "recipient-historical.jpg")
+    example_owner_path = create_image(tmp_path, "owner-historical.jpg")
+    example_recipient_path = create_image(tmp_path, "recipient-historical.jpg")
     store = configure_gallery(tmp_path)
-    robert_asset = catalogue_image(store, tmp_path, robert_path)
-    anita_asset = catalogue_image(store, tmp_path, anita_path)
-    store.catalogued_assets[robert_asset.vault_path] = replace(
-        robert_asset, owner_user_id=owner.user_id
+    example_owner_asset = catalogue_image(store, tmp_path, example_owner_path)
+    example_recipient_asset = catalogue_image(store, tmp_path, example_recipient_path)
+    store.catalogued_assets[example_owner_asset.vault_path] = replace(
+        example_owner_asset, owner_user_id=owner.user_id
     )
-    store.catalogued_assets[anita_asset.vault_path] = replace(
-        anita_asset, owner_username="recipient", owner_user_id=recipient.user_id
+    store.catalogued_assets[example_recipient_asset.vault_path] = replace(
+        example_recipient_asset, owner_username="recipient", owner_user_id=recipient.user_id
     )
     intelligence = MemoryGalleryIntelligenceStore()
     app.dependency_overrides[get_gallery_intelligence_store] = lambda: intelligence
@@ -835,9 +1023,9 @@ def test_gallery_backfill_status_and_historical_queue_are_owner_uuid_scoped(
     assert client.get("/api/gallery/intelligence/backfill/status").json() == {
         "eligible_count": 1, "run": None
     }
-    robert_backfill = client.post("/api/gallery/intelligence/backfill?limit=50")
-    assert robert_backfill.status_code == 200
-    assert [job.asset_id for job in intelligence.jobs.values()] == [robert_asset.id]
+    example_owner_backfill = client.post("/api/gallery/intelligence/backfill?limit=50")
+    assert example_owner_backfill.status_code == 200
+    assert [job.asset_id for job in intelligence.jobs.values()] == [example_owner_asset.id]
 
     app.dependency_overrides[require_authenticated_user] = lambda: AuthenticatedIdentity(recipient)
     # The global worker endpoint remains administrative, but owner action
@@ -846,10 +1034,10 @@ def test_gallery_backfill_status_and_historical_queue_are_owner_uuid_scoped(
     assert client.get("/api/gallery/intelligence/backfill/status").json() == {
         "eligible_count": 1, "run": None
     }
-    anita_backfill = client.post("/api/gallery/intelligence/backfill?limit=50")
-    assert anita_backfill.status_code == 200
-    assert {job.asset_id for job in intelligence.jobs.values()} == {robert_asset.id, anita_asset.id}
-    assert client.get("/api/gallery/intelligence/backfill/status").json()["run"] == anita_backfill.json()["run"]
+    example_recipient_backfill = client.post("/api/gallery/intelligence/backfill?limit=50")
+    assert example_recipient_backfill.status_code == 200
+    assert {job.asset_id for job in intelligence.jobs.values()} == {example_owner_asset.id, example_recipient_asset.id}
+    assert client.get("/api/gallery/intelligence/backfill/status").json()["run"] == example_recipient_backfill.json()["run"]
 
 
 def test_bulk_backfill_progress_is_persisted_and_tracks_job_states(
@@ -987,40 +1175,19 @@ def test_owner_selected_gallery_reanalysis_queues_exactly_one_canonical_asset_jo
     }
 
 
-def test_gallery_options_keep_photo_intelligence_and_ocr_actions_separate() -> None:
-    source = (
-        Path(__file__).parents[2] / "src" / "routes" / "app.gallery.$photoId.tsx"
-    ).read_text(encoding="utf-8")
-
-    assert "Analyse photo" in source
-    assert "Analyse text / OCR" in source
-    assert 'import { ActionProgress } from "@/components/pv/ActionProgress";' in source
-    assert "label={`Gallery Intelligence: ${galleryIntelligenceStatusLabel(job)}`}" in source
-    assert "Analysis completed — no photo type or content tags were identified." in source
-    assert "Photo type:" in source
-    assert "Content tags:" in source
-    assert 'onRetry={job.status === "failed" && !queueing ? onRetry : undefined}' in source
-    assert "Close" in source
-    assert "onClick={close}" in source
-    assert "/api/gallery/intelligence/assets/${photo.asset_id}/reanalyse" in source
-    assert "/api/gallery/intelligence/assets/${photo.asset_id}/status" in source
-    assert "/api/vault-master/assets/${assetId}/ai/ocr" in source
-
-
-def test_gallery_photo_detail_options_use_vm066_hide_restore_lifecycle() -> None:
-    source = (
-        Path(__file__).parents[2] / "src" / "routes" / "app.gallery.$photoId.tsx"
-    ).read_text(encoding="utf-8")
-
-    assert 'lifecycleState={photo.lifecycle_state ?? "active"}' in source
-    assert 'const action = lifecycleState === "hidden" ? "unhide" : "hide";' in source
-    assert "/api/vault-master/assets/${assetId}/lifecycle/${action}" in source
-    assert '{lifecycleState === "hidden" ? "Restore" : "Hide"}' in source
+def test_gallery_details_remove_per_photo_analysis_and_keep_hide_restore() -> None:
+    # Actual dialog behaviour is covered in tests/gallery-details.test.tsx.
+    source = (Path(__file__).parents[2] / "src" / "routes" / "app.gallery.$photoId.tsx").read_text(encoding="utf-8")
+    assert "Analyse photo" not in source
+    assert "Analyse text / OCR" not in source
+    assert "Use the arrow keys or viewer controls to move between photos." not in source
+    assert 'photo.lifecycle_state === "hidden" ? "unhide" : "hide"' in source
+    assert 'photo.lifecycle_state === "hidden" ? "Restore" : "Hide"' in source
     assert "Move to Bin" not in source
     assert "quarantine-" not in source
 
 
-def test_owner_gallery_detail_exposes_lifecycle_state(client: TestClient, tmp_path: Path) -> None:
+def test_hidden_gallery_assets_require_session_authorization(client: TestClient, tmp_path: Path, authentication_store) -> None:
     image_path = create_image(tmp_path, "hidden-photo.jpg")
     store = configure_gallery(tmp_path)
     asset = catalogue_image(store, tmp_path, image_path)
@@ -1033,10 +1200,28 @@ def test_owner_gallery_detail_exposes_lifecycle_state(client: TestClient, tmp_pa
     )
     authenticate(client)
 
-    response = client.get(f"/api/gallery/{scan_gallery(tmp_path)[0].id}")
-
+    image_id = scan_gallery(tmp_path)[0].id
+    response = client.get(f"/api/gallery/{image_id}")
+    assert response.status_code == 403
+    assert client.get("/api/gallery?include_hidden=true").status_code == 403
+    token = client.cookies.get("pv_session")
+    assert token is not None
+    hidden_status = client.get("/api/auth/hidden-photos/authorization")
+    assert hidden_status.json() == {"authorized": False}
+    assert hidden_status.headers["cache-control"] == "private, no-store"
+    assert authentication_store.authorize_hidden_photos_session(token, asset.owner_user_id)
+    assert client.get("/api/auth/hidden-photos/authorization").json() == {"authorized": True}
+    assert client.get("/api/gallery").json() == []
+    assert client.get("/api/gallery?include_hidden=true").status_code == 200
+    response = client.get(f"/api/gallery/{image_id}")
     assert response.status_code == 200
     assert response.json()["lifecycle_state"] == "hidden"
+    assert client.get(f"/api/gallery/{image_id}/content").status_code == 200
+    assert client.get(f"/api/gallery/{image_id}/preview").status_code == 200
+    client.post("/api/auth/logout")
+    authenticate(client)
+    assert client.get("/api/auth/hidden-photos/authorization").json() == {"authorized": False}
+    assert client.get("/api/gallery?include_hidden=true").status_code == 403
 
 
 def test_gallery_people_analysis_uses_shared_progress_and_polls_live_job_state() -> None:
@@ -1112,7 +1297,7 @@ def test_unincluded_shared_gallery_details_are_not_discoverable(
             "shared_with": ("son",),
         }
     )
-    app.dependency_overrides[require_authenticated_user] = lambda: "son"
+    app.dependency_overrides[require_authenticated_user] = lambda: synthetic_recipient()
     image_id = scan_gallery(tmp_path)[0].id
 
     response = client.get(f"/api/gallery/{image_id}")
@@ -1192,3 +1377,65 @@ def test_missing_gallery_storage_returns_service_unavailable(
     assert response.json() == {
         "detail": "Gallery storage is unavailable"
     }
+
+
+@pytest.mark.parametrize("sort", ["oldest", "newest"])
+@pytest.mark.parametrize("hidden", [False, True])
+@pytest.mark.parametrize("filter_kind", [None, "photo_type", "content_tag", "person"])
+def test_viewer_navigation_matches_gallery_scope(
+    client: TestClient, tmp_path: Path, authentication_store, sort, hidden, filter_kind
+) -> None:
+    store = configure_gallery(tmp_path)
+    intelligence = MemoryGalleryIntelligenceStore()
+    people = MemoryGalleryPeopleStore()
+    app.dependency_overrides[get_gallery_intelligence_store] = lambda: intelligence
+    app.dependency_overrides[get_gallery_people_store] = lambda: people
+    assets = []
+    for index in range(6):
+        path = create_image(tmp_path, f"scope-{index}.jpg")
+        asset = catalogue_image(store, tmp_path, path, captured_on=date(2024, 1, index + 1))
+        if index % 2:
+            store.set_catalogued_asset_lifecycle_state(asset.id, asset.owner_user_id, TEST_USERNAME, "hidden")
+        assets.append(asset)
+    person = people.create_person(TEST_USERNAME, "Synthetic person", assets[0].owner_user_id)
+    for asset in assets[:4]:
+        intelligence.decide(asset.id, "photo_type", "portrait", "include", TEST_USERNAME)
+        intelligence.decide(asset.id, "content_tag", "outdoors", "include", TEST_USERNAME)
+        people.associate(asset.id, person.id, "user")
+    authenticate(client)
+    token = client.cookies.get("pv_session")
+    assert authentication_store.authorize_hidden_photos_session(token, assets[0].owner_user_id)
+    params = {"sort": sort, "include_hidden": str(hidden).lower()}
+    if filter_kind:
+        params[filter_kind] = {"photo_type": "portrait", "content_tag": "outdoors", "person": str(person.id)}[filter_kind]
+    response = client.get("/api/gallery", params=params)
+    assert response.status_code == 200
+    cards = response.json()
+    expected = [f"scope-{i}.jpg" for i in range(6) if bool(i % 2) == hidden and (not filter_kind or i < 4)]
+    if sort == "newest":
+        expected.reverse()
+    assert [card["name"] for card in cards] == expected
+    for index, card in enumerate(cards):
+        detail = client.get(f"/api/gallery/{card['id']}", params=params)
+        assert detail.status_code == 200
+        body = detail.json()
+        assert body["previous_id"] == (cards[index - 1]["id"] if index else None)
+        assert body["next_id"] == (cards[index + 1]["id"] if index + 1 < len(cards) else None)
+    # A direct authorized hidden detail has no normal-Gallery neighbours.
+    hidden_id = next(image.id for image in scan_gallery(tmp_path) if image.name == "scope-1.jpg")
+    direct = client.get(f"/api/gallery/{hidden_id}")
+    assert direct.status_code == 200
+    assert direct.json()["previous_id"] is None
+    assert direct.json()["next_id"] is None
+    # An active asset cannot enter a Hidden Photos sequence via a direct ID.
+    active_id = next(image.id for image in scan_gallery(tmp_path) if image.name == "scope-0.jpg")
+    assert client.get(f"/api/gallery/{active_id}?include_hidden=true").status_code == 404
+
+
+def test_viewer_navigation_preserves_route_scope() -> None:
+    source = (Path(__file__).parents[2] / "src/routes/app.gallery.$photoId.tsx").read_text(encoding="utf-8")
+    # Swipe, keyboard arrows, and both desktop/full-screen links must retain scope.
+    assert source.count("search: { sort, photo_type, content_tag, person, private_tag, hidden },") == 3
+    navigation = source[source.index("function PhotoNavigation("):]
+    assert "search={{ sort, photo_type, content_tag, person, private_tag, hidden }}" in navigation
+    assert "photo_type: []" not in navigation

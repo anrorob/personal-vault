@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timezone
 from functools import lru_cache
+from app.arrival_publication_coordination import serialized_publication
 import hashlib
 import json
 import logging
@@ -27,12 +28,24 @@ from pypdf import PdfReader
 from pypdf.errors import FileNotDecryptedError, PdfReadError
 import reverse_geocode
 
+from app import music_video_identity as music_video
+from app.music_groups import MemoryMusicGroups, PostgresMusicGroups, initialize_music_groups, item_album, ensure_album, bind_members, declared_album, migrate_music_local_visibility
+
 from app.config import (
     get_admin_username,
     get_database_conninfo,
     get_metadata_storage_root,
 )
-from app.photo_dates import select_oldest_photo_date
+from app.home_videos import get_home_videos_path
+from app.media_formats import VIDEO_EXTENSIONS, VIDEO_MIME_TYPES
+from app.photo_dates import (
+    gallery_date_evidence,
+    normalize_source_date,
+    retain_oldest_source_dates,
+    resolve_gallery_effective_date,
+    resolve_photo_date,
+    select_oldest_photo_date,
+)
 from app.share_grants import (
     active_user_id,
     initialize_share_grants,
@@ -55,7 +68,7 @@ ARCHIVE_ENTRY_NAME_MAX_CHARS = 1024
 AUDIO_TAG_VALUE_LIMIT = 64
 MIME_OVERRIDES = {
     ".wma": "audio/x-ms-wma",
-    ".mkv": "video/x-matroska",
+    **VIDEO_MIME_TYPES,
 }
 VIDEO_PROBE_MAX_BYTES = 2 * 1024 * 1024
 VIDEO_PROBE_STREAM_LIMIT = 32
@@ -106,11 +119,15 @@ def proposed_destination_path(
     filename: str,
     destination_subfolder: str | None = None,
 ) -> str:
+    if category == "Ledger":
+        raise ValueError("Ledger is a derived view, not a canonical file destination")
     root = (
         PurePosixPath("/vault/Theatre/Movies")
         if category == "Movies"
         else PurePosixPath("/vault/Theatre/TV Shows")
         if category == "TV Shows"
+        else PurePosixPath(music_video.ROOT)
+        if category == music_video.ASSET_TYPE
         else PurePosixPath("/vault") / category
     )
     if destination_subfolder:
@@ -801,6 +818,14 @@ class ImportItem:
     owner_user_id: UUID | None = None
 
 
+def logical_filename(item: ImportItem) -> str:
+    """Content-facing basename; operational filename remains the real path name."""
+    value = item.metadata.get("logical_filename")
+    if isinstance(value, str) and value and Path(value).name == value:
+        return value
+    return item.filename
+
+
 @dataclass(frozen=True)
 class CataloguedFile:
     """One immutable physical file belonging to a canonical Vault asset."""
@@ -838,6 +863,35 @@ class CataloguedAsset:
     shared_with: tuple[str, ...] = ()
     shared_with_user_ids: tuple[UUID, ...] = ()
     lifecycle_state: str = "active"
+
+    def __post_init__(self) -> None:
+        if self.asset_type != "Gallery":
+            return
+        captured_on, source = resolve_gallery_effective_date(
+            (self.metadata, self.detected_metadata, self.imported_metadata,
+             {key: value for key, value in gallery_date_evidence(self.effective_metadata).items()
+              if key not in {"captured_on", "captured_at", "capture_date_source"}}),
+            self.user_overrides,
+            legacy_date=self.captured_on,
+            legacy_source=self.metadata_provenance.get("captured_on", "unavailable"),
+        )
+        object.__setattr__(self, "captured_on", captured_on)
+        object.__setattr__(self, "metadata_provenance", {**self.metadata_provenance, "captured_on": source})
+        effective = {**self.effective_metadata, "captured_on": captured_on.isoformat() if captured_on else None}
+        timestamp = effective.get("captured_at")
+        if not captured_on or not isinstance(timestamp, str) or not timestamp.startswith(captured_on.isoformat()):
+            effective.pop("captured_at", None)
+        object.__setattr__(self, "effective_metadata", effective)
+
+
+@dataclass(frozen=True)
+class CataloguedPlacementCandidate:
+    """The minimal primary-file facts needed to resolve a Gallery image ID."""
+
+    vault_path: str
+    asset_type: str
+    has_storage_placement: bool
+    storage_placement: object
 
 
 @dataclass(frozen=True)
@@ -1000,6 +1054,15 @@ def canonical_relationship_type(classification: str) -> str:
         raise ValueError("Classification cannot become a canonical relationship") from error
 
 
+def home_video_access_allowed(asset: CataloguedAsset, user: object) -> bool:
+    """Hidden Home Videos require live owner session authority, including direct URLs."""
+    if asset.asset_type != "Home Videos" or asset.lifecycle_state != "hidden":
+        return True
+    return (isinstance(getattr(user, "user_id", None), UUID)
+            and asset.owner_user_id == user.user_id
+            and getattr(user, "hidden_videos_authorized", False) is True)
+
+
 def asset_is_visible_to(asset: CataloguedAsset, user: object) -> bool:
     """Return whether a user may discover or open a canonical asset.
 
@@ -1010,10 +1073,31 @@ def asset_is_visible_to(asset: CataloguedAsset, user: object) -> bool:
     user_id = user if isinstance(user, UUID) else getattr(user, "user_id", None)
     if not isinstance(user_id, UUID):
         return False
+    if asset.lifecycle_state == "deleted":
+        return False
+    if not home_video_access_allowed(asset, user):
+        return False
     return asset.owner_user_id == user_id or asset.visibility == VAULT_WIDE_ASSET_VISIBILITY or (
         asset.visibility == SHARED_ASSET_VISIBILITY
         and user_id in asset.shared_with_user_ids
     )
+
+
+def canonical_section_matches_asset(asset: CataloguedAsset) -> bool:
+    """Restoration never guesses a new section or changes canonical placement."""
+    roots = {
+        "Gallery": "/vault/Gallery/",
+        "Documents": "/vault/Documents/",
+        "Archives": "/vault/Archives/",
+        "Home Videos": "/vault/Home Videos/",
+        "Music": "/vault/Music/",
+        "Library": "/vault/Library/",
+        "Movies": "/vault/Theatre/Movies/",
+        "Movie": "/vault/Theatre/Movies/",
+        "TV Shows": "/vault/Theatre/TV Shows/",
+    }
+    root = roots.get(asset.asset_type)
+    return root is not None and asset.vault_path.startswith(root)
 
 
 def asset_is_owned_by(asset: CataloguedAsset, user: object) -> bool:
@@ -1028,7 +1112,8 @@ def asset_is_owned_by(asset: CataloguedAsset, user: object) -> bool:
 
 def asset_is_editable_by(asset: CataloguedAsset, user: object) -> bool:
     """Only the immutable owner may change the canonical metadata record."""
-    return asset_is_owned_by(asset, user)
+    return (asset.lifecycle_state != "deleted" and asset_is_owned_by(asset, user)
+            and home_video_access_allowed(asset, user))
 
 
 @dataclass(frozen=True)
@@ -1054,6 +1139,15 @@ class SidecarReconciliation:
 
 
 class VaultMasterStore(Protocol):
+    def declare_music_album(self, owner: UUID, intent: dict[str, object]): ...
+    def get_music_album(self, album_id: UUID): ...
+    def get_asset_music_album(self, asset_id: UUID): ...
+    def music_album_asset_ids(self, album_id: UUID) -> list[UUID]: ...
+    def get_music_album_order(self, album_id: UUID) -> dict: ...
+    def set_music_album_order(self, album_id: UUID, owner: UUID, asset_ids: list[UUID]) -> dict: ...
+    def bind_music_album(self, album_id: UUID, owner: UUID, asset_ids: list[UUID]) -> None: ...
+    def correct_music_album(self, album_id: UUID, owner: UUID, artist: str, title: str): ...
+
     def get_local_vault_id(self) -> UUID: ...
 
     def migrate_source_root(
@@ -1144,6 +1238,10 @@ class VaultMasterStore(Protocol):
         self, vault_paths: list[str], username: str
     ) -> dict[str, CataloguedAsset]: ...
 
+    def filter_visible_catalogued_assets(
+        self, assets: dict[str, CataloguedAsset], username: str
+    ) -> dict[str, CataloguedAsset]: ...
+
     def get_catalogued_asset_by_id(
         self, asset_id: UUID
     ) -> CataloguedAsset | None: ...
@@ -1159,6 +1257,20 @@ class VaultMasterStore(Protocol):
     def list_visible_catalogued_assets(
         self, username: str
     ) -> list[CataloguedAsset]: ...
+
+    def gallery_page_paths(
+        self, owner_user_id: UUID, shared_asset_ids: list[UUID],
+        lifecycle_state: str, sort_order: str, date_from: date | None,
+        date_to: date | None, matching_asset_ids: list[UUID] | None,
+        after: tuple[date | None, str, str] | None, limit: int,
+        inclusive: bool = False, reverse: bool = False,
+    ) -> list[str]: ...
+
+    def gallery_chronology(
+        self, owner_user_id: UUID, shared_asset_ids: list[UUID],
+        lifecycle_state: str, sort_order: str, date_from: date | None,
+        date_to: date | None, matching_asset_ids: list[UUID] | None,
+    ) -> list[tuple[date | None, str, str, int]]: ...
 
     def search_catalogued_assets(
         self, query: str, limit: int = 50
@@ -1176,6 +1288,10 @@ class VaultMasterStore(Protocol):
         self, prefix: str
     ) -> list[CataloguedAsset]: ...
 
+    def list_catalogued_placement_candidates_by_vault_path_prefix(
+        self, prefix: str
+    ) -> list[CataloguedPlacementCandidate]: ...
+
     def set_movie_exclusive_state(
         self, asset_id: UUID, username: str, is_exclusive: bool
     ) -> CataloguedAsset | None: ...
@@ -1183,6 +1299,18 @@ class VaultMasterStore(Protocol):
     def search_visible_catalogued_assets(
         self, query: str, username: str, limit: int = 50
     ) -> list[CataloguedAsset]: ...
+
+    def search_recoverable_catalogued_assets(
+        self, query: str, owner_user_id: UUID, limit: int = 50
+    ) -> list[CataloguedAsset]: ...
+
+    def set_catalogued_asset_deleted(
+        self, asset_id: UUID, owner_user_id: UUID, username: str
+    ) -> CataloguedAsset | None: ...
+
+    def restore_catalogued_asset_deleted(
+        self, asset_id: UUID, owner_user_id: UUID, username: str
+    ) -> CataloguedAsset | None: ...
 
     def update_catalogued_asset_metadata(
         self,
@@ -1416,11 +1544,12 @@ def safely_move_approved_file(
     incoming_root: Path,
     destination_root: Path,
 ) -> Path:
-    if item.metadata.get("tv_resolver_batch_id"):
-        raise ValueError("TV resolver episodes require managed canonical TV publication")
+    if item.proposed_category == "Ledger":
+        raise ValueError("Ledger is a derived view, not a canonical file destination")
     if item.state not in {"approved", "move_failed"}:
         raise ValueError("Only an approved file can be moved")
-    if Path(item.filename).name != item.filename:
+    destination_filename = logical_filename(item)
+    if Path(destination_filename).name != destination_filename:
         raise ValueError("The recorded filename is not safe")
 
     source = require_file_within_root(Path(item.source_path), incoming_root)
@@ -1431,7 +1560,7 @@ def safely_move_approved_file(
     destination_relative = proposed_destination_relative_path(
         item.proposed_category or "",
         item.relative_path,
-        item.filename,
+        destination_filename,
     )
     destination_parent = resolved_destination_root
     for part in destination_relative.parent.parts:
@@ -1450,7 +1579,7 @@ def safely_move_approved_file(
         resolved_destination_root
     ):
         raise ValueError("The approved destination is outside its Vault root")
-    destination = destination_parent / item.filename
+    destination = destination_parent / destination_filename
     if destination.exists() or destination.is_symlink():
         raise FileExistsError("The approved destination already exists")
 
@@ -1527,8 +1656,8 @@ def safely_remove_rejected_arrival_item(
     item: ImportItem,
     incoming_root: Path,
 ) -> None:
-    if item.source_kind != INCOMING_SOURCE or item.state != "rejected":
-        raise ValueError("Only a rejected Arrival Hall file can be removed")
+    if item.source_kind != INCOMING_SOURCE or item.state not in {"rejected", "needs_review", "approved", "move_failed"}:
+        raise ValueError("Only an unpublished staged Arrival Hall file can be removed")
     # Absence is success only for an explicitly removed, safely bounded source.
     candidate = Path(item.source_path)
     resolved_root = incoming_root.resolve(strict=True)
@@ -1838,6 +1967,7 @@ def _extract_xmp_metadata(xmp: object) -> dict[str, object]:
         "display_title": ("title", "headline"),
         "description": ("description", "caption"),
         "creator": ("creator", "artist", "byline"),
+        "xmp_original_at": ("datetimeoriginal", "datecreated"),
         "xmp_created_at": (
             "datetimeoriginal",
             "createdate",
@@ -2384,22 +2514,7 @@ def _probe_frame_rate(value: object) -> float | None:
 def _extract_video_metadata(path: Path) -> dict[str, object]:
     mime_type = mimetypes.guess_type(path.name)[0] or ""
     suffix = path.suffix.casefold()
-    if not mime_type.startswith("video/") and suffix not in {
-        ".3gp",
-        ".avi",
-        ".m2ts",
-        ".m4v",
-        ".mkv",
-        ".mov",
-        ".mp4",
-        ".mpeg",
-        ".mpg",
-        ".mts",
-        ".ts",
-        ".vob",
-        ".webm",
-        ".wmv",
-    }:
+    if not mime_type.startswith("video/") and suffix not in VIDEO_EXTENSIONS:
         return {}
 
     command = [
@@ -2469,6 +2584,9 @@ def _extract_video_metadata(path: Path) -> dict[str, object]:
         value = _probe_number(format_data.get(source), coercion)
         if value is not None:
             metadata[destination] = value
+
+    from app.video_location import gps_location
+    metadata.update(gps_location(probe))
 
     retained_streams: list[dict[str, object]] = []
     creation_dates: list[datetime] = []
@@ -2569,6 +2687,21 @@ def _extract_video_metadata(path: Path) -> dict[str, object]:
     return metadata
 
 
+def retain_arrival_processing_evidence(scanned, previous_sha, previous_metadata):
+    metadata = dict(scanned.metadata)
+    if previous_sha == scanned.sha256:
+        for key in ("managed_request_id", "arrival_publication_rule"):
+            if key in previous_metadata:
+                metadata[key] = previous_metadata[key]
+    return metadata
+
+
+def verify_camera_photo(path: Path) -> None:
+    """Validate image structure before deterministic Vault Master publication."""
+    with Image.open(path) as photo:
+        photo.verify()
+
+
 def extract_basic_metadata(path: Path) -> dict[str, object]:
     document_metadata = _extract_ooxml_metadata(path)
     if document_metadata:
@@ -2630,25 +2763,18 @@ def extract_basic_metadata(path: Path) -> dict[str, object]:
                     metadata[name] = value
             metadata.update(_extract_exif_technical(exif))
             metadata.update(_extract_exif_gps(exif))
-            captured_on, date_source = select_oldest_photo_date(
-                path.name,
-                datetime.fromtimestamp(
-                    path.stat().st_mtime,
-                    tz=timezone.utc,
-                ),
-                (
-                    value
-                    for value in (
-                        exif.get(36867),
-                        exif.get(36868),
-                        exif.get(306),
-                        metadata.get("xmp_created_at"),
-                        metadata.get("iptc_created_at"),
-                    )
-                    if value
-                ),
-            )
-            metadata["captured_at"] = captured_on.isoformat()
+            # DateTimeOriginal/CreateDate normally live in the Exif IFD, not IFD0.
+            try:
+                exif_ifd = exif.get_ifd(34665)
+            except (KeyError, OSError, TypeError, ValueError):
+                exif_ifd = {}
+            for tag, name in ((36867, "exif_original_at"), (36868, "exif_created_at"), (306, "exif_modified_at")):
+                value = _embedded_text(exif_ifd.get(tag) or exif.get(tag))
+                if value:
+                    metadata[name] = value
+            captured_on, date_source = resolve_gallery_effective_date((metadata,))
+            if captured_on is not None:
+                metadata["captured_at"] = captured_on.isoformat()
             metadata["capture_date_source"] = date_source
             return metadata
     except (OSError, UnidentifiedImageError, ValueError):
@@ -2658,6 +2784,13 @@ def extract_basic_metadata(path: Path) -> dict[str, object]:
 def create_deterministic_proposal(
     scanned_file: ScannedFile,
 ) -> tuple[str, str, str, str]:
+    intent = music_video.declared_intent(scanned_file.metadata.get("source_context"), scanned_file.mime_type)
+    if intent is not None:
+        if scanned_file.owner_user_id is None:
+            raise ValueError("Declared Music Video requires an immutable owner")
+        return (music_video.ASSET_TYPE,
+                proposed_destination_path(music_video.ASSET_TYPE, scanned_file.relative_path, scanned_file.filename),
+                "Explicit owner-declared Music Video.", "high")
     suffix = Path(scanned_file.filename).suffix.casefold()
     mime_group = scanned_file.mime_type.partition("/")[0]
 
@@ -2741,11 +2874,23 @@ def create_deterministic_proposal(
             "for manual review."
         )
 
+    source_context = scanned_file.metadata.get("source_context")
+    logical_name = (
+        supplier_original_filename(source_context)
+        if isinstance(source_context, dict)
+        else None
+    ) or scanned_file.filename
     destination = proposed_destination_path(
         category,
         scanned_file.relative_path,
-        scanned_file.filename,
+        logical_name,
     )
+    if isinstance(source_context, dict) and source_context.get("music_album") is not None:
+        if category != "Music":
+            raise ValueError("Declared Music import must contain audio")
+        album = declared_album(scanned_file.owner_user_id, source_context["music_album"])
+        destination = f"/vault/Music/Albums/{album.id}/{logical_name}"
+        reason = "Explicit owner-declared Music album; metadata enrichment requires review."
     return category, destination, reason, confidence
 
 
@@ -2757,7 +2902,7 @@ def effective_asset_metadata(
     detected_title = (
         str(embedded_title)
         if embedded_title
-        else Path(item.filename).stem.replace("_", " ")
+        else Path(logical_filename(item)).stem.replace("_", " ")
     )
     display_title = overrides.get("display_title", detected_title)
     captured_value = overrides.get("captured_on")
@@ -2778,6 +2923,8 @@ def effective_asset_metadata(
         captured_on = None
         captured_source = "unavailable"
 
+    if item.proposed_category == "Gallery":
+        captured_on, captured_source = resolve_gallery_effective_date((item.metadata,), overrides)
     detected_location = item.metadata.get("location")
     location_value = overrides.get("location", detected_location)
     location = str(location_value) if location_value else None
@@ -2797,6 +2944,37 @@ def effective_asset_metadata(
     return display_title, captured_on, location, provenance
 
 
+def apply_source_timestamp_provenance(
+    metadata: dict[str, object], source_context: dict[str, object]
+) -> dict[str, object]:
+    """Persist validated Supplier source times and resolve the logical date."""
+    result = dict(metadata)
+    for field in ("source_created_at", "source_modified_at"):
+        parsed = normalize_source_date(source_context.get(field))
+        if parsed is not None:
+            result[field] = parsed
+    if result.get("capture_date_source") != "embedded":
+        captured_on, source = resolve_photo_date(
+            (), result.get("source_created_at"), result.get("source_modified_at")
+        )
+        result["capture_date_source"] = source
+        if captured_on is None:
+            result.pop("captured_at", None)
+        else:
+            result["captured_at"] = captured_on.isoformat()
+    return result
+
+
+def supplier_original_filename(source_context: dict[str, object]) -> str | None:
+    """Return a safe Supplier identity basename, never an Arrival staging name."""
+    value = source_context.get("original_filename")
+    if not isinstance(value, str) or not value or Path(value).name != value:
+        return None
+    if any(character in value for character in ("/", "\\", "\x00")):
+        return None
+    return value
+
+
 def canonical_asset_metadata_layers(
     item: ImportItem,
 ) -> tuple[
@@ -2807,9 +2985,12 @@ def canonical_asset_metadata_layers(
 ]:
     display_title, captured_on, location, _ = effective_asset_metadata(item)
     detected = normalise_typed_metadata(item.metadata)
+    album = item_album(item)
+    if album is not None:
+        detected["music_album_import"] = {"album_group_id": str(album.id), "owner_user_id": str(album.owner_user_id), "import_group_id": str(album.import_group_id), "artist_name": album.artist_name, "album_title": album.album_title}
     detected.setdefault(
         "display_title",
-        Path(item.filename).stem.replace("_", " "),
+        Path(logical_filename(item)).stem.replace("_", " "),
     )
     detected.setdefault(
         "captured_on",
@@ -2924,10 +3105,28 @@ def refresh_catalogued_asset_detection(
     item: ImportItem,
 ) -> CataloguedAsset:
     detected, _, _, _ = canonical_asset_metadata_layers(item)
+    if asset.asset_type == "Gallery":
+        # Inventory re-scans lack Supplier context. They must not erase evidence
+        # that was retained during the original owner-scoped intake.
+        retained = {**gallery_date_evidence(asset.metadata), **gallery_date_evidence(asset.detected_metadata)}
+        original_context = asset.detected_metadata.get("source_context", asset.metadata.get("source_context"))
+        if isinstance(original_context, dict):
+            retained["source_context"] = dict(original_context)
+        detected = retain_oldest_source_dates(retained, {**retained, **detected})
+        for key, value in retained.items():
+            if key not in {"captured_at", "captured_on", "capture_date_source"} and not detected.get(key):
+                detected[key] = value
+        if retained.get("capture_date_source") == "embedded" and not item.metadata.get("captured_at"):
+            for key in ("captured_at", "captured_on", "capture_date_source"):
+                if key in retained:
+                    detected[key] = retained[key]
     if "ingestion_evidence" in asset.detected_metadata:
         detected["ingestion_evidence"] = asset.detected_metadata[
             "ingestion_evidence"
         ]
+    accepted_title = asset.metadata.get('ken_accepted_title')
+    if accepted_title:
+        detected['ken_accepted_title'] = accepted_title
     imported = dict(asset.imported_metadata)
     overrides = dict(asset.user_overrides)
 
@@ -2951,7 +3150,7 @@ def refresh_catalogued_asset_detection(
     display_title = str(
         overrides.get(
             "display_title",
-            imported.get("display_title", detected["display_title"]),
+            accepted_title or imported.get("display_title", detected["display_title"]),
         )
     )
     captured_value = overrides.get(
@@ -2987,6 +3186,8 @@ def refresh_catalogued_asset_detection(
     for field in ("display_title", "captured_on", "location"):
         if field in overrides:
             provenance[field] = "user_override"
+        elif field == 'display_title' and accepted_title:
+            provenance[field] = asset.metadata.get('ken_title_source', 'ken_accepted')
         elif imported.get(field):
             existing_source = asset.metadata_provenance.get(field, "")
             provenance[field] = (
@@ -3123,8 +3324,8 @@ def apply_catalogue_metadata_changes(
         else:
             user_overrides.pop(field, None)
         if field == "display_title":
-            values[field] = value or detected_title
-            provenance[field] = "user_override" if value else "filename"
+            values[field] = value or asset.metadata.get('ken_accepted_title') or detected_title
+            provenance[field] = 'user_override' if value else asset.metadata.get('ken_title_source', 'ken_accepted') if asset.metadata.get('ken_accepted_title') else 'filename'
         elif field == "captured_on":
             values[field] = date.fromisoformat(value) if value else detected_date
             provenance[field] = (
@@ -3247,6 +3448,8 @@ def apply_imported_asset_metadata(
     imported_metadata = normalise_typed_metadata(
         {**asset.imported_metadata, **metadata}
     )
+    if asset.asset_type == "Gallery":
+        imported_metadata = retain_oldest_source_dates(asset.imported_metadata, imported_metadata)
     provenance = dict(asset.metadata_provenance)
 
     detected_title = asset.detected_metadata.get(
@@ -3259,7 +3462,7 @@ def apply_imported_asset_metadata(
     display_title = str(
         asset.user_overrides.get(
             "display_title",
-            imported_metadata.get("display_title", detected_title),
+            asset.metadata.get('ken_accepted_title') or imported_metadata.get("display_title", detected_title),
         )
     )
     captured_value = asset.user_overrides.get(
@@ -3291,6 +3494,8 @@ def apply_imported_asset_metadata(
     ):
         if field in asset.user_overrides:
             provenance[field] = "user_override"
+        elif field == 'display_title' and asset.metadata.get('ken_accepted_title'):
+            provenance[field] = asset.metadata.get('ken_title_source', 'ken_accepted')
         elif imported_value:
             provenance[field] = f"import:{source}"
         elif detected_value:
@@ -3361,12 +3566,7 @@ def inventory_catalogue_location(
         ),
         (
             "Home Videos",
-            Path(
-                os.getenv(
-                    "PV_PERSONAL_VIDEOS_PATH",
-                    "/media/personal-videos",
-                )
-            ),
+            get_home_videos_path(),
             PurePosixPath("/vault/Home Videos"),
         ),
         (
@@ -3439,7 +3639,8 @@ def scan_root(
             if source_kind == INCOMING_SOURCE and source_context_lookup:
                 source_context = source_context_lookup(path)
                 if source_context is not None:
-                    scanned = ScannedFile(**{**scanned.__dict__, "metadata": {**scanned.metadata, "source_context": source_context}})
+                    original_filename = supplier_original_filename(source_context)
+                    scanned = ScannedFile(**{**scanned.__dict__, "metadata": {**apply_source_timestamp_provenance(scanned.metadata, source_context), "source_context": source_context, **({"logical_filename": original_filename} if original_filename else {})}})
             store.record_file(
                 batch_id,
                 source_kind,
@@ -3547,7 +3748,8 @@ def process_next_batch(
             if source_kind == INCOMING_SOURCE and source_context_lookup:
                 source_context = source_context_lookup(path)
                 if source_context is not None:
-                    scanned = ScannedFile(**{**scanned.__dict__, "metadata": {**scanned.metadata, "source_context": source_context}})
+                    original_filename = supplier_original_filename(source_context)
+                    scanned = ScannedFile(**{**scanned.__dict__, "metadata": {**apply_source_timestamp_provenance(scanned.metadata, source_context), "source_context": source_context, **({"logical_filename": original_filename} if original_filename else {})}})
             store.record_file(
                 batch_id,
                 source_kind,
@@ -3565,6 +3767,25 @@ def process_next_batch(
     return batch_id
 
 
+def arrival_routing_receipt_matches(item: ImportItem, receipt: dict[str, object]) -> bool:
+    """Keep manual receipts distinct and bind automatic receipts to signed authority."""
+    rule = item.metadata.get("arrival_publication_rule")
+    authorization = receipt.get("routing_authorization")
+    if rule is None:
+        return authorization is None
+    if not isinstance(rule, dict):
+        return False
+    if rule.get("version") == "incident-camera-photo-v1":
+        return authorization is None
+    if rule.get("version") not in {"vm-routing-score-v1", "vm-routing-score-v2"}:
+        return False
+    expected = {field: rule.get(field) for field in (
+        "version", "decision_id", "authorization_id", "policy_id",
+        "owner_user_id", "semantic_class", "destination", "score", "threshold")}
+    return authorization == expected
+
+
+@serialized_publication
 def process_next_move(
     store: VaultMasterStore,
     incoming_root: Path,
@@ -3575,21 +3796,29 @@ def process_next_move(
     item = store.claim_next_move()
     if item is None:
         return None
-    if item.state == "move_failed":
+    if item.proposed_category == "Ledger":
+        store.record_move_result(item.id, "move_failed", "Vault Master worker",
+                                 "Ledger is a derived view, not a canonical file destination")
         return item.id
     from app.tv_publication_authority import validate_request_authority
     try:
         validate_request_authority(item)
+        music_video.validate_publication(item)
+        album = item_album(item)
+        if album is not None:
+            store.declare_music_album(album.owner_user_id, {"import_group_id": str(album.import_group_id), "artist_name": album.artist_name, "album_title": album.album_title})
     except ValueError as error:
         store.record_move_result(item.id, "move_failed", "Vault Master worker", str(error))
         return item.id
-    if item.proposed_category in {"Movies", "TV Shows"}:
+    if item.proposed_category in {"Movies", "TV Shows", "Music", music_video.ASSET_TYPE, "Gallery", "Documents", "Archives"}:
         if theatre_queue is None:
             store.record_move_result(item.id, "move_failed", "Vault Master worker", "Theatre publisher is unavailable")
             return item.id
         try:
             request_id = theatre_queue(item)
-            store.mark_theatre_promotion_pending(item.id, request_id if isinstance(request_id, UUID) else None)
+            store.mark_theatre_promotion_pending(
+                item.id, request_id if isinstance(request_id, UUID) else None
+            )
         except (OSError, ValueError) as error:
             store.record_move_result(item.id, "move_failed", "Vault Master worker", str(error))
         return item.id
@@ -3650,7 +3879,7 @@ def get_inventory_paths() -> tuple[Path, ...]:
     configured = os.getenv(
         "PV_VAULT_MASTER_INVENTORY_PATHS",
         (
-            "/media/movies,/media/gallery,/media/personal-videos,"
+            "/media/movies,/media/gallery,/vault/Home Videos,"
             "/media/documents,/media/archives,/media/music,/media/tv"
             ",/media/library"
         ),
@@ -3662,7 +3891,7 @@ def get_inventory_paths() -> tuple[Path, ...]:
     )
 
 
-class MemoryVaultMasterStore:
+class MemoryVaultMasterStore(MemoryMusicGroups):
     def __init__(
         self,
         sidecar_root: Path | None = None,
@@ -3869,14 +4098,19 @@ class MemoryVaultMasterStore:
                     if existing
                     else (
                         VAULT_WIDE_ASSET_VISIBILITY
-                        if item.proposed_category in {"Movies", "TV Shows"} and item.publication_audience != "private"
+                        if item.proposed_category in {"Movies", "TV Shows", "Music", music_video.ASSET_TYPE} and item.publication_audience != "private"
                         else PRIVATE_ASSET_VISIBILITY
                     )
                 ),
                 shared_with=existing.shared_with if existing else (),
                 shared_with_user_ids=existing.shared_with_user_ids if existing else (),
             )
+        album = item_album(item)
+        if album is not None:
+            self.declare_music_album(album.owner_user_id, {"import_group_id": str(album.import_group_id), "artist_name": album.artist_name, "album_title": album.album_title})
         self.catalogued_assets[vault_path] = published
+        if album is not None:
+            self.bind_music_album(album.id, album.owner_user_id, [published.id])
         self._export_sidecar(published)
         return published
 
@@ -3934,6 +4168,7 @@ class MemoryVaultMasterStore:
         }
         return batch_id
 
+    @serialized_publication
     def record_file(
         self,
         batch_id: UUID,
@@ -3941,12 +4176,10 @@ class MemoryVaultMasterStore:
         scanned_file: ScannedFile,
     ) -> ImportItem:
         existing = self.items.get(scanned_file.source_path)
-        if existing and existing.metadata.get("tv_resolver_batch_id"):
-            if (existing.sha256 != scanned_file.sha256
-                or existing.size_bytes != scanned_file.size_bytes
-                or (scanned_file.owner_user_id is not None and existing.owner_user_id != scanned_file.owner_user_id)):
-                raise ValueError("Rescan conflicts with approved TV resolver evidence")
-            return existing
+        if (source_kind == INCOMING_SOURCE and existing is not None
+                and existing.state in {"move_queued", "moving", "theatre_promotion_pending"}):
+            return existing  # publication owns the immutable source snapshot
+
         state = (
             "inventoried"
             if source_kind == INVENTORY_SOURCE
@@ -3957,6 +4190,8 @@ class MemoryVaultMasterStore:
             if source_kind == INCOMING_SOURCE
             else (None, None, None, None)
         )
+        if proposal[0] == music_video.ASSET_TYPE:
+            state = "approved"
         proposed_category = (
             existing.proposed_category
             if existing
@@ -4009,6 +4244,7 @@ class MemoryVaultMasterStore:
                     "theatre_promotion_pending",
                     "duplicate_kept",
                     "duplicate_remove_failed",
+                    "arrival_removed",
                 }
                 else state
             ),
@@ -4047,7 +4283,7 @@ class MemoryVaultMasterStore:
                 }
                 else proposal[3]
             ),
-            metadata=scanned_file.metadata,
+            metadata=retain_arrival_processing_evidence(scanned_file, existing.sha256 if existing else None, existing.metadata if existing else {}),
             metadata_overrides=(
                 existing.metadata_overrides if existing else {}
             ),
@@ -4074,6 +4310,9 @@ class MemoryVaultMasterStore:
             batch_id=batch_id,
             item=item,
         )
+        if (item.proposed_category == music_video.ASSET_TYPE and item.state == "approved"
+                and item.duplicate_of_id is None and item.proposal_reason == "Explicit owner-declared Music Video."):
+            item = self.queue_move(item.id, str(item.owner_user_id)) or item
         return item
 
     def complete_batch(self, batch_id: UUID, item_count: int) -> None:
@@ -4227,6 +4466,7 @@ class MemoryVaultMasterStore:
             None,
         )
 
+    @serialized_publication
     def update_proposal(
         self,
         item_id: UUID,
@@ -4347,6 +4587,8 @@ class MemoryVaultMasterStore:
         if entry is None:
             return None
         vault_path, asset = entry
+        if asset.asset_type == 'Home Videos' and asset.lifecycle_state == 'hidden' and visibility != 'private':
+            raise ValueError('Hidden videos must be restored before sharing.')
         updated = apply_catalogue_access_changes(
             asset,
             visibility,
@@ -4376,6 +4618,7 @@ class MemoryVaultMasterStore:
         )
         return updated
 
+    @serialized_publication
     def update_metadata_overrides(
         self,
         item_id: UUID,
@@ -4384,7 +4627,7 @@ class MemoryVaultMasterStore:
     ) -> ImportItem | None:
         del username
         item = self._find_item(item_id)
-        if item is None or item.source_kind != INCOMING_SOURCE:
+        if item is None or item.source_kind != INCOMING_SOURCE or item.state == "arrival_removed":
             return None
         overrides = dict(item.metadata_overrides)
         for name, value in changes.items():
@@ -4402,12 +4645,15 @@ class MemoryVaultMasterStore:
         self.items[item.source_path] = updated
         return updated
 
+    @serialized_publication
     def record_decision(
         self, item_id: UUID, decision: str, username: str
     ) -> ImportItem | None:
         item = self._find_item(item_id)
         if item is None or item.source_kind != INCOMING_SOURCE:
             return None
+        if item.state == "arrival_removed":
+            return item if decision == "arrival_removed" else None
         values = {**item.__dict__, "state": decision}
         if (
             decision == "approved"
@@ -4492,6 +4738,15 @@ class MemoryVaultMasterStore:
             for vault_path, asset in self.get_catalogued_assets(
                 vault_paths
             ).items()
+            if asset_is_visible_to(asset, username)
+        }
+
+    def filter_visible_catalogued_assets(
+        self, assets: dict[str, CataloguedAsset], username: str
+    ) -> dict[str, CataloguedAsset]:
+        return {
+            vault_path: asset
+            for vault_path, asset in assets.items()
             if asset_is_visible_to(asset, username)
         }
 
@@ -4587,6 +4842,66 @@ class MemoryVaultMasterStore:
             key=lambda asset: (asset.filename.casefold(), str(asset.id)),
         )
 
+    def gallery_page_paths(
+        self, owner_user_id: UUID, shared_asset_ids: list[UUID],
+        lifecycle_state: str, sort_order: str, date_from: date | None,
+        date_to: date | None, matching_asset_ids: list[UUID] | None,
+        after: tuple[date | None, str, str] | None, limit: int,
+        inclusive: bool = False, reverse: bool = False,
+    ) -> list[str]:
+        shared = set(shared_asset_ids)
+        matching = set(matching_asset_ids) if matching_asset_ids is not None else None
+
+        def key(asset: CataloguedAsset) -> tuple[bool, int, str, str]:
+            captured = asset.captured_on
+            return (
+                captured is None,
+                (-captured.toordinal() if sort_order == "newest" else captured.toordinal())
+                if captured is not None else 0,
+                asset.filename.casefold(),
+                asset.vault_path,
+            )
+
+        after_key = (
+            (after[0] is None,
+             (-after[0].toordinal() if sort_order == "newest" else after[0].toordinal())
+             if after[0] is not None else 0,
+             after[1], after[2])
+            if after is not None else None
+        )
+        candidates = (
+            asset for asset in self.catalogued_assets.values()
+            if asset.vault_path.startswith("/vault/Gallery/")
+            and asset.asset_type.casefold() == "gallery"
+            and (asset.owner_user_id == owner_user_id or asset.id in shared)
+            and asset.lifecycle_state == lifecycle_state
+            and (date_from is None or (asset.captured_on is not None and asset.captured_on >= date_from))
+            and (date_to is None or (asset.captured_on is not None and asset.captured_on <= date_to))
+            and (matching is None or asset.id in matching)
+            and (after_key is None or (
+                (key(asset) <= after_key if inclusive else key(asset) < after_key)
+                if reverse else (key(asset) >= after_key if inclusive else key(asset) > after_key)
+            ))
+        )
+        return [asset.vault_path for asset in sorted(candidates, key=key, reverse=reverse)[:limit]]
+
+    def gallery_chronology(
+        self, owner_user_id: UUID, shared_asset_ids: list[UUID],
+        lifecycle_state: str, sort_order: str, date_from: date | None,
+        date_to: date | None, matching_asset_ids: list[UUID] | None,
+    ) -> list[tuple[date | None, str, str, int]]:
+        paths = self.gallery_page_paths(owner_user_id, shared_asset_ids, lifecycle_state,
+            sort_order, date_from, date_to, matching_asset_ids, None, len(self.catalogued_assets))
+        groups = {}
+        for path in paths:
+            asset = self.catalogued_assets[path]
+            captured = asset.captured_on
+            period = (captured.year, captured.month) if captured else None
+            if period not in groups:
+                groups[period] = [captured, asset.filename.casefold(), path, 0]
+            groups[period][3] += 1
+        return [tuple(value) for value in groups.values()]
+
     def set_movie_exclusive_state(
         self, asset_id: UUID, username: str, is_exclusive: bool
     ) -> CataloguedAsset | None:
@@ -4637,6 +4952,19 @@ class MemoryVaultMasterStore:
             key=lambda asset: str(asset.id),
         )
 
+    def list_catalogued_placement_candidates_by_vault_path_prefix(
+        self, prefix: str
+    ) -> list[CataloguedPlacementCandidate]:
+        return [
+            CataloguedPlacementCandidate(
+                vault_path=asset.vault_path,
+                asset_type=asset.asset_type,
+                has_storage_placement="storage_placement" in asset.metadata,
+                storage_placement=asset.metadata.get("storage_placement"),
+            )
+            for asset in self.list_catalogued_assets_by_vault_path_prefix(prefix)
+        ]
+
     def update_catalogued_assets_access(
         self, asset_ids: list[UUID], visibility: str, shared_with: tuple[str, ...], username: str,
         *, local_all: bool = False, share_mode: Literal["quick", "standard"] = "quick", shared_with_user_ids: tuple[UUID, ...] = (),
@@ -4674,6 +5002,64 @@ class MemoryVaultMasterStore:
             )
             if asset_is_visible_to(asset, username)
         ][:limit]
+
+    def search_recoverable_catalogued_assets(
+        self, query: str, owner_user_id: UUID, limit: int = 50
+    ) -> list[CataloguedAsset]:
+        terms = query.strip().casefold().split()
+        if not terms:
+            return []
+        return sorted((
+            asset for asset in self.catalogued_assets.values()
+            if asset.owner_user_id == owner_user_id
+            and all(term in " ".join((
+                asset.display_title, asset.filename, asset.vault_path,
+                asset.asset_type, asset.location or "",
+                asset.captured_on.isoformat() if asset.captured_on else "",
+                json.dumps(asset.metadata, default=str),
+                json.dumps(asset.detected_metadata, default=str),
+                json.dumps(asset.imported_metadata, default=str),
+                json.dumps(asset.effective_metadata, default=str),
+            )).casefold() for term in terms)
+        ), key=lambda asset: (asset.display_title.casefold(), str(asset.id)))[:limit]
+
+    def set_catalogued_asset_deleted(
+        self, asset_id: UUID, owner_user_id: UUID, username: str
+    ) -> CataloguedAsset | None:
+        asset = self.get_catalogued_asset_by_id(asset_id)
+        if asset is None or asset.owner_user_id != owner_user_id or asset.lifecycle_state == "deleted":
+            return None
+        updated = replace(asset, lifecycle_state="deleted", visibility="private",
+                          shared_with=(), shared_with_user_ids=())
+        self.catalogued_assets[asset.vault_path] = updated
+        self.asset_history.append({
+            "id": uuid4(), "asset_id": asset_id, "action": "asset_deleted",
+            "username": username, "actor_user_id": owner_user_id,
+            "previous_values": {"lifecycle_state": asset.lifecycle_state, "visibility": asset.visibility},
+            "current_values": {"lifecycle_state": "deleted", "original_section": asset.asset_type},
+            "created_at": datetime.now(timezone.utc),
+        })
+        return updated
+
+    def restore_catalogued_asset_deleted(
+        self, asset_id: UUID, owner_user_id: UUID, username: str
+    ) -> CataloguedAsset | None:
+        asset = self.get_catalogued_asset_by_id(asset_id)
+        if asset is None or asset.owner_user_id != owner_user_id or asset.lifecycle_state != "deleted":
+            return None
+        if not canonical_section_matches_asset(asset):
+            raise ValueError("Original logical section is unavailable")
+        updated = replace(asset, lifecycle_state="active", visibility="private",
+                          shared_with=(), shared_with_user_ids=())
+        self.catalogued_assets[asset.vault_path] = updated
+        self.asset_history.append({
+            "id": uuid4(), "asset_id": asset_id, "action": "asset_restored",
+            "username": username, "actor_user_id": owner_user_id,
+            "previous_values": {"lifecycle_state": "deleted", "original_section": asset.asset_type},
+            "current_values": {"lifecycle_state": "active", "section": asset.asset_type},
+            "created_at": datetime.now(timezone.utc),
+        })
+        return updated
 
     def update_catalogued_asset_metadata(
         self,
@@ -5332,6 +5718,7 @@ class MemoryVaultMasterStore:
         self.asset_history.append(entry)
         return dict(entry)
 
+    @serialized_publication
     def record_move_result(
         self,
         item_id: UUID,
@@ -5343,7 +5730,7 @@ class MemoryVaultMasterStore:
         item = self._find_item(item_id)
         if item is None:
             return None
-        if state == "move_failed" and item.state == "moved":
+        if item.state == "arrival_removed" or (state == "move_failed" and item.state == "moved"):
             return item
         updated = ImportItem(**{**item.__dict__, "state": state})
         self.items[item.source_path] = updated
@@ -5392,6 +5779,7 @@ class MemoryVaultMasterStore:
         )
         return updated
 
+    @serialized_publication
     def queue_move(self, item_id: UUID, username: str) -> ImportItem | None:
         item = self._find_item(item_id)
         if item is None or item.state not in {"approved", "move_failed"}:
@@ -5432,21 +5820,28 @@ class MemoryVaultMasterStore:
         self.items[item.source_path] = updated
         return updated
 
+    def completed_arrival_request_ids(self) -> set[str]:
+        return {str(receipt["request_id"]) for item_id, receipt in self.arrival_managed_publications.items()
+                if (item := self.get_item(item_id)) is not None and item.state == "moved"
+                and self.get_catalogued_asset_by_id(UUID(str(receipt["asset_id"]))) is not None}
+
+    @serialized_publication
     def publish_arrival_managed_receipt(
         self, item_id: UUID, receipt: dict[str, object]
     ) -> CataloguedAsset | None:
         item = self._find_item(item_id)
-        if item is None or item.proposed_category != "Movies" or item.owner_user_id is None:
+        if item is None or item.proposed_category not in {"Movies", "Music", music_video.ASSET_TYPE, "Gallery", "Documents", "Archives"} or item.owner_user_id is None:
             return None
         destination = item.proposed_destination or proposed_destination_path(
-            "Movies", item.relative_path, item.filename
+            item.proposed_category, item.relative_path, item.filename
         )
         expected_relative = destination.removeprefix("/vault/")
         if (
             receipt.get("item_id") != str(item.id)
+            or not arrival_routing_receipt_matches(item, receipt)
             or receipt.get("owner_user_id") != str(item.owner_user_id)
             or receipt.get("logical_destination") != destination
-            or receipt.get("logical_area") != "Theatre / Movies"
+            or receipt.get("logical_area") != (item.proposed_category if item.proposed_category in {"Gallery", "Documents", "Archives"} else "Music" if item.proposed_category in {"Music", music_video.ASSET_TYPE} else "Theatre / Movies")
             or receipt.get("relative_path") != expected_relative
             or receipt.get("expected_sha256") != item.sha256
             or receipt.get("expected_size_bytes") != item.size_bytes
@@ -5636,7 +6031,7 @@ class MemoryVaultMasterStore:
         return updated
 
 
-class PostgresVaultMasterStore:
+class PostgresVaultMasterStore(PostgresMusicGroups):
     def __init__(
         self,
         conninfo: str,
@@ -5686,7 +6081,7 @@ class PostgresVaultMasterStore:
                         asset.metadata_provenance, asset.detected_metadata,
                         asset.imported_metadata, asset.user_overrides,
                         asset.effective_metadata, asset.owner_username, asset.owner_user_id,
-                        asset.origin_vault_id, asset.visibility, asset.shared_with, file.vault_path,
+                        asset.origin_vault_id, asset.visibility, asset.shared_with, asset.lifecycle_state, file.vault_path,
                         file.filename, file.size_bytes, file.mime_type,
                         file.sha256
                     FROM vault_files AS file
@@ -5912,7 +6307,17 @@ class PostgresVaultMasterStore:
         username: str,
         asset_ids: list[UUID],
     ) -> set[UUID]:
-        user_id = active_user_id(cursor, username)
+        if hasattr(username, "user_id"):
+            user_id = getattr(username, "user_id", None)
+            if not isinstance(user_id, UUID):
+                return set()
+            cursor.execute("SELECT user_id FROM auth_accounts WHERE user_id=%s AND active=TRUE", (user_id,))
+            if cursor.fetchone() is None:
+                return set()
+        else:
+            # Legacy internal callers remain supported; authenticated routes
+            # always carry immutable identity and must never resolve its label.
+            user_id = active_user_id(cursor, username)
         if user_id is None:
             return set()
         return visible_asset_ids(cursor, user_id, asset_ids)
@@ -6076,7 +6481,7 @@ class PostgresVaultMasterStore:
                         if existing_file
                         else (
                             VAULT_WIDE_ASSET_VISIBILITY
-                            if item.proposed_category in {"Movies", "TV Shows"} and item.publication_audience != "private"
+                            if item.proposed_category in {"Movies", "TV Shows", "Music", music_video.ASSET_TYPE} and item.publication_audience != "private"
                             else PRIVATE_ASSET_VISIBILITY
                         )
                     ),
@@ -6184,9 +6589,16 @@ class PostgresVaultMasterStore:
                 ),
             )
 
+        album = item_album(item)
+        if album is not None:
+            album = ensure_album(cursor, album)
+            bind_members(cursor, album, [asset_id])
+
     def initialize(self) -> None:
         with self._connect() as connection:
             with connection.cursor() as cursor:
+                from app.arrival_incremental_scan import CHECKPOINT_SCHEMA
+                cursor.execute(CHECKPOINT_SCHEMA)
                 cursor.execute(
                     """
                     CREATE TABLE IF NOT EXISTS vaults (
@@ -6403,7 +6815,7 @@ class PostgresVaultMasterStore:
                         CONSTRAINT vault_assets_visibility_check
                             CHECK (visibility IN ('private', 'shared', 'vault-wide')),
                         CONSTRAINT vault_assets_lifecycle_state_check
-                            CHECK (lifecycle_state IN ('active', 'hidden')),
+                            CHECK (lifecycle_state IN ('active', 'hidden', 'deleted')),
                         created_at TIMESTAMPTZ NOT NULL
                             DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMPTZ NOT NULL
@@ -6443,7 +6855,7 @@ class PostgresVaultMasterStore:
                 )
                 cursor.execute(
                     "ALTER TABLE vault_assets ADD CONSTRAINT vault_assets_lifecycle_state_check "
-                    "CHECK (lifecycle_state IN ('active', 'hidden'))"
+                    "CHECK (lifecycle_state IN ('active', 'hidden', 'deleted'))"
                 )
                 cursor.execute(
                     "CREATE INDEX IF NOT EXISTS vault_assets_lifecycle_state_idx "
@@ -6640,6 +7052,20 @@ class PostgresVaultMasterStore:
                     )
                     """
                 )
+                # Development uses independently commissioned PV-DEV-DISK
+                # slots. Keep the production slot grammar intact while
+                # accepting that explicit isolated-development namespace.
+                # Replacing the named generated CHECK is idempotent for
+                # existing Development catalogues.
+                cursor.execute(
+                    "ALTER TABLE vault_storage_slots "
+                    "DROP CONSTRAINT IF EXISTS vault_storage_slots_slot_id_check"
+                )
+                cursor.execute(
+                    "ALTER TABLE vault_storage_slots "
+                    "ADD CONSTRAINT vault_storage_slots_slot_id_check "
+                    "CHECK (slot_id ~ '^PV(-DEV)?-DISK-[0-9]{3,}$')"
+                )
                 cursor.execute(
                     """
                     CREATE TABLE IF NOT EXISTS vault_file_storage_placements (
@@ -6703,10 +7129,14 @@ class PostgresVaultMasterStore:
                         file_id UUID NOT NULL UNIQUE REFERENCES vault_files(id) ON DELETE RESTRICT,
                         slot_id TEXT NOT NULL REFERENCES vault_storage_slots(slot_id),
                         relative_path TEXT NOT NULL,
+                        routing_decision_id UUID,
+                        routing_authorization_id UUID,
                         published_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
                     )
                     """
                 )
+                cursor.execute("ALTER TABLE vault_arrival_managed_publications ADD COLUMN IF NOT EXISTS routing_decision_id UUID")
+                cursor.execute("ALTER TABLE vault_arrival_managed_publications ADD COLUMN IF NOT EXISTS routing_authorization_id UUID")
                 cursor.execute(
                     """
                     CREATE TABLE IF NOT EXISTS vault_asset_relationships (
@@ -6743,12 +7173,16 @@ class PostgresVaultMasterStore:
                             REFERENCES vault_assets(id),
                         action TEXT NOT NULL,
                         username TEXT NOT NULL,
+                        actor_user_id UUID,
                         previous_values JSONB NOT NULL,
                         current_values JSONB NOT NULL,
                         created_at TIMESTAMPTZ NOT NULL
                             DEFAULT CURRENT_TIMESTAMP
                     )
                     """
+                )
+                cursor.execute(
+                    "ALTER TABLE vault_asset_history ADD COLUMN IF NOT EXISTS actor_user_id UUID"
                 )
                 cursor.execute(
                     """
@@ -6892,6 +7326,9 @@ class PostgresVaultMasterStore:
                     ))
                     """
                 )
+
+                initialize_music_groups(cursor)
+                migrate_music_local_visibility(cursor, self._local_vault_id(cursor))
 
     def migrate_source_root(
         self,
@@ -7136,6 +7573,7 @@ class PostgresVaultMasterStore:
         row = cursor.fetchone()
         return UUID(str(row["id"])) if row is not None else None
 
+    @serialized_publication
     def record_file(
         self,
         batch_id: UUID,
@@ -7153,6 +7591,8 @@ class PostgresVaultMasterStore:
             if source_kind == INCOMING_SOURCE
             else (None, None, None, None)
         )
+        if proposal[0] == music_video.ASSET_TYPE:
+            state = "approved"
         with self._connect() as connection:
             with connection.cursor() as cursor:
                 if scanned_file.owner_user_id is not None:
@@ -7180,21 +7620,13 @@ class PostgresVaultMasterStore:
                     SELECT *
                     FROM vault_master_items
                     WHERE source_path = %s
-                    FOR UPDATE
                     """,
                     (scanned_file.source_path,),
                 )
                 existing = cursor.fetchone()
-                if existing is not None and source_kind == INCOMING_SOURCE:
-                    from app.tv_publication_authority import approved_projection
-                    protected = self._to_item(existing)
-                    if approved_projection(cursor, protected) is not None:
-                        if (protected.sha256 != scanned_file.sha256
-                            or protected.size_bytes != scanned_file.size_bytes
-                            or protected.owner_user_id != owner_user_id):
-                            raise ValueError("Rescan conflicts with approved TV resolver evidence")
-                        # Approval is a durable decision, not fresh scan metadata.
-                        return protected
+                if (source_kind == INCOMING_SOURCE and existing is not None
+                        and existing["state"] in {"move_queued", "moving", "theatre_promotion_pending"}):
+                    return self._to_item(existing)
                 effective_category = proposal[0]
                 if (
                     existing is not None
@@ -7240,7 +7672,7 @@ class PostgresVaultMasterStore:
                                 'approved', 'rejected', 'move_failed',
                                 'move_queued', 'moving', 'theatre_promotion_pending',
                                 'duplicate_kept',
-                                'duplicate_remove_failed'
+                                'duplicate_remove_failed', 'arrival_removed'
                             )
                             THEN vault_master_items.state
                             ELSE EXCLUDED.state
@@ -7305,7 +7737,7 @@ class PostgresVaultMasterStore:
                         proposal[1],
                         proposal[2],
                         proposal[3],
-                        Jsonb(scanned_file.metadata),
+                        Jsonb(retain_arrival_processing_evidence(scanned_file, existing["sha256"] if existing else None, existing["metadata"] if existing else {})),
                         owner_username,
                         owner_user_id,
                     ),
@@ -7348,6 +7780,9 @@ class PostgresVaultMasterStore:
             asset = self.get_catalogued_asset(sidecar_vault_path)
             if asset:
                 self._export_sidecar(asset)
+        if (item.proposed_category == music_video.ASSET_TYPE and item.state == "approved"
+                and item.duplicate_of_id is None and item.proposal_reason == "Explicit owner-declared Music Video."):
+            item = self.queue_move(item.id, str(item.owner_user_id)) or item
         return item
 
     def complete_batch(self, batch_id: UUID, item_count: int) -> None:
@@ -7537,6 +7972,7 @@ class PostgresVaultMasterStore:
                 rows = cursor.fetchall()
         return [VaultMasterActivity(**row) for row in rows]
 
+    @serialized_publication
     def update_proposal(
         self,
         item_id: UUID,
@@ -7551,7 +7987,7 @@ class PostgresVaultMasterStore:
                     """
                     SELECT relative_path, filename
                     FROM vault_master_items
-                    WHERE id = %s AND source_kind = 'incoming'
+                    WHERE id = %s AND source_kind = 'incoming' AND state IN ('needs_review','approved','rejected','move_failed')
                     """,
                     (item_id,),
                 )
@@ -7568,7 +8004,7 @@ class PostgresVaultMasterStore:
                         publication_audience = %s,
                         state = 'needs_review',
                         updated_at = CURRENT_TIMESTAMP
-                    WHERE id = %s AND source_kind = 'incoming'
+                    WHERE id = %s AND source_kind = 'incoming' AND state IN ('needs_review','approved','rejected','move_failed')
                     RETURNING *
                     """,
                     (
@@ -7881,6 +8317,7 @@ class PostgresVaultMasterStore:
             for publication in published_assets.values()
         )
 
+    @serialized_publication
     def record_decision(
         self, item_id: UUID, decision: str, username: str
     ) -> ImportItem | None:
@@ -7897,6 +8334,8 @@ class PostgresVaultMasterStore:
                 if current_row is None:
                     return None
                 current = self._to_item(current_row)
+                if current.state == "arrival_removed":
+                    return current if decision == "arrival_removed" else None
                 destination = current.proposed_destination
                 tv_set_evidence: dict[str, object] | None = None
                 if (
@@ -8007,6 +8446,7 @@ class PostgresVaultMasterStore:
                 self._export_sidecar(asset)
         return result
 
+    @serialized_publication
     def update_metadata_overrides(
         self,
         item_id: UUID,
@@ -8254,6 +8694,24 @@ class PostgresVaultMasterStore:
             str(row["vault_path"]): _catalogued_asset_from_row(row)
             for row in rows
             if UUID(str(row["id"])) in allowed
+            and home_video_access_allowed(_catalogued_asset_from_row(row), username)
+        }
+
+    def filter_visible_catalogued_assets(
+        self, assets: dict[str, CataloguedAsset], username: str
+    ) -> dict[str, CataloguedAsset]:
+        """Apply the live grant evaluator to already-loaded catalogue rows."""
+        if not assets:
+            return {}
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                allowed = self._visible_asset_ids_for_username(
+                    cursor, username, [asset.id for asset in assets.values()]
+                )
+        return {
+            vault_path: asset
+            for vault_path, asset in assets.items()
+            if asset.id in allowed and home_video_access_allowed(asset, username)
         }
 
     def get_catalogued_asset_by_id(
@@ -8302,6 +8760,7 @@ class PostgresVaultMasterStore:
                         asset.origin_vault_id,
                         asset.visibility,
                         asset.shared_with,
+                        asset.lifecycle_state,
                         file.vault_path,
                         file.filename,
                         file.size_bytes,
@@ -8328,7 +8787,7 @@ class PostgresVaultMasterStore:
                       asset.location, asset.metadata, asset.metadata_provenance,
                       asset.detected_metadata, asset.imported_metadata, asset.user_overrides,
                       asset.effective_metadata, asset.owner_username, asset.owner_user_id,
-                      asset.origin_vault_id, asset.visibility, asset.shared_with, file.vault_path,
+                      asset.origin_vault_id, asset.visibility, asset.shared_with, asset.lifecycle_state, file.vault_path,
                       file.filename, file.size_bytes, file.mime_type, file.sha256
                     FROM vault_files AS file JOIN vault_assets AS asset ON asset.id=file.asset_id
                     WHERE asset.owner_user_id=%s ORDER BY lower(file.filename), asset.id
@@ -8352,7 +8811,7 @@ class PostgresVaultMasterStore:
                         asset.imported_metadata, asset.user_overrides,
                         asset.effective_metadata, asset.owner_username,
                         asset.owner_user_id, asset.origin_vault_id,
-                        asset.visibility, asset.shared_with, file.vault_path,
+                        asset.visibility, asset.shared_with, asset.lifecycle_state, file.vault_path,
                         file.filename, file.size_bytes, file.mime_type, file.sha256
                     FROM vault_assets AS asset
                     JOIN vault_files AS file ON file.asset_id = asset.id
@@ -8367,7 +8826,110 @@ class PostgresVaultMasterStore:
             _catalogued_asset_from_row(row)
             for row in rows
             if UUID(str(row["id"])) in allowed
+            and home_video_access_allowed(_catalogued_asset_from_row(row), username)
         ]
+
+    @staticmethod
+    def _gallery_scope(owner_user_id, shared_asset_ids, lifecycle_state, sort_order,
+                       date_from, date_to, matching_asset_ids):
+        if sort_order not in {"newest", "oldest"}:
+            raise ValueError("Unsupported Gallery sort")
+        clauses = [
+            "file.vault_path LIKE '/vault/Gallery/%%'",
+            "lower(asset.asset_type) = 'gallery'",
+            "(asset.owner_user_id = %s OR asset.id = ANY(%s))",
+            "asset.lifecycle_state = %s",
+        ]
+        params: list[object] = [owner_user_id, shared_asset_ids, lifecycle_state]
+        if date_from is not None:
+            clauses.append("asset.captured_on >= %s")
+            params.append(date_from)
+        if date_to is not None:
+            clauses.append("asset.captured_on <= %s")
+            params.append(date_to)
+        if matching_asset_ids is not None:
+            clauses.append("asset.id = ANY(%s)")
+            params.append(matching_asset_ids)
+        return clauses, params
+
+    def gallery_chronology(
+        self, owner_user_id: UUID, shared_asset_ids: list[UUID],
+        lifecycle_state: str, sort_order: str, date_from: date | None,
+        date_to: date | None, matching_asset_ids: list[UUID] | None,
+    ) -> list[tuple[date | None, str, str, int]]:
+        clauses, params = self._gallery_scope(owner_user_id, shared_asset_ids,
+            lifecycle_state, sort_order, date_from, date_to, matching_asset_ids)
+        direction = 'DESC' if sort_order == 'newest' else 'ASC'
+        # One catalogue query, one row per represented month; no file access or
+        # full asset metadata. The first tuple is an inclusive page seek token.
+        query = (
+            "WITH scoped AS (SELECT asset.captured_on, lower(file.filename) AS name, "
+            "file.vault_path, date_trunc('month', asset.captured_on) AS period "
+            "FROM vault_files file JOIN vault_assets asset ON asset.id = file.asset_id "
+            f"WHERE {' AND '.join(clauses)}), grouped AS ("
+            "SELECT captured_on, name, vault_path, "
+            "count(*) OVER (PARTITION BY period) AS count, "
+            f"row_number() OVER (PARTITION BY period ORDER BY captured_on {direction} NULLS LAST, "
+            "name, vault_path) AS position FROM scoped) "
+            "SELECT captured_on, name, vault_path, count FROM grouped WHERE position = 1 "
+            f"ORDER BY captured_on {direction} NULLS LAST, name, vault_path"
+        )
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [(row['captured_on'], row['name'], row['vault_path'], int(row['count'])) for row in rows]
+
+    def gallery_page_paths(
+        self, owner_user_id: UUID, shared_asset_ids: list[UUID],
+        lifecycle_state: str, sort_order: str, date_from: date | None,
+        date_to: date | None, matching_asset_ids: list[UUID] | None,
+        after: tuple[date | None, str, str] | None, limit: int,
+        inclusive: bool = False, reverse: bool = False,
+    ) -> list[str]:
+        """Select a bounded Gallery page before loading catalogue metadata or files.
+
+        The shared IDs come from the request-time grant evaluator. Callers must
+        recheck visibility before presenting these paths because grants can be
+        revoked between the two queries.
+        """
+        clauses, params = self._gallery_scope(owner_user_id, shared_asset_ids,
+            lifecycle_state, sort_order, date_from, date_to, matching_asset_ids)
+        direction = "DESC" if sort_order == "newest" else "ASC"
+        if reverse:
+            direction = "ASC" if direction == "DESC" else "DESC"
+        if after is not None:
+            captured, folded_name, vault_path = after
+            tie = ("<=" if inclusive else "<") if reverse else (">=" if inclusive else ">")
+            if captured is None:
+                predicate = f"(asset.captured_on IS NULL AND (lower(file.filename), file.vault_path) {tie} (%s, %s))"
+                if reverse:
+                    predicate = f"(asset.captured_on IS NOT NULL OR {predicate})"
+                clauses.append(predicate)
+                params.extend((folded_name, vault_path))
+            else:
+                comparison = "<" if direction == "DESC" else ">"
+                predicate = (
+                    f"(asset.captured_on {comparison} %s OR (asset.captured_on = %s AND "
+                    f"(lower(file.filename), file.vault_path) {tie} (%s, %s)))"
+                )
+                if not reverse:
+                    predicate = f"(asset.captured_on IS NULL OR {predicate})"
+                clauses.append(predicate)
+                params.extend((captured, captured, folded_name, vault_path))
+        nulls = "FIRST" if reverse else "LAST"
+        tie_direction = "DESC" if reverse else "ASC"
+        query = (
+            "SELECT file.vault_path FROM vault_files AS file "
+            "JOIN vault_assets AS asset ON asset.id = file.asset_id "
+            f"WHERE {' AND '.join(clauses)} "
+            f"ORDER BY asset.captured_on {direction} NULLS {nulls}, "
+            f"lower(file.filename) {tie_direction}, file.vault_path {tie_direction} LIMIT %s"
+        )
+        params.append(limit)
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(query, params)
+                rows = cursor.fetchall()
+        return [str(row["vault_path"]) for row in rows]
 
     def search_catalogued_assets(
         self, query: str, limit: int = 50
@@ -8397,6 +8959,7 @@ class PostgresVaultMasterStore:
                         asset.origin_vault_id,
                         asset.visibility,
                         asset.shared_with,
+                        asset.lifecycle_state,
                         file.vault_path,
                         file.filename,
                         file.size_bytes,
@@ -8431,7 +8994,8 @@ class PostgresVaultMasterStore:
                 )
         if asset_id not in allowed:
             return None
-        return self.get_catalogued_asset_by_id(asset_id)
+        asset = self.get_catalogued_asset_by_id(asset_id)
+        return asset if asset is not None and home_video_access_allowed(asset, username) else None
 
     def list_visible_movie_assets(
         self, username: str
@@ -8445,7 +9009,7 @@ class PostgresVaultMasterStore:
                            asset.metadata_provenance, asset.detected_metadata,
                            asset.imported_metadata, asset.user_overrides,
                            asset.effective_metadata, asset.owner_username, asset.owner_user_id,
-                           asset.origin_vault_id, asset.visibility, asset.shared_with, file.vault_path,
+                           asset.origin_vault_id, asset.visibility, asset.shared_with, asset.lifecycle_state, file.vault_path,
                            file.filename, file.size_bytes, file.mime_type, file.sha256
                     FROM vault_assets AS asset
                     JOIN LATERAL (
@@ -8466,6 +9030,7 @@ class PostgresVaultMasterStore:
             _catalogued_asset_from_row(row)
             for row in rows
             if UUID(str(row["id"])) in allowed
+            and home_video_access_allowed(_catalogued_asset_from_row(row), username)
         ]
 
     def set_movie_exclusive_state(
@@ -8509,14 +9074,74 @@ class PostgresVaultMasterStore:
         with self._connect() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    "SELECT DISTINCT asset_id FROM vault_files WHERE vault_path LIKE %s ORDER BY asset_id",
+                    """
+                    SELECT asset.id, asset.asset_type, asset.display_title,
+                           asset.captured_on, asset.location, asset.metadata,
+                           asset.metadata_provenance, asset.detected_metadata,
+                           asset.imported_metadata, asset.user_overrides,
+                           asset.effective_metadata, asset.owner_username,
+                           asset.owner_user_id, asset.origin_vault_id,
+                           asset.visibility, asset.shared_with, asset.lifecycle_state,
+                           file.vault_path, file.filename, file.size_bytes,
+                           file.mime_type, file.sha256
+                    FROM (
+                        SELECT DISTINCT asset_id
+                        FROM vault_files
+                        WHERE vault_path LIKE %s
+                    ) AS matching
+                    JOIN vault_assets AS asset ON asset.id = matching.asset_id
+                    JOIN LATERAL (
+                        SELECT vault_path, filename, size_bytes, mime_type, sha256
+                        FROM vault_files
+                        WHERE asset_id = matching.asset_id
+                        ORDER BY (file_role = 'primary') DESC, created_at
+                        LIMIT 1
+                    ) AS file ON TRUE
+                    ORDER BY asset.id
+                    """,
                     (f"{prefix}%",),
                 )
-                asset_ids = [UUID(str(row["asset_id"])) for row in cursor.fetchall()]
+                rows = cursor.fetchall()
+        return [_catalogued_asset_from_row(row) for row in rows]
+
+    def list_catalogued_placement_candidates_by_vault_path_prefix(
+        self, prefix: str
+    ) -> list[CataloguedPlacementCandidate]:
+        """Use the same matching assets and preferred files with narrow rows."""
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT asset.asset_type,
+                           asset.metadata ? 'storage_placement' AS has_storage_placement,
+                           asset.metadata -> 'storage_placement' AS storage_placement,
+                           file.vault_path
+                    FROM (
+                        SELECT DISTINCT asset_id
+                        FROM vault_files
+                        WHERE vault_path LIKE %s
+                    ) AS matching
+                    JOIN vault_assets AS asset ON asset.id = matching.asset_id
+                    JOIN LATERAL (
+                        SELECT vault_path
+                        FROM vault_files
+                        WHERE asset_id = matching.asset_id
+                        ORDER BY (file_role = 'primary') DESC, created_at
+                        LIMIT 1
+                    ) AS file ON TRUE
+                    ORDER BY asset.id
+                    """,
+                    (f"{prefix}%",),
+                )
+                rows = cursor.fetchall()
         return [
-            asset
-            for asset_id in asset_ids
-            if (asset := self.get_catalogued_asset_by_id(asset_id)) is not None
+            CataloguedPlacementCandidate(
+                vault_path=str(row["vault_path"]),
+                asset_type=str(row["asset_type"]),
+                has_storage_placement=bool(row["has_storage_placement"]),
+                storage_placement=row["storage_placement"],
+            )
+            for row in rows
         ]
 
     def search_visible_catalogued_assets(
@@ -8547,6 +9172,7 @@ class PostgresVaultMasterStore:
                         asset.origin_vault_id,
                         asset.visibility,
                         asset.shared_with,
+                        asset.lifecycle_state,
                         file.vault_path,
                         file.filename,
                         file.size_bytes,
@@ -8581,7 +9207,86 @@ class PostgresVaultMasterStore:
             _catalogued_asset_from_row(row)
             for row in rows
             if UUID(str(row["id"])) in allowed
+            and home_video_access_allowed(_catalogued_asset_from_row(row), username)
         ]
+
+    def search_recoverable_catalogued_assets(
+        self, query: str, owner_user_id: UUID, limit: int = 50
+    ) -> list[CataloguedAsset]:
+        terms = query.strip().split()
+        if not terms:
+            return []
+        patterns = ["%" + term.replace("\\", "\\\\").replace("%", "\\%")
+                    .replace("_", "\\_") + "%" for term in terms]
+        with self._connect() as connection, connection.cursor() as cursor:
+            optional_sources = {
+                "vault_gallery_florence_evidence": """(
+                    SELECT string_agg(e.caption || ' ' || e.ocr_text, ' ')
+                    FROM vault_gallery_florence_evidence e WHERE e.asset_id=asset.id
+                )""",
+                "vault_publication_blocks": """(
+                    SELECT string_agg(block.content_text, ' ')
+                    FROM vault_publication_blocks block WHERE block.asset_id=asset.id
+                )""",
+                "vault_ken_runs": """(
+                    SELECT string_agg(run.result::text, ' ')
+                    FROM vault_ken_runs run
+                    WHERE run.asset_id=asset.id AND run.status='completed'
+                )""",
+            }
+            searchable = [
+                "asset.display_title", "file.filename", "file.vault_path",
+                "asset.asset_type", "asset.location", "asset.captured_on::text",
+                "asset.metadata::text", "asset.detected_metadata::text",
+                "asset.imported_metadata::text", "asset.user_overrides::text",
+                "asset.effective_metadata::text",
+                "(SELECT string_agg(other_file.filename, ' ') FROM vault_files other_file WHERE other_file.asset_id=asset.id)",
+            ]
+            for table_name, expression in optional_sources.items():
+                cursor.execute("SELECT to_regclass(%s) IS NOT NULL AS available", (table_name,))
+                if cursor.fetchone()["available"]:
+                    searchable.append(expression)
+            cursor.execute("""SELECT to_regclass('vault_asset_metadata_assignments') IS NOT NULL
+                          AND to_regclass('vault_metadata_terms') IS NOT NULL AS available""")
+            if cursor.fetchone()["available"]:
+                searchable.append("""(
+                    SELECT string_agg(term.slug || ' ' || term.display_name, ' ')
+                    FROM vault_asset_metadata_assignments assignment
+                    JOIN vault_metadata_terms term ON term.id=assignment.term_id
+                    WHERE assignment.asset_id=asset.id
+                )""")
+            cursor.execute("""SELECT to_regclass('user_gallery_custom_tag_assignments') IS NOT NULL
+                          AND to_regclass('user_gallery_custom_tags') IS NOT NULL AS available""")
+            if cursor.fetchone()["available"]:
+                searchable.append("""(
+                    SELECT string_agg(tag.slug || ' ' || tag.display_name, ' ')
+                    FROM user_gallery_custom_tag_assignments assignment
+                    JOIN user_gallery_custom_tags tag ON tag.id=assignment.tag_id
+                    WHERE assignment.asset_id=asset.id AND assignment.owner_user_id=asset.owner_user_id
+                )""")
+            search_text = ", ".join(searchable)
+            cursor.execute(f"""
+                SELECT asset.id, asset.asset_type, asset.display_title, asset.captured_on,
+                       asset.location, asset.metadata, asset.metadata_provenance,
+                       asset.detected_metadata, asset.imported_metadata,
+                       asset.user_overrides, asset.effective_metadata,
+                       asset.owner_username, asset.owner_user_id, asset.origin_vault_id,
+                       asset.visibility, asset.shared_with, asset.lifecycle_state,
+                       file.vault_path, file.filename, file.size_bytes, file.mime_type,
+                       file.sha256
+                FROM vault_assets AS asset
+                JOIN LATERAL (
+                    SELECT * FROM vault_files WHERE asset_id=asset.id
+                    ORDER BY (file_role='primary') DESC, created_at LIMIT 1
+                ) AS file ON TRUE
+                WHERE asset.owner_user_id=%s
+                  AND asset.lifecycle_state IN ('active', 'hidden', 'deleted')
+                  AND concat_ws(' ', {search_text})
+                      ILIKE ALL(%s::text[])
+                ORDER BY lower(asset.display_title), asset.id
+                LIMIT %s
+            """, (owner_user_id, patterns, limit))
+            return [_catalogued_asset_from_row(row) for row in cursor.fetchall()]
 
     def update_catalogued_asset_metadata(
         self,
@@ -8610,6 +9315,7 @@ class PostgresVaultMasterStore:
                         asset.origin_vault_id,
                         asset.visibility,
                         asset.shared_with,
+                        asset.lifecycle_state,
                         file.vault_path,
                         file.filename,
                         file.size_bytes,
@@ -8621,6 +9327,7 @@ class PostgresVaultMasterStore:
                     ORDER BY file.file_role = 'primary' DESC,
                              file.created_at
                     LIMIT 1
+                    FOR UPDATE OF asset
                     """,
                     (asset_id,),
                 )
@@ -8700,7 +9407,7 @@ class PostgresVaultMasterStore:
                         asset.metadata_provenance, asset.detected_metadata,
                         asset.imported_metadata, asset.user_overrides,
                         asset.effective_metadata, asset.owner_username, asset.owner_user_id,
-                        asset.origin_vault_id, asset.visibility, asset.shared_with, file.vault_path,
+                        asset.origin_vault_id, asset.visibility, asset.shared_with, asset.lifecycle_state, file.vault_path,
                         file.filename, file.size_bytes, file.mime_type,
                         file.sha256
                     FROM vault_assets AS asset
@@ -8765,7 +9472,7 @@ class PostgresVaultMasterStore:
                         asset.metadata_provenance, asset.detected_metadata,
                         asset.imported_metadata, asset.user_overrides,
                         asset.effective_metadata, asset.owner_username, asset.owner_user_id,
-                        asset.origin_vault_id, asset.visibility, asset.shared_with, file.vault_path,
+                        asset.origin_vault_id, asset.visibility, asset.shared_with, asset.lifecycle_state, file.vault_path,
                         file.filename, file.size_bytes, file.mime_type,
                         file.sha256
                     FROM vault_assets AS asset
@@ -8867,7 +9574,7 @@ class PostgresVaultMasterStore:
                 caller = active_user_id(cursor, username)
                 if caller is None:
                     raise ValueError("Authenticated owner is unavailable")
-                cursor.execute("""SELECT DISTINCT ON (asset.id) asset.id, asset.asset_type, asset.display_title, asset.captured_on, asset.location, asset.metadata, asset.metadata_provenance, asset.detected_metadata, asset.imported_metadata, asset.user_overrides, asset.effective_metadata, asset.owner_username, asset.owner_user_id, asset.origin_vault_id, asset.visibility, asset.shared_with, file.vault_path, file.filename, file.size_bytes, file.mime_type, file.sha256 FROM vault_assets asset JOIN vault_files file ON file.asset_id=asset.id WHERE asset.id=ANY(%s) ORDER BY asset.id, (file.file_role='primary') DESC, file.created_at""", (asset_ids,))
+                cursor.execute("""SELECT DISTINCT ON (asset.id) asset.id, asset.asset_type, asset.display_title, asset.captured_on, asset.location, asset.metadata, asset.metadata_provenance, asset.detected_metadata, asset.imported_metadata, asset.user_overrides, asset.effective_metadata, asset.owner_username, asset.owner_user_id, asset.origin_vault_id, asset.visibility, asset.shared_with, asset.lifecycle_state, file.vault_path, file.filename, file.size_bytes, file.mime_type, file.sha256 FROM vault_assets asset JOIN vault_files file ON file.asset_id=asset.id WHERE asset.id=ANY(%s) ORDER BY asset.id, (file.file_role='primary') DESC, file.created_at""", (asset_ids,))
                 assets = {}
                 for row in cursor.fetchall():
                     asset = _catalogued_asset_from_row(row)
@@ -9833,6 +10540,7 @@ class PostgresVaultMasterStore:
             "created_at": created_at,
         }
 
+    @serialized_publication
     def record_move_result(
         self,
         item_id: UUID,
@@ -9851,6 +10559,7 @@ class PostgresVaultMasterStore:
                     WHERE id = %s
                       AND source_kind = 'incoming'
                       AND (%s <> 'move_failed' OR state <> 'moved')
+                      AND state <> 'arrival_removed'
                     RETURNING *
                     """,
                     (state, item_id, state),
@@ -9938,6 +10647,7 @@ class PostgresVaultMasterStore:
                     )
         return self._to_item(row) if row else None
 
+    @serialized_publication
     def queue_move(self, item_id: UUID, username: str) -> ImportItem | None:
         with self._connect() as connection:
             with connection.cursor() as cursor:
@@ -10029,17 +10739,16 @@ class PostgresVaultMasterStore:
                 try:
                     projection = approved_projection(cursor, self._to_item(claimed))
                 except ValueError as error:
-                    cursor.execute("UPDATE vault_master_items SET state='move_failed' WHERE id=%s RETURNING *", (claimed['id'],))
+                    cursor.execute("UPDATE vault_master_items SET state='move_failed' WHERE id=%s RETURNING *", (claimed["id"],))
                     failed = cursor.fetchone()
-                    cursor.execute("INSERT INTO vault_master_activity(id,item_id,action,username,detail,succeeded) VALUES (%s,%s,'move_failed','Vault Master worker',%s,FALSE)", (uuid4(), claimed['id'], str(error)))
+                    cursor.execute("INSERT INTO vault_master_activity(id,item_id,action,username,detail,succeeded) VALUES (%s,%s,'move_failed','Vault Master worker',%s,FALSE)", (uuid4(), claimed["id"], str(error)))
                     return self._to_item(failed)
                 if projection is not None:
                     cursor.execute(
                         """UPDATE vault_master_items SET proposed_category='TV Shows',
                            proposed_destination=%s, publication_audience=%s, metadata=%s
                            WHERE id=%s RETURNING *""",
-                        (projection["proposed_destination"], projection["publication_audience"],
-                         Jsonb(projection["metadata"]), claimed["id"]),
+                        (projection["proposed_destination"], projection["publication_audience"], Jsonb(projection["metadata"]), claimed["id"]),
                     )
                     claimed = cursor.fetchone()
         return self._to_item(claimed)
@@ -10149,6 +10858,15 @@ class PostgresVaultMasterStore:
             self._export_sidecar(updated)
         return updated
 
+    def completed_arrival_request_ids(self) -> set[str]:
+        with self._connect() as connection:
+            rows = connection.execute("""SELECT publication.request_id FROM vault_arrival_managed_publications publication
+                JOIN vault_master_items item ON item.id=publication.item_id AND item.state='moved'
+                JOIN vault_files file ON file.id=publication.file_id AND file.asset_id=publication.asset_id
+                WHERE file.vault_path=publication.logical_destination""").fetchall()
+        return {str(row["request_id"]) for row in rows}
+
+    @serialized_publication
     def publish_arrival_managed_receipt(
         self, item_id: UUID, receipt: dict[str, object]
     ) -> CataloguedAsset | None:
@@ -10172,27 +10890,29 @@ class PostgresVaultMasterStore:
                     marker = item.metadata.get("tv_publication_set")
                     tv_marker = marker if isinstance(marker, dict) else None
                     category = item.proposed_category
-                    if category not in {"Movies", "TV Shows"}:
+                    if category not in {"Movies", "TV Shows", "Music", music_video.ASSET_TYPE, "Gallery", "Documents", "Archives"}:
                         return None
                     # A TV episode is never a standalone Theatre publication.
                     # The root executor has already moved its bytes by the time
                     # this receipt is reconciled, so reject malformed review
                     # state before creating (or marking) any catalogue record.
                     from app.tv_extras import valid_extra_receipt
-                    is_extra = category == 'TV Shows' and isinstance(item.metadata.get('tv_extra'), dict)
+                    is_extra = category == "TV Shows" and isinstance(item.metadata.get("tv_extra"), dict)
                     if category == "TV Shows" and not (
-                        valid_extra_receipt(cursor, item) if is_extra
+                        valid_extra_receipt(cursor, item)
+                        if is_extra
                         else self._valid_tv_receipt_group(cursor, item, tv_marker)
                     ):
                         return None
-                    logical_area = f"Theatre / {category}"
+                    logical_area = category if category in {"Gallery", "Documents", "Archives"} else "Music" if category in {"Music", music_video.ASSET_TYPE} else f"Theatre / {category}"
                     destination = item.proposed_destination or proposed_destination_path(
                         category, item.relative_path, item.filename
                     )
                     expected_relative = destination.removeprefix("/vault/")
                     if (
-                        category not in {"Movies", "TV Shows"}
+                        category not in {"Movies", "TV Shows", "Music", music_video.ASSET_TYPE, "Gallery", "Documents", "Archives"}
                         or item.proposed_destination != destination
+                        or not arrival_routing_receipt_matches(item, receipt)
                         or receipt.get("item_id") != str(item.id)
                         or item.owner_user_id is None
                         or receipt.get("owner_user_id") != str(item.owner_user_id)
@@ -10204,6 +10924,36 @@ class PostgresVaultMasterStore:
                         or not isinstance(receipt.get("slot_id"), str)
                     ):
                         return None
+                    routing_rule = item.metadata.get("arrival_publication_rule")
+                    routing_decision_id = None
+                    routing_authorization_id = None
+                    if routing_rule is not None:
+                        if not isinstance(routing_rule, dict):
+                            return None
+                        if routing_rule.get("version") == "incident-camera-photo-v1":
+                            routing_rule = None
+                        elif routing_rule.get("version") not in {"vm-routing-score-v1", "vm-routing-score-v2"}:
+                            return None
+                    if isinstance(routing_rule, dict):
+                        try:
+                            routing_decision_id = UUID(str(routing_rule["decision_id"]))
+                            routing_authorization_id = UUID(str(routing_rule["authorization_id"]))
+                        except (KeyError, TypeError, ValueError):
+                            return None
+                        cursor.execute("""SELECT authz.id, authz.policy_snapshot,
+                            decision.decision, decision.source_sha256
+                            FROM vault_routing_authorizations authz
+                            JOIN vault_routing_decisions decision ON decision.id=authz.decision_id
+                            WHERE authz.id=%s AND authz.decision_id=%s
+                            AND authz.item_id=%s AND authz.owner_user_id=%s""",
+                            (routing_authorization_id, routing_decision_id, item.id, item.owner_user_id))
+                        authority = cursor.fetchone()
+                        if (authority is None or authority["source_sha256"] != item.sha256
+                                or authority["decision"].get("destination") != category
+                                or authority["decision"].get("score") != routing_rule.get("score")
+                                or not authority["decision"].get("automatic_eligible")
+                                or authority["policy_snapshot"].get("id") != routing_rule.get("policy_id")):
+                            return None
                     cursor.execute("SELECT asset.id, file.id AS file_id, file.sha256, file.size_bytes FROM vault_files AS file JOIN vault_assets AS asset ON asset.id = file.asset_id WHERE file.vault_path = %s FOR UPDATE", (destination,))
                     existing = cursor.fetchone()
                     if existing is not None:
@@ -10230,21 +10980,21 @@ class PostgresVaultMasterStore:
                             return None
                         # The slot row is an auditable receipt of the root-owned
                         # final manifest, not a backend filesystem authority.
-                        cursor.execute("INSERT INTO vault_storage_slots (slot_id, state, assigned_areas) VALUES (%s, 'active', %s) ON CONFLICT (slot_id) DO UPDATE SET state = 'active', assigned_areas = EXCLUDED.assigned_areas", (receipt["slot_id"], Jsonb([logical_area])))
+                        cursor.execute("INSERT INTO vault_storage_slots (slot_id, state, assigned_areas) VALUES (%s, 'active', %s) ON CONFLICT (slot_id) DO UPDATE SET state = 'active', assigned_areas = (SELECT jsonb_agg(DISTINCT area) FROM jsonb_array_elements(vault_storage_slots.assigned_areas || EXCLUDED.assigned_areas) AS area)", (receipt["slot_id"], Jsonb([logical_area])))
                         self._publish_catalogued_asset(cursor, item, destination, preserve_existing_metadata=False)
                         cursor.execute("SELECT id, asset_id FROM vault_files WHERE vault_path = %s FOR UPDATE", (destination,))
                         file_row = cursor.fetchone()
                         if file_row is None:
                             raise RuntimeError("Theatre catalogue publication did not create its file")
                         cursor.execute("INSERT INTO vault_file_storage_placements (file_id, slot_id, relative_path, assigned_by, placement_reason) VALUES (%s, %s, %s, %s, %s)", (file_row["id"], receipt["slot_id"], expected_relative, "Arrival Hall managed publisher", "root-verified Arrival Hall managed publication"))
-                        cursor.execute("INSERT INTO vault_arrival_managed_publications (item_id, request_id, owner_user_id, logical_destination, logical_area, asset_id, file_id, slot_id, relative_path) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)", (item.id, receipt["request_id"], item.owner_user_id, destination, logical_area, file_row["asset_id"], file_row["id"], receipt["slot_id"], expected_relative))
+                        cursor.execute("INSERT INTO vault_arrival_managed_publications (item_id, request_id, owner_user_id, logical_destination, logical_area, asset_id, file_id, slot_id, relative_path, routing_decision_id, routing_authorization_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", (item.id, receipt["request_id"], item.owner_user_id, destination, logical_area, file_row["asset_id"], file_row["id"], receipt["slot_id"], expected_relative, routing_decision_id, routing_authorization_id))
                         placement = {"slot_id": receipt["slot_id"], "relative_path": expected_relative}
                         cursor.execute("UPDATE vault_assets SET metadata = metadata || %s, metadata_provenance = metadata_provenance || %s, effective_metadata = effective_metadata || %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s", (Jsonb({"storage_placement": placement}), Jsonb({"storage_placement": "root_verified_receipt"}), Jsonb({"storage_placement": placement}), file_row["asset_id"]))
                         cursor.execute("UPDATE vault_master_items SET state = 'moved', updated_at = CURRENT_TIMESTAMP WHERE id = %s", (item.id,))
                         asset_id = UUID(str(file_row["asset_id"]))
                         if is_extra:
-                            cursor.execute("INSERT INTO vault_tv_extras(asset_id,season_id) VALUES (%s,%s)", (asset_id, UUID(item.metadata['tv_extra']['season_id'])))
-                            cursor.execute("UPDATE vault_assets SET metadata=metadata || %s, effective_metadata=effective_metadata || %s, metadata_provenance=metadata_provenance || %s WHERE id=%s", (Jsonb({'tv_extra': item.metadata['tv_extra']}), Jsonb({'tv_extra': item.metadata['tv_extra']}), Jsonb({'tv_extra': 'approved_tv_resolver'}), asset_id))
+                            cursor.execute("INSERT INTO vault_tv_extras(asset_id,season_id) VALUES (%s,%s)", (asset_id, UUID(item.metadata["tv_extra"]["season_id"])))
+                            cursor.execute("UPDATE vault_assets SET metadata=metadata || %s, effective_metadata=effective_metadata || %s, metadata_provenance=metadata_provenance || %s WHERE id=%s", (Jsonb({"tv_extra": item.metadata["tv_extra"]}), Jsonb({"tv_extra": item.metadata["tv_extra"]}), Jsonb({"tv_extra": "approved_tv_resolver"}), asset_id))
                     cursor.execute("INSERT INTO vault_master_activity (id, batch_id, item_id, action, username, detail, succeeded) VALUES (%s, %s, %s, 'file_moved', %s, %s, TRUE)", (uuid4(), item.batch_id, item.id, "Arrival Hall managed publisher", f"Published root-verified managed receipt {receipt['request_id']}"))
                     sidecar_vault_path = destination
         except psycopg.errors.UniqueViolation:
@@ -10306,12 +11056,15 @@ class PostgresVaultMasterStore:
             try:
                 for member in members:
                     projection = approved_projection(cursor, member)
-                    if (projection is None or projection["metadata"]["tv_publication_set"] != marker
+                    if (
+                        projection is None
+                        or projection["metadata"]["tv_publication_set"] != marker
                         or member.metadata.get("tv_publication_set") != marker
                         or member.proposed_category != "TV Shows"
                         or member.proposed_destination != projection["proposed_destination"]
                         or member.publication_audience != projection["publication_audience"]
-                        or member.state not in {"move_queued", "moving", "theatre_promotion_pending", "moved", "move_failed"}):
+                        or member.state not in {"move_queued", "moving", "theatre_promotion_pending", "moved", "move_failed"}
+                    ):
                         return False
             except ValueError:
                 return False
@@ -10542,7 +11295,7 @@ class PostgresVaultMasterStore:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT lifecycle_state FROM vault_assets
+                    SELECT lifecycle_state, asset_type FROM vault_assets
                     WHERE id = %s AND owner_user_id = %s FOR UPDATE
                     """,
                     (asset_id, owner_user_id),
@@ -10550,6 +11303,9 @@ class PostgresVaultMasterStore:
                 existing = cursor.fetchone()
                 if existing is None:
                     return None
+                if state == 'hidden' and existing['asset_type'] == 'Home Videos':
+                    from app.home_video_privacy import require_unshared
+                    require_unshared(cursor, asset_id)
                 previous_state = str(existing["lifecycle_state"])
                 if previous_state == state:
                     return self.get_catalogued_asset_by_id(asset_id)
@@ -10586,6 +11342,138 @@ class PostgresVaultMasterStore:
                     ),
                 )
         return self.get_catalogued_asset_by_id(asset_id)
+
+    def set_catalogued_asset_deleted(
+        self, asset_id: UUID, owner_user_id: UUID, username: str
+    ) -> CataloguedAsset | None:
+        """Hide a canonical asset and revoke its sharing in one transaction."""
+        from app.federation import FederationStore
+
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT asset.id, asset.asset_type, asset.display_title, asset.captured_on,
+                       asset.location, asset.metadata, asset.metadata_provenance,
+                       asset.detected_metadata, asset.imported_metadata,
+                       asset.user_overrides, asset.effective_metadata,
+                       asset.owner_username, asset.owner_user_id, asset.origin_vault_id,
+                       asset.visibility, asset.shared_with, asset.lifecycle_state,
+                       file.vault_path, file.filename, file.size_bytes, file.mime_type,
+                       file.sha256
+                FROM vault_assets AS asset
+                JOIN LATERAL (
+                    SELECT * FROM vault_files WHERE asset_id=asset.id
+                    ORDER BY (file_role='primary') DESC, created_at LIMIT 1
+                ) AS file ON TRUE
+                WHERE asset.id=%s AND asset.owner_user_id=%s
+                FOR UPDATE OF asset
+            """, (asset_id, owner_user_id))
+            row = cursor.fetchone()
+            if row is None or row["lifecycle_state"] not in {"active", "hidden"}:
+                return None
+            previous = _catalogued_asset_from_row(row)
+            cursor.execute("""
+                UPDATE vault_assets SET lifecycle_state='deleted', visibility='private',
+                    shared_with='[]'::jsonb, updated_at=CURRENT_TIMESTAMP
+                WHERE id=%s
+            """, (asset_id,))
+            cursor.execute("""
+                UPDATE vault_share_grants SET state='revoked', revoked_at=CURRENT_TIMESTAMP
+                WHERE asset_id=%s AND state IN ('pending','active')
+                RETURNING operation_id
+            """, (asset_id,))
+            operation_ids = {row["operation_id"] for row in cursor.fetchall()
+                             if row["operation_id"] is not None}
+            if operation_ids:
+                cursor.execute("""
+                    UPDATE vault_share_operations AS operation
+                    SET state='revoked', revoked_at=CURRENT_TIMESTAMP
+                    WHERE operation_id=ANY(%s) AND state IN ('pending','active')
+                      AND NOT EXISTS (SELECT 1 FROM vault_share_grants AS share_grant
+                          WHERE share_grant.operation_id=operation.operation_id
+                            AND share_grant.state IN ('pending','active'))
+                      AND NOT EXISTS (SELECT 1 FROM vault_collection_share_grants AS collection_grant
+                          WHERE collection_grant.operation_id=operation.operation_id
+                            AND collection_grant.state IN ('pending','active'))
+                """, (list(operation_ids),))
+            cursor.execute("""
+                DELETE FROM vault_shared_collection_members WHERE asset_id=%s
+                RETURNING collection_id
+            """, (asset_id,))
+            collection_ids = {row["collection_id"] for row in cursor.fetchall()}
+            federation = FederationStore(self._conninfo)
+            cursor.execute("""
+                UPDATE vault_federation_outgoing_shares
+                SET state='revoked', revoked_at=CURRENT_TIMESTAMP,
+                    lifecycle_revision=lifecycle_revision+1,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE origin_asset_id=%s AND owner_user_id=%s
+                  AND state IN ('pending','active')
+                RETURNING federation_share_id
+            """, (asset_id, owner_user_id))
+            for share in cursor.fetchall():
+                federation._queue_event(cursor, share["federation_share_id"], "share_revoked")
+            if collection_ids:
+                cursor.execute("""
+                    SELECT federation_collection_share_id
+                    FROM vault_federation_outgoing_collection_shares
+                    WHERE origin_collection_id=ANY(%s) AND state IN ('pending','active')
+                """, (list(collection_ids),))
+                for share in cursor.fetchall():
+                    federation._queue_collection_snapshot(cursor, share["federation_collection_share_id"])
+            cursor.execute("""
+                INSERT INTO vault_asset_history
+                    (id, asset_id, action, username, actor_user_id, previous_values, current_values)
+                VALUES (%s,%s,'asset_deleted',%s,%s,%s,%s)
+            """, (uuid4(), asset_id, username, owner_user_id,
+                  Jsonb({"lifecycle_state": previous.lifecycle_state,
+                         "visibility": previous.visibility}),
+                  Jsonb({"lifecycle_state": "deleted",
+                         "original_section": previous.asset_type})))
+            cursor.execute("""
+                INSERT INTO vault_master_activity
+                    (id, action, username, detail, succeeded)
+                VALUES (%s,'asset_deleted',%s,%s,TRUE)
+            """, (uuid4(), username, f"Recoverable deletion of {asset_id}"))
+        updated = self.get_catalogued_asset_by_id(asset_id)
+        if updated is not None:
+            self._export_sidecar(updated)
+        return updated
+
+    def restore_catalogued_asset_deleted(
+        self, asset_id: UUID, owner_user_id: UUID, username: str
+    ) -> CataloguedAsset | None:
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT asset_type, lifecycle_state FROM vault_assets
+                WHERE id=%s AND owner_user_id=%s FOR UPDATE
+            """, (asset_id, owner_user_id))
+            row = cursor.fetchone()
+            if row is None or row["lifecycle_state"] != "deleted":
+                return None
+            asset = self.get_catalogued_asset_by_id(asset_id)
+            if asset is None or not canonical_section_matches_asset(asset):
+                raise ValueError("Original logical section is unavailable")
+            cursor.execute("""
+                UPDATE vault_assets SET lifecycle_state='active', visibility='private',
+                    shared_with='[]'::jsonb, updated_at=CURRENT_TIMESTAMP
+                WHERE id=%s
+            """, (asset_id,))
+            cursor.execute("""
+                INSERT INTO vault_asset_history
+                    (id, asset_id, action, username, actor_user_id, previous_values, current_values)
+                VALUES (%s,%s,'asset_restored',%s,%s,%s,%s)
+            """, (uuid4(), asset_id, username, owner_user_id,
+                  Jsonb({"lifecycle_state": "deleted", "original_section": asset.asset_type}),
+                  Jsonb({"lifecycle_state": "active", "section": asset.asset_type})))
+            cursor.execute("""
+                INSERT INTO vault_master_activity
+                    (id, action, username, detail, succeeded)
+                VALUES (%s,'asset_restored',%s,%s,TRUE)
+            """, (uuid4(), username, f"Restored {asset_id} to {asset.asset_type}"))
+        updated = self.get_catalogued_asset_by_id(asset_id)
+        if updated is not None:
+            self._export_sidecar(updated)
+        return updated
 
     def has_catalogued_asset_deletion(self, asset_id: UUID) -> bool:
         with self._connect() as connection:
@@ -10636,7 +11524,6 @@ class PostgresVaultMasterStore:
                         IF to_regclass('vault_tv_publication_set_members') IS NOT NULL THEN
                             DELETE FROM vault_tv_publication_set_members;
                             DELETE FROM vault_tv_publication_sets;
-                            DELETE FROM vault_tv_extras;
                             DELETE FROM vault_tv_episodes;
                             DELETE FROM vault_tv_seasons;
                             DELETE FROM vault_tv_shows;

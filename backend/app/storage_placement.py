@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import os
+import shutil
 from pathlib import Path, PurePosixPath
 from typing import Iterable
 
@@ -65,6 +66,26 @@ class StorageResolver:
 
 MANIFEST_SCHEMA = "personal-vault.slot-managed-manifest.v1"
 SLOT_PUBLISH_ROOT = Path(os.getenv("PV_STORAGE_SLOT_ROOT", "/vault-storage-slots"))
+
+
+def commissioned_destination_slots(area: str, size: int, manifest: Path) -> list[EligibleSlot]:
+    """Resolve a logical area through commissioned authority, never section hardware."""
+    document = json.loads(manifest.read_text(encoding="utf-8"))
+    if document.get("schema") != MANIFEST_SCHEMA or not isinstance(document.get("slots"), dict):
+        raise ValueError("Commissioned storage is unavailable")
+    roots = configured_slot_roots()
+    slots = []
+    for slot_id, slot in document["slots"].items():
+        if not isinstance(slot, dict) or slot.get("state") != "active" or slot.get("integration_mode") != "slot_managed":
+            continue
+        if area not in slot.get("areas", []) or slot.get("logical_mappings", {}).get(area) != "/vault/" + area.replace(" / ", "/"):
+            continue
+        root = roots.get(slot_id)
+        if root is None or not root.is_dir() or root.is_symlink() or not root.is_mount():
+            continue
+        slots.append(EligibleSlot(slot_id, area, shutil.disk_usage(root).free, True, True, root))
+    select_slot(slots, area, size)
+    return slots
 
 
 def configured_slot_roots() -> dict[str, Path]:

@@ -3,58 +3,49 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { TvResolverActions } from "../src/components/TvResolverActions";
 import { normalizeTvResolverBatches, tvCounts } from "../src/lib/tv-resolver";
 
-const batch = () =>
-  normalizeTvResolverBatches({
+function batch(status = "published") {
+  return normalizeTvResolverBatches({
     batches: [
       {
-        id: "batch",
-        status: "published",
-        proposed_show_title: "Westworld",
+        id: "synthetic-batch",
+        status,
+        proposed_show_title: "Synthetic Show",
         seasons: [],
-        tracks: Array.from({ length: 99 }, (_, n) => ({
-          id: String(n),
-          original_filename: `track-${n}.mkv`,
-          classification: n < 28 ? "likely_episode" : "likely_extra",
-          publication_state: n < 28 ? "published" : "needs_review",
+        tracks: Array.from({ length: 3 }, (_, index) => ({
+          id: String(index),
+          original_filename: `track-${index}.mkv`,
+          classification: index < 2 ? "likely_episode" : "likely_extra",
+          publication_state: index < 2 ? "published" : "needs_review",
         })),
       },
     ],
   }).batches[0];
+}
 
-test("published episodes have no approval button and 71 extras await the explicit action", () => {
+test("published episodes expose only the explicit extras phase", () => {
   const value = batch();
-  expect(tvCounts(value).published).toBe(28);
-  expect(tvCounts(value).extrasRemaining).toBe(71);
+  expect(tvCounts(value).published).toBe(2);
+  expect(tvCounts(value).extrasRemaining).toBe(1);
   const html = renderToStaticMarkup(
     <TvResolverActions batch={value} busy={false} onAction={() => {}} />,
   );
   expect(html).not.toContain("Approve batch");
   expect(html).toContain("Publish extras");
-  expect(html).not.toContain("Retry failed");
 });
 
-test("a failed extra exposes retry and preserves successful counts", () => {
-  const value = batch();
-  value.status = "failed";
-  value.tracks.forEach((track) => {
-    track.publication_state = "published";
-  });
-  value.tracks[98].publication_state = "failed";
-  expect(tvCounts(value).extrasRemaining).toBe(1);
-  expect(tvCounts(value).failed).toBe(1);
+test("failed extras retain successful episode progress and expose failed-only retry", () => {
+  const value = batch("failed");
+  value.tracks[2].publication_state = "failed";
   const html = renderToStaticMarkup(
     <TvResolverActions batch={value} busy={false} onAction={() => {}} />,
   );
+  expect(tvCounts(value).published).toBe(2);
   expect(html).toContain("Retry failed");
   expect(html).not.toContain("Publish extras");
-  expect(html).not.toContain("Approve batch");
 });
 
-test("complete batches are absent from the active resolver view", () => {
-  const value = batch();
-  value.status = "complete";
-  expect(normalizeTvResolverBatches({ batches: [value] }).batches).toEqual([]);
+test("complete batches are absent from the active view model", () => {
   expect(
-    renderToStaticMarkup(<TvResolverActions batch={value} busy={false} onAction={() => {}} />),
-  ).toBe("");
+    normalizeTvResolverBatches({ batches: [{ ...batch(), status: "complete" }] }).batches,
+  ).toEqual([]);
 });

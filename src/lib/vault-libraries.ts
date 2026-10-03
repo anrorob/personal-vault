@@ -9,6 +9,8 @@ export type VaultFileKind =
   | "other";
 
 export type VaultLibraryFile = {
+  asset_id?: string;
+  can_edit?: boolean;
   id: string;
   name: string;
   directory: string | null;
@@ -17,6 +19,7 @@ export type VaultLibraryFile = {
   kind: VaultFileKind;
   opens_inline: boolean;
   open_url: string;
+  thumbnail_url?: string | null;
   display_title: string | null;
   captured_on: string | null;
   location: string | null;

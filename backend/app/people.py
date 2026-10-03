@@ -144,7 +144,7 @@ class PeopleService:
                 vault_path=asset.vault_path,
             )
             for asset in self.vault_store.list_owned_catalogued_assets_by_user_id(self.user_id)
-            if asset.id in ids
+            if asset.id in ids and asset_is_editable_by(asset, self.user)
         ]
         shared_ids = self.share_grant_store.included_gallery_assets_for_local_people(
             self.user_id, (person_id,)

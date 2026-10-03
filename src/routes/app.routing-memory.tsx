@@ -43,7 +43,7 @@ function RoutingMemoryPage() {
 
   const editDestination = async (rule: RoutingMemoryRule) => {
     const destination = window.prompt(
-      "New destination: Gallery, Home Videos, Music, Movies, TV Shows, Documents, Archives, or Ledger",
+      "New destination: Gallery, Home Videos, Music, Movies, TV Shows, Documents, or Archives",
       rule.destination,
     );
     if (!destination || destination === rule.destination) return;

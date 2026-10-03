@@ -1,0 +1,8 @@
+# Only generic service source enters this build context.
+**
+!Dockerfile
+!ken_infer.py
+!native_input.py
+!server.py
+!service_input.py
+!video_ffmpeg.py

@@ -63,7 +63,7 @@ _PRIORITY: dict[SemanticContentType, int] = {
 }
 
 _DESTINATIONS: dict[SemanticContentType, str | None] = {
-    "financial_document": "Ledger",
+    "financial_document": "Documents",
     "receipt": "Documents",
     "publication": "Library",
     "general_document": "Documents",

@@ -39,6 +39,39 @@ class FakeResponse(BytesIO):
         self.close()
 
 
+def test_media_path_mutations_use_jellyfin_paths_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[Request] = []
+
+    def fake_urlopen(request: Request, timeout: float) -> FakeResponse:
+        requests.append(request)
+        assert timeout == 10
+        return FakeResponse(b"")
+
+    monkeypatch.setattr(jellyfin, "urlopen", fake_urlopen)
+    client = JellyfinClient("http://pv-jellyfin:8096", "secret-api-key")
+    path = "/vault-storage-slots/PV-DEV-DISK-001/Theatre/TV Shows"
+
+    client.add_media_path("TV Shows", path, refresh_library=False)
+    client.remove_media_path("TV Shows", path, refresh_library=False)
+
+    post, delete = requests
+    assert post.get_method() == "POST"
+    assert urlsplit(post.full_url).path == "/Library/VirtualFolders/Paths"
+    assert parse_qs(urlsplit(post.full_url).query) == {"refreshLibrary": ["false"]}
+    assert json.loads(post.data or b"") == {"Name": "TV Shows", "Path": path}
+    assert post.get_header("Content-type") == "application/json"
+    assert delete.get_method() == "DELETE"
+    assert urlsplit(delete.full_url).path == "/Library/VirtualFolders/Paths"
+    assert parse_qs(urlsplit(delete.full_url).query) == {
+        "name": ["TV Shows"], "path": [path], "refreshLibrary": ["false"]
+    }
+    assert delete.data is None
+    assert all(request.get_header("X-emby-token") == "secret-api-key" for request in requests)
+    assert all("secret-api-key" not in request.full_url for request in requests)
+
+
 def test_client_matches_exact_source_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -610,7 +643,7 @@ def test_client_loads_audio_details_with_user_context(
             body: object = [{"Id": "private-user-id"}]
         elif path == "/Items/audio-item-id":
             body = {
-                "Name": "One day",
+                "Name": "Example Song",
                 "Artists": ["Example Artist"],
                 "Album": "Example Album",
                 "AlbumArtist": "Example Artist",
@@ -640,7 +673,7 @@ def test_client_loads_audio_details_with_user_context(
 
     details = client.get_audio_details(audio)
 
-    assert details["display_title"] == "One day"
+    assert details["display_title"] == "Example Song"
     assert details["artist"] == "Example Artist"
     assert details["track_number"] == 13
     assert urlsplit(requested_urls[0]).path == "/Users"

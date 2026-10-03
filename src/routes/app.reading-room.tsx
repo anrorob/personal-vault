@@ -147,7 +147,7 @@ function ReadingRoomPage() {
   };
 
   return (
-    <div className="max-w-6xl mx-auto space-y-7">
+    <div className="pv-layout-container max-w-7xl mx-auto space-y-7">
       <section className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
         <div>
           <h1 className="pv-page-title text-3xl md:text-4xl">Reading Room</h1>
@@ -242,7 +242,7 @@ function ReadingRoomPage() {
           </p>
         </div>
       ) : (
-        <section className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
+        <section className="pv-card-grid">
           {(publications ?? []).map((publication) => (
             <button
               key={publication.id}

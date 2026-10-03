@@ -173,24 +173,24 @@ def test_pdf_embedded_text_is_page_labelled_and_bounded(
         (
             "A screenshot of a purchase receipt",
             "RECEIPT VAT amount paid",
-            "receipt",
-            "Documents",
+            "screenshot",
+            "Archives",
         ),
         (
             "A screenshot containing a photograph of two people outdoors",
             "",
-            "personal_photo",
-            "Gallery",
+            "screenshot",
+            "Archives",
         ),
         (
             "A screenshot of the cover of a book",
             "Book cover title and author",
-            "publication_cover",
-            "Library",
+            "screenshot",
+            "Archives",
         ),
     ],
 )
-def test_screenshot_context_yields_to_content_semantics(
+def test_native_screenshot_primary_capture_routes_to_archives(
     caption: str,
     ocr_text: str,
     expected_content_type: str,
@@ -206,7 +206,7 @@ def test_screenshot_context_yields_to_content_semantics(
 
     assert content_type == expected_content_type
     assert destination == expected_destination
-    assert not screenshot_fallback
+    assert screenshot_fallback
 
 
 def test_book_cover_evidence_routes_to_review_only_library_candidate(
@@ -250,7 +250,7 @@ def test_destination_assessment_is_versioned_explainable_and_safety_gated(
         0.96,
         "BANK STATEMENT account number and closing balance",
     )
-    assert statement.recommended_destination == "Ledger"
+    assert statement.recommended_destination == "Documents"
     assert "Destination evidence conflicts" in statement.automatic_disqualifiers
     assert statement.routing_band == "individual_review"
     assert statement.conflicts
@@ -334,6 +334,22 @@ def test_continuous_queue_is_idempotent_and_does_not_retry_failure(
     assert ai_store.queue_analysis(item.id, TEST_USERNAME).status == "queued"
 
 
+def test_staged_old_semantic_version_is_queued_once_for_reanalysis(tmp_path: Path) -> None:
+    vault_store, _, item = staged_image(tmp_path)
+    ai_store = MemoryIngestionAiStore()
+    assert queue_pending_ingestion_image_analysis(ai_store, vault_store, TEST_USERNAME) == 1
+    job = ai_store.claim_next_job()
+    assert job is not None
+    assessment = assess_destination(item, "unknown", 0.25, "")
+    evidence = ai_store.complete_job(
+        job.id, "unknown", "An unclear image", "", 0.25, (), 1,
+        assessment, item.sha256,
+    )
+    ai_store.evidence[evidence.id] = replace(evidence, task_version="semantic-intake-v6")
+    assert queue_pending_ingestion_image_analysis(ai_store, vault_store, TEST_USERNAME) == 1
+    assert queue_pending_ingestion_image_analysis(ai_store, vault_store, TEST_USERNAME) == 0
+
+
 def test_staged_analysis_is_idempotent_private_and_review_only(
     client: TestClient,
     tmp_path: Path,
@@ -363,7 +379,7 @@ def test_staged_analysis_is_idempotent_private_and_review_only(
         0.94,
         "PRIVATE ACCOUNT TEXT",
     )
-    assert assessment.recommended_destination == "Ledger"
+    assert assessment.recommended_destination == "Documents"
     ai_store.complete_job(
         claimed.id,
         "financial_document",
@@ -379,7 +395,7 @@ def test_staged_analysis_is_idempotent_private_and_review_only(
     assert evidence.headers["cache-control"] == "private, no-store"
     assert evidence.json()["publication_rule"] == "private_review_evidence_only"
     assert evidence.json()["items"][0]["evidence"][0]["ocr_text"] == "PRIVATE ACCOUNT TEXT"
-    assert evidence.json()["items"][0]["evidence"][0]["recommended_destination"] == "Ledger"
+    assert evidence.json()["items"][0]["evidence"][0]["recommended_destination"] == "Documents"
     assert evidence.json()["items"][0]["evidence"][0]["routing_band"] == "individual_review"
     assert Path(arrival / "statement.jpg").read_bytes() == b"unchanged-image"
     assert vault_store.get_item(item.id).proposed_category == item.proposed_category
@@ -467,42 +483,42 @@ def test_owner_sees_florence_evidence_when_administrator_requested_analysis(
     assert response.json()["items"][0]["evidence"][0]["caption"] == "Recipient's Florence description"
 
 
-def test_robert_and_anita_owner_capabilities_are_uuid_isolated(
+def test_example_owner_and_example_recipient_owner_capabilities_are_uuid_isolated(
     client: TestClient, tmp_path: Path, authentication_store: MemoryAuthenticationStore
 ) -> None:
-    vault_store, arrival, robert_item = staged_image(tmp_path)
+    vault_store, arrival, example_owner_item = staged_image(tmp_path)
     owner = authentication_store.ensure_initial_administrator(TEST_USERNAME, "hash")
     recipient = Account("recipient", "Recipient", None, "hash", "member", True, False, datetime.now(timezone.utc), None)
     authentication_store.create_account(recipient)
-    anita_path = arrival / "recipient.jpg"
-    anita_path.write_bytes(b"recipient-image")
-    anita_item = replace(
-        robert_item, id=uuid4(), source_path=anita_path, filename="recipient.jpg", sha256="b" * 64
+    example_recipient_path = arrival / "recipient.jpg"
+    example_recipient_path.write_bytes(b"recipient-image")
+    example_recipient_item = replace(
+        example_owner_item, id=uuid4(), source_path=example_recipient_path, filename="recipient.jpg", sha256="b" * 64
     )
-    robert_item = replace(robert_item, owner_user_id=owner.user_id)
-    anita_item = replace(anita_item, owner_username="recipient", owner_user_id=recipient.user_id)
-    vault_store.items[robert_item.source_path] = robert_item
-    vault_store.items[anita_item.source_path] = anita_item
+    example_owner_item = replace(example_owner_item, owner_user_id=owner.user_id)
+    example_recipient_item = replace(example_recipient_item, owner_username="recipient", owner_user_id=recipient.user_id)
+    vault_store.items[example_owner_item.source_path] = example_owner_item
+    vault_store.items[example_recipient_item.source_path] = example_recipient_item
     ai_store = MemoryIngestionAiStore()
     autopilot_store = MemoryAutopilotStore()
     app.dependency_overrides[get_vault_master_store] = lambda: vault_store
     app.dependency_overrides[get_ingestion_ai_store] = lambda: ai_store
     app.dependency_overrides[get_autopilot_store] = lambda: autopilot_store
     app.dependency_overrides[require_authenticated_user] = lambda: AuthenticatedIdentity(owner)
-    assert client.post("/api/vault-master/items/ai/batches", json={"item_ids": [str(robert_item.id)]}).status_code == 202
-    assert client.post("/api/vault-master/items/ai/batches", json={"item_ids": [str(anita_item.id)]}).status_code == 409
-    robert_policy = client.put("/api/vault-master/autopilot/policy", json={"content_type":"personal_photo","destination":"Gallery","threshold":80,"max_items":50,"max_failures":2,"max_failure_percent":5})
-    assert robert_policy.status_code == 200
+    assert client.post("/api/vault-master/items/ai/batches", json={"item_ids": [str(example_owner_item.id)]}).status_code == 202
+    assert client.post("/api/vault-master/items/ai/batches", json={"item_ids": [str(example_recipient_item.id)]}).status_code == 409
+    example_owner_policy = client.put("/api/vault-master/autopilot/policy", json={"content_type":"personal_photo","destination":"Gallery","threshold":80,"max_items":50,"max_failures":2,"max_failure_percent":5})
+    assert example_owner_policy.status_code == 200
     app.dependency_overrides[require_authenticated_user] = lambda: AuthenticatedIdentity(recipient)
     assert client.get("/api/vault-master/items/ai/batches").json() == {"batches": []}
-    assert client.post("/api/vault-master/items/ai/review-batches", json={"action":"reject","item_ids":[str(robert_item.id), str(anita_item.id)]}).status_code == 403
-    anita_policy = client.put("/api/vault-master/autopilot/policy", json={"content_type":"personal_photo","destination":"Gallery","threshold":80,"max_items":50,"max_failures":2,"max_failure_percent":5})
-    assert anita_policy.status_code == 200
-    assert client.patch(f"/api/vault-master/autopilot/policy/{anita_policy.json()['id']}", json={"status":"enabled"}).status_code == 200
+    assert client.post("/api/vault-master/items/ai/review-batches", json={"action":"reject","item_ids":[str(example_owner_item.id), str(example_recipient_item.id)]}).status_code == 403
+    example_recipient_policy = client.put("/api/vault-master/autopilot/policy", json={"content_type":"personal_photo","destination":"Gallery","threshold":80,"max_items":50,"max_failures":2,"max_failure_percent":5})
+    assert example_recipient_policy.status_code == 200
+    assert client.patch(f"/api/vault-master/autopilot/policy/{example_recipient_policy.json()['id']}", json={"status":"enabled"}).status_code == 200
     assert len(client.get("/api/vault-master/autopilot").json()["policies"]) == 1
     app.dependency_overrides[require_authenticated_user] = lambda: AuthenticatedIdentity(owner)
     assert client.get("/api/vault-master/autopilot").json()["policies"][0]["status"] == "disabled"
-    assert client.patch(f"/api/vault-master/autopilot/policy/{robert_policy.json()['id']}", json={"status":"enabled"}).status_code == 200
+    assert client.patch(f"/api/vault-master/autopilot/policy/{example_owner_policy.json()['id']}", json={"status":"enabled"}).status_code == 200
     assert autopilot_store.list_policies(owner.user_id)[0].owner_user_id == owner.user_id
     assert autopilot_store.list_policies(recipient.user_id)[0].owner_user_id == recipient.user_id
     assert autopilot_store.list_policies(owner.user_id)[0].status == "enabled"
@@ -531,12 +547,12 @@ def test_worker_revalidates_staged_checksum_and_records_local_analysis(
     evidence = ai_store.list_evidence(item.id, TEST_USERNAME)[0]
     assert evidence.content_type == "financial_document"
     assert evidence.model_revision == "21a599d414c4d928c9032694c424fb94458e3594"
-    assert evidence.task_version == "semantic-intake-v5"
-    assert evidence.recommended_destination == "Ledger"
+    assert evidence.task_version == "semantic-intake-v9"
+    assert evidence.recommended_destination == "Documents"
     assert evidence.decision_model_version == "intelligent-routing-v5"
     updated = vault_store.get_item(item.id)
     assert updated is not None
-    assert updated.proposed_category == "Ledger"
+    assert updated.proposed_category == "Documents"
     assert updated.proposal_reason == "Local image evidence suggests this destination."
 
     changed_store, changed_arrival, changed_item = staged_image(tmp_path / "changed")
@@ -550,7 +566,7 @@ def test_worker_revalidates_staged_checksum_and_records_local_analysis(
     assert "no longer matches" in (failed.error or "")
 
 
-def test_screenshot_context_does_not_override_semantic_content(
+def test_native_screenshot_of_banking_app_recommends_archives(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -572,7 +588,7 @@ def test_screenshot_context_does_not_override_semantic_content(
     assert preserved is not None
     assert preserved.proposed_category == "Gallery"
     evidence = ai_store.list_evidence(item.id, TEST_USERNAME)[0]
-    assert evidence.recommended_destination == "Ledger"
+    assert evidence.recommended_destination == "Archives"
     assert evidence.conflicts
 
 
@@ -610,7 +626,7 @@ def test_screenshot_replaces_untouched_gallery_guess_but_cannot_auto_move(
     assert rescanned.proposal_reason == "Local image evidence suggests this destination."
 
 
-def test_embedded_screenshot_marker_is_context_not_a_financial_override(
+def test_embedded_screenshot_marker_and_weak_financial_ocr_hold_review(
     tmp_path: Path,
 ) -> None:
     _, _, item = staged_image(tmp_path)
@@ -625,7 +641,7 @@ def test_embedded_screenshot_marker_is_context_not_a_financial_override(
         0.99,
         "BANK STATEMENT account balance People Devices Items Me",
     )
-    assert assessment.recommended_destination == "Ledger"
+    assert assessment.recommended_destination == "Gallery"
     assert assessment.routing_band == "individual_review"
     assert "Screenshot capture context requires owner review" in (
         assessment.automatic_disqualifiers
@@ -660,7 +676,7 @@ def test_staged_pdf_receipt_receives_private_semantic_analysis_and_is_eligible(
     ("caption", "ocr_text", "content_type", "destination", "routing_band"),
     [
         ("A scanned childhood photograph", "", "personal_photo", "Gallery", "automatic_eligible"),
-        ("A bank statement", "closing balance account number", "financial_document", "Ledger", "automatic_eligible"),
+        ("A bank statement", "closing balance account number", "financial_document", "Documents", "automatic_eligible"),
         ("A purchase receipt", "RECEIPT VAT amount paid", "receipt", "Documents", "automatic_eligible"),
         ("The cover of a book", "book cover title and author", "publication_cover", "Library", "individual_review"),
     ],
@@ -808,7 +824,7 @@ def test_bulk_analysis_api_is_owner_private_and_individual_review_is_not_batch_a
     )
     listing = client.get("/api/vault-master/items/ai/batches")
     assert listing.headers["cache-control"] == "private, no-store"
-    assert listing.json()["batches"][0]["groups"][0]["destination"] == "Ledger"
+    assert listing.json()["batches"][0]["groups"][0]["destination"] == "Documents"
 
     reviewed = client.post(
         "/api/vault-master/items/ai/review-batches",
@@ -842,7 +858,7 @@ def test_routing_memory_matures_is_owner_scoped_and_contradictions_demote(
             claimed.id, "financial_document", "A statement", "BANK STATEMENT",
             0.96, ("Financial statement indicators",), 10, base,
         )
-        rule = ai_store.remember_decision(item, "Ledger", "approved", TEST_USERNAME)
+        rule = ai_store.remember_decision(item, "Documents", "approved", TEST_USERNAME)
         assert rule is not None and rule.example_count == expected_count
         if expected_count == 1:
             assert rule.maturity == "evidence"
@@ -853,7 +869,7 @@ def test_routing_memory_matures_is_owner_scoped_and_contradictions_demote(
     assert learned == base
     assert ai_store.list_routing_rules(UUID(int=999)) == []
 
-    contradicted = ai_store.remember_decision(item, "Documents", "approved", TEST_USERNAME)
+    contradicted = ai_store.remember_decision(item, "Archives", "approved", TEST_USERNAME)
     assert contradicted is not None
     assert contradicted.contradiction_count == 1
     assert contradicted.maturity == "review"
@@ -870,30 +886,30 @@ def test_routing_memory_matures_is_owner_scoped_and_contradictions_demote(
 def test_routing_memory_owner_uuid_isolates_requester_and_duplicate_display_names(tmp_path: Path) -> None:
     vault_store, _, item = staged_image(tmp_path)
     # The UUIDs represent two accounts that may share a human-facing display name.
-    anita_item = replace(item, id=UUID(int=902), owner_user_id=UUID(int=22), owner_username="recipient")
-    robert_item = replace(item, owner_user_id=UUID(int=11), owner_username=TEST_USERNAME)
+    example_recipient_item = replace(item, id=UUID(int=902), owner_user_id=UUID(int=22), owner_username="recipient")
+    example_owner_item = replace(item, owner_user_id=UUID(int=11), owner_username=TEST_USERNAME)
     ai_store = MemoryIngestionAiStore()
-    base = assess_destination(robert_item, "personal_photo", 0.95, "")
+    base = assess_destination(example_owner_item, "personal_photo", 0.95, "")
     for owned_item, requester, decision_actor in (
-        (robert_item, TEST_USERNAME, TEST_USERNAME),
-        (anita_item, TEST_USERNAME, "recipient"),
+        (example_owner_item, TEST_USERNAME, TEST_USERNAME),
+        (example_recipient_item, TEST_USERNAME, "recipient"),
     ):
         job = ai_store.queue_analysis(owned_item.id, requester)
         assert ai_store.claim_next_job() is not None
         ai_store.complete_job(job.id, "personal_photo", "A photo", "", 0.95, (), 1, base)
         ai_store.remember_decision(owned_item, "Gallery", "approved", decision_actor)
-    assert ai_store.apply_routing_memory(anita_item, "personal_photo", "", base) == base
-    assert ai_store.apply_routing_memory(robert_item, "personal_photo", "", base) == base
+    assert ai_store.apply_routing_memory(example_recipient_item, "personal_photo", "", base) == base
+    assert ai_store.apply_routing_memory(example_owner_item, "personal_photo", "", base) == base
     assert {rule.owner_user_id for rule in ai_store.routing_rules.values()} == {UUID(int=11), UUID(int=22)}
     for _ in range(9):
-        job = ai_store.queue_analysis(robert_item.id, TEST_USERNAME)
+        job = ai_store.queue_analysis(example_owner_item.id, TEST_USERNAME)
         assert ai_store.claim_next_job() is not None
         ai_store.complete_job(job.id, "personal_photo", "A photo", "", 0.95, (), 1, base)
-        robert_rule = ai_store.remember_decision(robert_item, "Gallery", "approved", TEST_USERNAME)
-    assert robert_rule is not None and robert_rule.maturity == "established"
-    assert ai_store.apply_routing_memory(robert_item, "personal_photo", "", base).confidence_components["learned_routing"] > 0
+        example_owner_rule = ai_store.remember_decision(example_owner_item, "Gallery", "approved", TEST_USERNAME)
+    assert example_owner_rule is not None and example_owner_rule.maturity == "established"
+    assert ai_store.apply_routing_memory(example_owner_item, "personal_photo", "", base).confidence_components["learned_routing"] > 0
     # The requester remains Owner, but an Recipient-owned item must never read Owner's rule.
-    assert ai_store.apply_routing_memory(anita_item, "personal_photo", "", base) == base
+    assert ai_store.apply_routing_memory(example_recipient_item, "personal_photo", "", base) == base
 
 
 def test_established_routing_memory_retains_existing_influence(tmp_path: Path) -> None:
@@ -904,7 +920,7 @@ def test_established_routing_memory_retains_existing_influence(tmp_path: Path) -
         job = ai_store.queue_analysis(item.id, TEST_USERNAME)
         assert ai_store.claim_next_job() is not None
         ai_store.complete_job(job.id, "financial_document", "Statement", "BANK STATEMENT", 0.96, (), 1, base)
-        rule = ai_store.remember_decision(item, "Ledger", "approved", TEST_USERNAME)
+        rule = ai_store.remember_decision(item, "Documents", "approved", TEST_USERNAME)
     assert rule is not None and rule.maturity == "established"
     assert ai_store.apply_routing_memory(item, "financial_document", "BANK STATEMENT", base).confidence_components["learned_routing"] > 0
 

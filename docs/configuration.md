@@ -29,3 +29,18 @@ set it through environment configuration.
 The example Compose override sets media paths for Theatre, Gallery, Home Videos, Documents, Archives, Music, Library, Arrival Hall, and Quarantine. The backend also supports path, worker cadence, upload-limit, intelligence-service URL, and controlled-executor settings used by its current production-shaped stack.
 
 Those operational settings are not a supported public deployment contract yet. Consult the code and Compose files before changing them; do not expose executor signing keys or bind a development instance to production storage.
+
+## Source admission, Supplier LAN, and Jellyfin
+
+| Setting | Required when | Contract |
+| --- | --- | --- |
+| `PV_REPOSITORY` | Reporting an identified build or using admitted workers | Exact deployed `owner/repository`; Compose defaults to public upstream. Forks must override it. |
+| `PV_ALLOWED_SOURCE_REPOSITORIES` | KEN or section mover admission | Explicit case-sensitive exact identities; missing/invalid configuration denies workers. Supply it independently to each worker runtime. |
+| `PV_VAULT_SUPPLIER_LAN_ALLOWED_HOSTS` | Receiving Supplier payloads | One or more comma-separated exact ASCII hostnames; case-insensitive, no URL/port/wildcard. Missing/invalid configuration denies payload routes. Also configure general `PV_ALLOWED_HOSTS`, restricted LAN proxy, and TLS. |
+| `PV_JELLYFIN_MEDIA_PATH_MAP_JSON` | PV and Jellyfin use different media path namespaces | Optional JSON mapping; absent preserves literal paths, present must validate fully. |
+
+See [Supplier listener authorization](supplier-lan-configuration.md), [runtime source admission](runtime-source-identity.md), and [Jellyfin mapping](jellyfin-media-paths.md).
+
+Optional KEN needs `PV_KEN_ENABLED=true`, `PV_KEN_URL`, an explicitly admitted source identity, and a writable isolated `PV_KEN_WORK_ROOT` in production. Models belong in read-only application mounts, never catalogue content. Section mover admission also uses the source allowlist and `PV_SECTION_MOVE_ENABLED=true` in production. These workers are not enabled or deployed by the base Compose example.
+
+Cache paths (`PV_MUSIC_PLAYBACK_CACHE_PATH` and thumbnail caches) are writable derivative storage, separate from canonical media. Budget and mount them accordingly. Recoverable Delete retains canonical bytes; no age-based automatic purge is introduced. Permanent deletion is a separate elevated administrative action.

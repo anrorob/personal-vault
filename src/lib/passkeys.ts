@@ -215,3 +215,73 @@ export async function elevateVaultControl(): Promise<void> {
   });
   if (!response.ok) throw new Error("Vault Control identity confirmation failed.");
 }
+
+export async function confirmRecoverableDelete(assetId: string): Promise<void> {
+  if (!passkeysSupported()) throw new Error("This browser does not support passkeys.");
+  const endpoint = `/api/vault-master/assets/${assetId}/lifecycle/delete`;
+  const start = await options(`${endpoint}/options`);
+  const assertion = await navigator.credentials.get({ publicKey: requestOptions(start.publicKey) });
+  if (!(assertion instanceof PublicKeyCredential))
+    throw new Error("Delete passkey confirmation was cancelled.");
+  const response = await fetch(endpoint, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      challenge_id: start.challenge_id,
+      credential: authenticationJson(assertion),
+    }),
+  });
+  if (!response.ok) {
+    const body = (await response.json()) as { detail?: string };
+    throw new Error(body.detail ?? "Delete passkey confirmation failed.");
+  }
+}
+
+export async function authorizeHiddenPhotos(): Promise<void> {
+  const status = await fetch("/api/auth/hidden-photos/authorization", {
+    credentials: "include",
+    cache: "no-store",
+  });
+  if (!status.ok) throw new Error("Hidden Photos session could not be verified.");
+  if ((await status.json()).authorized === true) return;
+  if (!passkeysSupported()) throw new Error("This browser does not support passkeys.");
+  const start = await options("/api/auth/hidden-photos/authorization/options");
+  const assertion = await navigator.credentials.get({ publicKey: requestOptions(start.publicKey) });
+  if (!(assertion instanceof PublicKeyCredential))
+    throw new Error("Hidden Photos identity confirmation was cancelled.");
+  const response = await fetch("/api/auth/hidden-photos/authorization/verify", {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      challenge_id: start.challenge_id,
+      credential: authenticationJson(assertion),
+    }),
+  });
+  if (!response.ok) throw new Error("Hidden Photos identity confirmation failed.");
+}
+
+export async function authorizeHiddenVideos(): Promise<void> {
+  const status = await fetch("/api/auth/hidden-videos/authorization", {
+    credentials: "include",
+    cache: "no-store",
+  });
+  if (!status.ok) throw new Error("Hidden Videos session could not be verified.");
+  if ((await status.json()).authorized === true) return;
+  if (!passkeysSupported()) throw new Error("This browser does not support passkeys.");
+  const start = await options("/api/auth/hidden-videos/authorization/options");
+  const assertion = await navigator.credentials.get({ publicKey: requestOptions(start.publicKey) });
+  if (!(assertion instanceof PublicKeyCredential))
+    throw new Error("Hidden Videos identity confirmation was cancelled.");
+  const response = await fetch("/api/auth/hidden-videos/authorization/verify", {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      challenge_id: start.challenge_id,
+      credential: authenticationJson(assertion),
+    }),
+  });
+  if (!response.ok) throw new Error("Hidden Videos identity confirmation failed.");
+}

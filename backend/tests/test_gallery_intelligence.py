@@ -2,7 +2,7 @@ import json
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import pytest
 
@@ -30,7 +30,7 @@ def gallery_asset(tmp_path: Path) -> tuple[MemoryVaultMasterStore, CataloguedAss
     asset = CataloguedAsset(
         id=uuid4(), asset_type="Gallery", display_title="Holiday", captured_on=date(2024, 1, 1),
         location=None, vault_path="/vault/Gallery/holiday.jpg", filename="holiday.jpg", size_bytes=image.stat().st_size,
-        mime_type="image/jpeg", sha256="a" * 64, metadata={}, metadata_provenance={}, owner_username="owner",
+        mime_type="image/jpeg", sha256="a" * 64, metadata={}, metadata_provenance={}, owner_username="owner", owner_user_id=uuid5(NAMESPACE_URL, "personal-vault-test:owner"),
     )
     vault = MemoryVaultMasterStore()
     vault.catalogued_assets[asset.vault_path] = asset
@@ -53,7 +53,7 @@ def retained_florence_description(
         modified_at=datetime.now(timezone.utc), sha256=asset.sha256, state="moved",
         duplicate_of_id=None, proposed_category="Gallery", proposed_destination=asset.vault_path,
         proposal_reason="published", proposal_confidence="high", metadata={}, metadata_overrides={},
-        owner_username=asset.owner_username,
+        owner_username=asset.owner_username, owner_user_id=asset.owner_user_id,
     )
     vault.items[item.source_path] = item
     evidence = IngestionAiEvidence(
@@ -64,7 +64,7 @@ def retained_florence_description(
         recommended_destination="/vault/Gallery", decision_score=85,
         routing_band="automatic_eligible", confidence_components={}, conflicts=(),
         automatic_disqualifiers=(), decision_model_version="intelligent-routing-v4",
-        requested_by=asset.owner_username,
+        requested_by=asset.owner_username, owner_user_id=asset.owner_user_id,
         created_at=created_at or datetime.now(timezone.utc),
     )
     ingestion.evidence[evidence.id] = evidence
@@ -322,13 +322,13 @@ def test_confirmed_reference_remains_usable_after_people_reanalysis(tmp_path: Pa
 @pytest.mark.parametrize(
     "filename, face_count",
     [
-        ("IMG_5287.JPG", 1),
-        ("20170210_202909375_iOS.jpg", 1),
-        ("WP_20140215_003.jpg", 1),
-        ("DSC_0018.jpg", 1),
-        ("IMG_4052.jpeg", 1),
-        ("IMG_0078.JPG", 2),  # multi-face support; exact recall is specialist-native.
-        ("IMG_4211.jpeg", 0),  # bird/no-face control
+        ("test-single-face-a.JPG", 1),
+        ("test-single-face-b.jpg", 1),
+        ("test-single-face-c.jpg", 1),
+        ("test-single-face-d.jpg", 1),
+        ("test-single-face-e.jpeg", 1),
+        ("test-multiple-faces.JPG", 2),  # multi-face support; exact recall is specialist-native.
+        ("test-bird-no-face.jpeg", 0),  # bird/no-face control
     ],
 )
 def test_mediapipe_face_evidence_preserves_unknown_without_inventing_people(
@@ -351,7 +351,7 @@ def test_mediapipe_face_evidence_preserves_unknown_without_inventing_people(
 def test_people_service_request_uses_mediapipe_boxes_before_facenet(tmp_path: Path, monkeypatch) -> None:
     from app import gallery_people_worker
 
-    source = tmp_path / "IMG_5287.JPG"
+    source = tmp_path / "test-single-face-a.JPG"
     source.write_bytes(b"private-image")
     calls = []
 
@@ -683,3 +683,37 @@ def test_worker_does_not_implicitly_queue_historical_gallery_assets(tmp_path: Pa
     )
     assert not intelligence.jobs
     assert vault.get_catalogued_asset_by_id(asset.id) is not None
+
+
+def test_section_moved_publication_queues_gi_by_immutable_asset_identity(tmp_path: Path, monkeypatch) -> None:
+    from app import main as main_module
+    from tests.conftest import MemoryGalleryFlorenceStore
+    from app.vault_master_ingestion_ai import MemoryIngestionAiStore
+    monkeypatch.setattr(main_module, "get_ingestion_ai_store", lambda: MemoryIngestionAiStore())
+    monkeypatch.setattr("app.gallery_florence.get_gallery_florence_store", lambda: MemoryGalleryFlorenceStore())
+    vault, original = gallery_asset(tmp_path)
+    moved = replace(original, vault_path="/vault/Gallery/final.jpg", filename="final.jpg")
+    vault.catalogued_assets = {moved.vault_path: moved}
+    item = ImportItem(
+        id=uuid4(), batch_id=uuid4(), source_kind="incoming", source_path="/vault/Incoming/holiday.jpg",
+        relative_path="holiday.jpg", filename="holiday.jpg", size_bytes=original.size_bytes,
+        mime_type=original.mime_type, modified_at=datetime.now(timezone.utc), sha256=original.sha256,
+        state="moved", duplicate_of_id=None, proposed_category="Gallery",
+        proposed_destination=original.vault_path, proposal_reason="published", proposal_confidence="high",
+        metadata={}, metadata_overrides={}, owner_username=original.owner_username, owner_user_id=original.owner_user_id,
+    )
+    vault.items[item.source_path] = item
+    store = MemoryGalleryIntelligenceStore()
+    assert queue_gallery_intelligence_for_published_asset(vault, store, item.id, "owner")
+    job = store.latest_job(moved.id)
+    assert job is not None and job.asset_id == moved.id and job.status == "queued"
+    assert len(store.jobs) == 1
+
+
+@pytest.fixture(autouse=True)
+def isolated_canonical_florence(monkeypatch):
+    # These tests supply retained ingestion evidence. Canonical fallback is an
+    # injected empty store, never a connection to a real Vault database.
+    from types import SimpleNamespace
+    monkeypatch.setattr('app.gallery_florence.get_gallery_florence_store',
+                        lambda: SimpleNamespace(latest_evidence=lambda *_:None))

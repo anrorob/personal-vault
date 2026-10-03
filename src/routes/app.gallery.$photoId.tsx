@@ -9,7 +9,15 @@ import {
   Share2,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type FormEvent,
+  type PointerEvent,
+  type ReactNode,
+} from "react";
 import {
   formatPhotoDate,
   getPhotoTitle,
@@ -19,6 +27,7 @@ import {
   type GalleryFaceDetection,
   type GalleryImageDetails,
   type GalleryLocalAnnotation,
+  type GalleryCustomTag,
   type GallerySortOrder,
 } from "@/lib/gallery";
 import {
@@ -27,7 +36,15 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import {
+  Dialog,
+  DialogTrigger,
+  DialogContent,
+  DialogTitle,
+  DialogDescription,
+} from "@/components/ui/dialog";
 import { ActionProgress } from "@/components/pv/ActionProgress";
+import { confirmRecoverableDelete } from "@/lib/passkeys";
 
 type GalleryIntelligenceJobStatus = {
   id: string;
@@ -57,13 +74,15 @@ export const Route = createFileRoute("/app/gallery/$photoId")({
     photo_type: parseGalleryFilter(search.photo_type),
     content_tag: parseGalleryFilter(search.content_tag),
     person: parseGalleryFilter(search.person),
+    private_tag: parseGalleryFilter(search.private_tag),
+    hidden: search.hidden === true,
   }),
   component: PhotoViewerPage,
 });
 
 function PhotoViewerPage() {
   const { photoId } = Route.useParams();
-  const { sort, photo_type, content_tag, person } = Route.useSearch();
+  const { sort, photo_type, content_tag, person, private_tag, hidden } = Route.useSearch();
   const navigate = useNavigate();
   const [photo, setPhoto] = useState<GalleryImageDetails | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -71,6 +90,34 @@ function PhotoViewerPage() {
   const [showDetails, setShowDetails] = useState(false);
   const [faceIdentificationMode, setFaceIdentificationMode] = useState(false);
   const [selectedFaceId, setSelectedFaceId] = useState<string | null>(null);
+  const swipeStart = useRef<{ x: number; y: number } | null>(null);
+
+  const navigatePhoto = useCallback(
+    (nextPhotoId: string | null) => {
+      if (!nextPhotoId) return;
+      void navigate({
+        to: "/app/gallery/$photoId",
+        params: { photoId: nextPhotoId },
+        search: { sort, photo_type, content_tag, person, private_tag, hidden },
+      });
+    },
+    [content_tag, hidden, navigate, person, photo_type, private_tag, sort],
+  );
+
+  const beginTouchSwipe = (event: PointerEvent) => {
+    if (event.pointerType !== "touch") return;
+    swipeStart.current = { x: event.clientX, y: event.clientY };
+  };
+
+  const finishTouchSwipe = (event: PointerEvent) => {
+    const start = swipeStart.current;
+    swipeStart.current = null;
+    if (!start || event.pointerType !== "touch" || !photo) return;
+    const horizontal = event.clientX - start.x;
+    const vertical = event.clientY - start.y;
+    if (Math.abs(horizontal) < 56 || Math.abs(horizontal) <= Math.abs(vertical)) return;
+    navigatePhoto(horizontal < 0 ? photo.next_id : photo.previous_id);
+  };
 
   useEffect(() => {
     const controller = new AbortController();
@@ -83,6 +130,8 @@ function PhotoViewerPage() {
         photo_type.forEach((value) => query.append("photo_type", value));
         content_tag.forEach((value) => query.append("content_tag", value));
         person.forEach((value) => query.append("person", value));
+        private_tag.forEach((value) => query.append("private_tag", value));
+        if (hidden) query.set("include_hidden", "true");
         const response = await fetch(`/api/gallery/${photoId}?${query}`, {
           credentials: "include",
           headers: { Accept: "application/json" },
@@ -115,7 +164,7 @@ function PhotoViewerPage() {
 
     void loadPhoto();
     return () => controller.abort();
-  }, [content_tag, navigate, person, photoId, photo_type, sort]);
+  }, [content_tag, hidden, navigate, person, photoId, photo_type, private_tag, sort]);
 
   useEffect(() => {
     if (!photo) {
@@ -123,13 +172,19 @@ function PhotoViewerPage() {
     }
 
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (
+        document.querySelector('[role="dialog"]') ||
+        (event.target instanceof HTMLElement &&
+          event.target.closest("input, textarea, select, [contenteditable]"))
+      )
+        return;
       if (event.key === "Escape" && fullScreen) {
         setFullScreen(false);
       } else if (event.key === "ArrowLeft" && photo.previous_id) {
         void navigate({
           to: "/app/gallery/$photoId",
           params: { photoId: photo.previous_id },
-          search: { sort, photo_type, content_tag, person },
+          search: { sort, photo_type, content_tag, person, private_tag, hidden },
         });
       }
 
@@ -137,14 +192,14 @@ function PhotoViewerPage() {
         void navigate({
           to: "/app/gallery/$photoId",
           params: { photoId: photo.next_id },
-          search: { sort, photo_type, content_tag, person },
+          search: { sort, photo_type, content_tag, person, private_tag, hidden },
         });
       }
     };
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [content_tag, fullScreen, navigate, person, photo, photo_type, sort]);
+  }, [content_tag, fullScreen, hidden, navigate, person, photo, photo_type, private_tag, sort]);
 
   useEffect(() => {
     if (!fullScreen) return;
@@ -163,6 +218,7 @@ function PhotoViewerPage() {
           photoTypes={photo_type}
           contentTags={content_tag}
           people={person}
+          privateTags={private_tag}
         />
         <div className="pv-panel p-10 text-sm text-center text-red-300">{error}</div>
       </div>
@@ -187,6 +243,7 @@ function PhotoViewerPage() {
           photoTypes={photo_type}
           contentTags={content_tag}
           people={person}
+          privateTags={private_tag}
         />
         <button
           type="button"
@@ -205,6 +262,11 @@ function PhotoViewerPage() {
       <PhotoStage
         photo={photo}
         sort={sort}
+        onPointerDown={beginTouchSwipe}
+        onPointerUp={finishTouchSwipe}
+        onPointerCancel={() => {
+          swipeStart.current = null;
+        }}
         faceIdentification={{
           active: faceIdentificationMode,
           selectedFaceId,
@@ -218,6 +280,11 @@ function PhotoViewerPage() {
           role="dialog"
           aria-modal="true"
           aria-label={`Full-screen view of ${photo.display_title ?? getPhotoTitle(photo.name)}`}
+          onPointerDown={beginTouchSwipe}
+          onPointerUp={finishTouchSwipe}
+          onPointerCancel={() => {
+            swipeStart.current = null;
+          }}
         >
           <img
             src={
@@ -255,13 +322,27 @@ function PhotoViewerPage() {
               ? "Corrected date"
               : photo.date_source === "embedded"
                 ? "Photo taken"
-                : photo.date_source === "filename"
-                  ? "Date from filename"
-                  : photo.date_source === "file_modified"
-                    ? "File date"
-                    : "Capture date"}
+                : photo.date_source.includes("source_file_modified")
+                  ? "Captured"
+                  : photo.date_source.includes("source_file_created")
+                    ? "Captured"
+                    : photo.date_source === "filename"
+                      ? "Date from filename"
+                      : photo.date_source === "file_modified"
+                        ? "File date"
+                        : "Capture date"}
             : {formatPhotoDate(photo.captured_on)}
           </h1>
+          {photo.date_source.includes("source_file_modified") ? (
+            <p className="text-xs mt-1" style={{ color: "var(--pv-text-dim)" }}>
+              Date provenance: source file modified
+            </p>
+          ) : null}
+          {photo.date_source.includes("source_file_created") ? (
+            <p className="text-xs mt-1" style={{ color: "var(--pv-text-dim)" }}>
+              Date provenance: source file created
+            </p>
+          ) : null}
           {photo.location && (
             <p className="text-xs mt-1" style={{ color: "var(--pv-text-dim)" }}>
               {photo.location}
@@ -284,9 +365,6 @@ function PhotoViewerPage() {
             <Info size={14} />
             {showDetails ? "Hide details" : "Details"}
           </button>
-          <p className="text-xs" style={{ color: "var(--pv-text-dim)" }}>
-            Use the arrow keys or viewer controls to move between photos.
-          </p>
         </div>
       </div>
       {showDetails && (
@@ -304,7 +382,7 @@ function PhotoViewerPage() {
   );
 }
 
-function PhotoDetails({
+export function PhotoDetails({
   photo,
   onUpdated,
   sort,
@@ -346,11 +424,6 @@ function PhotoDetails({
     captured_on: photo.captured_on ?? "",
     location: photo.location ?? "",
   });
-  const provenance = [
-    ["Title", photo.metadata_provenance?.display_title],
-    ["Date", photo.metadata_provenance?.captured_on],
-    ["Location", photo.metadata_provenance?.location],
-  ].filter((entry): entry is [string, string] => Boolean(entry[1]));
 
   useEffect(() => {
     if (!photo.can_edit || !photo.asset_id) return;
@@ -535,8 +608,6 @@ function PhotoDetails({
         recipientUserIds: policy.recipients.map((recipient) => recipient.user_id),
         shareMode: "quick",
       });
-      setEditing(false);
-      setEditingAccess(true);
     } catch (requestError) {
       setAccessError(
         requestError instanceof Error
@@ -582,6 +653,7 @@ function PhotoDetails({
       setAccessDraft({
         mode: policy.mode,
         recipientUserIds: policy.recipients.map((recipient) => recipient.user_id),
+        shareMode: "quick",
       });
       setEditingAccess(false);
     } catch (requestError) {
@@ -663,83 +735,277 @@ function PhotoDetails({
 
   return (
     <section className="pv-panel p-5 text-sm" aria-label="Photo details">
-      <div className="grid gap-5 md:grid-cols-2">
-        <div className="space-y-2">
-          <h2 className="font-medium" style={{ color: "var(--pv-silver)" }}>
-            Permanent file
-          </h2>
-          <p className="break-all" style={{ color: "var(--pv-text-dim)" }}>
-            {photo.vault_path}
-          </p>
-          <p style={{ color: "var(--pv-text-dim)" }}>
-            {photo.name} · {formatBytes(photo.size)} · {photo.mime_type}
-          </p>
-          <p className="break-all font-mono text-[10px]" style={{ color: "var(--pv-text-dim)" }}>
-            SHA-256 {photo.sha256}
-          </p>
-        </div>
-        <div className="space-y-2">
-          <div className="flex items-center justify-between gap-3">
-            <h2 className="font-medium" style={{ color: "var(--pv-silver)" }}>
-              Metadata provenance
-            </h2>
-            {access && access.mode !== "private" && (
-              <span className="text-xs" style={{ color: "var(--pv-gold)" }}>
-                {access.mode === "everyone"
-                  ? "Shared with everyone"
-                  : `Shared with ${access.recipients.length} ${access.recipients.length === 1 ? "person" : "people"}`}
-              </span>
-            )}
-            {photo.can_edit && !editingAccess && (
-              <div className="flex flex-wrap justify-end gap-x-4 gap-y-2">
-                {!editing && (
+      <header
+        aria-label="Photo actions"
+        className="flex flex-wrap items-center justify-between gap-3"
+      >
+        <h2 className="min-w-0 break-all font-medium">
+          {photo.name} · {formatBytes(photo.size)}
+        </h2>
+        {photo.can_edit && photo.asset_id && (
+          <div className="flex flex-wrap items-center gap-2">
+            <PhotoDialog
+              title="Edit metadata"
+              open={editing}
+              onOpenChange={(open) => {
+                if (saving) return;
+                resetDraft();
+                setEditError(null);
+                setEditing(open);
+              }}
+              trigger={
+                <>
+                  <Pencil size={14} />
+                  Edit metadata
+                </>
+              }
+            >
+              <form
+                className="mt-5 space-y-4 pt-5"
+                style={{ borderTop: "1px solid var(--pv-border)" }}
+                onSubmit={saveChanges}
+              >
+                <div>
+                  <h2 className="font-medium" style={{ color: "var(--pv-silver)" }}>
+                    Edit permanent descriptive metadata
+                  </h2>
+                  <p className="mt-1 text-xs" style={{ color: "var(--pv-text-dim)" }}>
+                    The file itself is unchanged. This correction is saved by Vault Master and
+                    recorded in its history.
+                  </p>
+                </div>
+                <div className="grid gap-4 md:grid-cols-3">
+                  <MetadataInput
+                    label="Display title"
+                    value={draft.display_title}
+                    onChange={(value) =>
+                      setDraft((current) => ({ ...current, display_title: value }))
+                    }
+                  />
+                  <MetadataInput
+                    label="Capture date"
+                    type="date"
+                    value={draft.captured_on}
+                    onChange={(value) =>
+                      setDraft((current) => ({ ...current, captured_on: value }))
+                    }
+                  />
+                  <MetadataInput
+                    label="Location"
+                    value={draft.location}
+                    placeholder="Not recorded"
+                    onChange={(value) => setDraft((current) => ({ ...current, location: value }))}
+                  />
+                </div>
+                {editError && (
+                  <p className="text-xs" style={{ color: "#fca5a5" }}>
+                    {editError}
+                  </p>
+                )}
+                <div className="flex flex-wrap justify-end gap-2">
                   <button
                     type="button"
-                    className="inline-flex items-center gap-1 text-xs"
-                    style={{ color: "var(--pv-gold)" }}
+                    className="rounded-md px-3 py-2 text-xs"
+                    style={{ color: "var(--pv-silver)", border: "1px solid var(--pv-border)" }}
+                    disabled={saving}
                     onClick={() => {
                       resetDraft();
                       setEditError(null);
-                      setEditing(true);
+                      setEditing(false);
                     }}
                   >
-                    <Pencil size={13} />
-                    Edit metadata
+                    Cancel
                   </button>
-                )}
-                <button
-                  type="button"
-                  className="inline-flex items-center gap-1 text-xs"
-                  style={{ color: "var(--pv-gold)" }}
-                  disabled={accessSaving}
-                  onClick={startAccessEditing}
+                  <button
+                    type="submit"
+                    className="pv-btn-primary px-3 py-2 text-xs"
+                    disabled={saving}
+                  >
+                    {saving ? "Saving…" : "Save correction"}
+                  </button>
+                </div>
+              </form>
+            </PhotoDialog>
+            <PhotoDialog
+              title="Manage sharing"
+              open={editingAccess}
+              onOpenChange={(open) => {
+                if (accessSaving) return;
+                setEditingAccess(open);
+                if (open) void startAccessEditing();
+              }}
+              trigger={
+                <>
+                  <Share2 size={14} />
+                  Manage sharing
+                </>
+              }
+            >
+              {accessSaving && <p role="status">Loading sharing…</p>}
+              {accessError && !access && <p role="alert">{accessError}</p>}
+              {access && !accessSaving && (
+                <form
+                  className="mt-5 space-y-4 pt-5"
+                  style={{ borderTop: "1px solid var(--pv-border)" }}
+                  onSubmit={saveAccessChanges}
                 >
-                  <Share2 size={13} />
-                  {accessSaving ? "Loading…" : "Manage sharing"}
-                </button>
-              </div>
-            )}
+                  <div>
+                    <h2 className="font-medium" style={{ color: "var(--pv-silver)" }}>
+                      Sharing
+                    </h2>
+                    <p className="mt-1 text-xs" style={{ color: "var(--pv-text-dim)" }}>
+                      This item remains owned by {access.owner_username}. Sharing never moves or
+                      copies its file.
+                    </p>
+                  </div>
+                  <fieldset className="space-y-3">
+                    <legend className="text-xs" style={{ color: "var(--pv-silver)" }}>
+                      Share this item
+                    </legend>
+                    {(
+                      [
+                        ["private", "Private", "Only you can see this item."],
+                        [
+                          "everyone",
+                          "Share in my Vault — Everyone",
+                          "Everyone in this Vault can see this item.",
+                        ],
+                        [
+                          "specific",
+                          "Share in my Vault — Specific people",
+                          "Choose the people who can see this item.",
+                        ],
+                      ] as const
+                    ).map(([mode, label, description]) => (
+                      <label
+                        key={mode}
+                        className="flex cursor-pointer gap-3 rounded-md p-3"
+                        style={{ border: "1px solid var(--pv-border)" }}
+                      >
+                        <input
+                          type="radio"
+                          name="asset-sharing-mode"
+                          value={mode}
+                          checked={accessDraft.mode === mode}
+                          onChange={() => setAccessDraft((current) => ({ ...current, mode }))}
+                        />
+                        <span>
+                          <span className="block text-xs" style={{ color: "var(--pv-silver)" }}>
+                            {label}
+                          </span>
+                          <span className="block text-xs" style={{ color: "var(--pv-text-dim)" }}>
+                            {description}
+                          </span>
+                        </span>
+                      </label>
+                    ))}
+                  </fieldset>
+                  {accessDraft.mode === "specific" && (
+                    <div className="space-y-2">
+                      <p className="text-xs" style={{ color: "var(--pv-silver)" }}>
+                        Specific people
+                      </p>
+                      {access.eligible_users.map((person) => {
+                        const selected = accessDraft.recipientUserIds.includes(person.user_id);
+                        return (
+                          <label
+                            key={person.user_id}
+                            className="flex cursor-pointer items-center gap-3 rounded-md px-3 py-2"
+                            style={{ border: "1px solid var(--pv-border)" }}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={selected}
+                              onChange={() =>
+                                setAccessDraft((current) => ({
+                                  ...current,
+                                  recipientUserIds: selected
+                                    ? current.recipientUserIds.filter((id) => id !== person.user_id)
+                                    : [...current.recipientUserIds, person.user_id],
+                                }))
+                              }
+                            />
+                            <span
+                              className="flex h-7 w-7 items-center justify-center rounded-full text-[10px]"
+                              style={{ background: "var(--pv-border)", color: "var(--pv-silver)" }}
+                            >
+                              {person.avatar_label}
+                            </span>
+                            <span className="text-xs" style={{ color: "var(--pv-silver)" }}>
+                              {person.display_name}
+                            </span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  )}
+                  {accessDraft.mode !== "private" && (
+                    <label className="block text-xs" style={{ color: "var(--pv-silver)" }}>
+                      Release
+                      <select
+                        className="ml-3 rounded-md px-2 py-1"
+                        value={accessDraft.shareMode}
+                        onChange={(event) =>
+                          setAccessDraft((current) => ({
+                            ...current,
+                            shareMode: event.target.value as "quick" | "standard",
+                          }))
+                        }
+                      >
+                        <option value="quick">Quick Share — available now</option>
+                        <option value="standard">Standard Share — review for 3 minutes</option>
+                      </select>
+                    </label>
+                  )}
+                  {accessError && (
+                    <p className="text-xs" style={{ color: "#fca5a5" }}>
+                      {accessError}
+                    </p>
+                  )}
+                  <div className="flex flex-wrap justify-end gap-2">
+                    <button
+                      type="button"
+                      className="rounded-md px-3 py-2 text-xs"
+                      style={{ color: "var(--pv-silver)", border: "1px solid var(--pv-border)" }}
+                      disabled={accessSaving}
+                      onClick={() => {
+                        setAccessError(null);
+                        setEditingAccess(false);
+                      }}
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="submit"
+                      className="pv-btn-primary px-3 py-2 text-xs"
+                      disabled={accessSaving}
+                    >
+                      {accessSaving ? "Saving…" : "Save sharing"}
+                    </button>
+                  </div>
+                </form>
+              )}
+            </PhotoDialog>
+            <GalleryOptions photo={photo} sort={sort} />
           </div>
-          {provenance.length ? (
-            provenance.map(([label, source]) => (
-              <p key={label} className="flex justify-between gap-4 text-xs">
-                <span style={{ color: "var(--pv-text-dim)" }}>{label}</span>
-                <span style={{ color: "var(--pv-silver)" }}>{source.replaceAll("_", " ")}</span>
-              </p>
-            ))
-          ) : (
+        )}
+      </header>
+      {photo.can_edit && photo.asset_id && (
+        <div className="mt-5 space-y-2 pt-5" style={{ borderTop: "1px solid var(--pv-border)" }}>
+          <h2 className="font-medium" style={{ color: "var(--pv-silver)" }}>
+            Florence visual description
+          </h2>
+          {descriptionLoading && (
             <p className="text-xs" style={{ color: "var(--pv-text-dim)" }}>
-              No provenance has been recorded.
+              Loading visual description…
             </p>
           )}
+          {descriptionError && <p className="text-xs text-red-300">{descriptionError}</p>}
+          {!descriptionLoading && !descriptionError && aiEvidence && (
+            <GalleryVisualDescription evidence={aiEvidence} />
+          )}
         </div>
-      </div>
-      {photo.description || photo.captured_at ? (
-        <div className="mt-4 space-y-1 text-xs" style={{ color: "var(--pv-text-dim)" }}>
-          {photo.captured_at ? <p>Captured: {photo.captured_at}</p> : null}
-          {photo.description ? <p>{photo.description}</p> : null}
-        </div>
-      ) : null}
+      )}
       <GalleryIntelligenceMetadata
         photo={photo}
         onUpdated={onUpdated}
@@ -760,234 +1026,6 @@ function PhotoDetails({
           setFaceIdentificationMode={setFaceIdentificationMode}
           selectedFaceId={selectedFaceId}
           setSelectedFaceId={setSelectedFaceId}
-        />
-      )}
-      {photo.can_edit && photo.asset_id && (
-        <div className="mt-5 space-y-2 pt-5" style={{ borderTop: "1px solid var(--pv-border)" }}>
-          <h2 className="font-medium" style={{ color: "var(--pv-silver)" }}>
-            Florence visual description
-          </h2>
-          {descriptionLoading && (
-            <p className="text-xs" style={{ color: "var(--pv-text-dim)" }}>
-              Loading visual description…
-            </p>
-          )}
-          {descriptionError && <p className="text-xs text-red-300">{descriptionError}</p>}
-          {!descriptionLoading && !descriptionError && aiEvidence && (
-            <GalleryVisualDescription evidence={aiEvidence} />
-          )}
-        </div>
-      )}
-      {editing && (
-        <form
-          className="mt-5 space-y-4 pt-5"
-          style={{ borderTop: "1px solid var(--pv-border)" }}
-          onSubmit={saveChanges}
-        >
-          <div>
-            <h2 className="font-medium" style={{ color: "var(--pv-silver)" }}>
-              Edit permanent descriptive metadata
-            </h2>
-            <p className="mt-1 text-xs" style={{ color: "var(--pv-text-dim)" }}>
-              The file itself is unchanged. This correction is saved by Vault Master and recorded in
-              its history.
-            </p>
-          </div>
-          <div className="grid gap-4 md:grid-cols-3">
-            <MetadataInput
-              label="Display title"
-              value={draft.display_title}
-              onChange={(value) => setDraft((current) => ({ ...current, display_title: value }))}
-            />
-            <MetadataInput
-              label="Capture date"
-              type="date"
-              value={draft.captured_on}
-              onChange={(value) => setDraft((current) => ({ ...current, captured_on: value }))}
-            />
-            <MetadataInput
-              label="Location"
-              value={draft.location}
-              placeholder="Not recorded"
-              onChange={(value) => setDraft((current) => ({ ...current, location: value }))}
-            />
-          </div>
-          {editError && (
-            <p className="text-xs" style={{ color: "#fca5a5" }}>
-              {editError}
-            </p>
-          )}
-          <div className="flex flex-wrap justify-end gap-2">
-            <button
-              type="button"
-              className="rounded-md px-3 py-2 text-xs"
-              style={{ color: "var(--pv-silver)", border: "1px solid var(--pv-border)" }}
-              disabled={saving}
-              onClick={() => {
-                resetDraft();
-                setEditError(null);
-                setEditing(false);
-              }}
-            >
-              Cancel
-            </button>
-            <button type="submit" className="pv-btn-primary px-3 py-2 text-xs" disabled={saving}>
-              {saving ? "Saving…" : "Save correction"}
-            </button>
-          </div>
-        </form>
-      )}
-      {editingAccess && access && (
-        <form
-          className="mt-5 space-y-4 pt-5"
-          style={{ borderTop: "1px solid var(--pv-border)" }}
-          onSubmit={saveAccessChanges}
-        >
-          <div>
-            <h2 className="font-medium" style={{ color: "var(--pv-silver)" }}>
-              Sharing
-            </h2>
-            <p className="mt-1 text-xs" style={{ color: "var(--pv-text-dim)" }}>
-              This item remains owned by {access.owner_username}. Sharing never moves or copies its
-              file.
-            </p>
-          </div>
-          <fieldset className="space-y-3">
-            <legend className="text-xs" style={{ color: "var(--pv-silver)" }}>
-              Share this item
-            </legend>
-            {(
-              [
-                ["private", "Private", "Only you can see this item."],
-                [
-                  "everyone",
-                  "Share in my Vault — Everyone",
-                  "Everyone in this Vault can see this item.",
-                ],
-                [
-                  "specific",
-                  "Share in my Vault — Specific people",
-                  "Choose the people who can see this item.",
-                ],
-              ] as const
-            ).map(([mode, label, description]) => (
-              <label
-                key={mode}
-                className="flex cursor-pointer gap-3 rounded-md p-3"
-                style={{ border: "1px solid var(--pv-border)" }}
-              >
-                <input
-                  type="radio"
-                  name="asset-sharing-mode"
-                  value={mode}
-                  checked={accessDraft.mode === mode}
-                  onChange={() => setAccessDraft((current) => ({ ...current, mode }))}
-                />
-                <span>
-                  <span className="block text-xs" style={{ color: "var(--pv-silver)" }}>
-                    {label}
-                  </span>
-                  <span className="block text-xs" style={{ color: "var(--pv-text-dim)" }}>
-                    {description}
-                  </span>
-                </span>
-              </label>
-            ))}
-          </fieldset>
-          {accessDraft.mode === "specific" && (
-            <div className="space-y-2">
-              <p className="text-xs" style={{ color: "var(--pv-silver)" }}>
-                Specific people
-              </p>
-              {access.eligible_users.map((person) => {
-                const selected = accessDraft.recipientUserIds.includes(person.user_id);
-                return (
-                  <label
-                    key={person.user_id}
-                    className="flex cursor-pointer items-center gap-3 rounded-md px-3 py-2"
-                    style={{ border: "1px solid var(--pv-border)" }}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={selected}
-                      onChange={() =>
-                        setAccessDraft((current) => ({
-                          ...current,
-                          recipientUserIds: selected
-                            ? current.recipientUserIds.filter((id) => id !== person.user_id)
-                            : [...current.recipientUserIds, person.user_id],
-                        }))
-                      }
-                    />
-                    <span
-                      className="flex h-7 w-7 items-center justify-center rounded-full text-[10px]"
-                      style={{ background: "var(--pv-border)", color: "var(--pv-silver)" }}
-                    >
-                      {person.avatar_label}
-                    </span>
-                    <span className="text-xs" style={{ color: "var(--pv-silver)" }}>
-                      {person.display_name}
-                    </span>
-                  </label>
-                );
-              })}
-            </div>
-          )}
-          {accessDraft.mode !== "private" && (
-            <label className="block text-xs" style={{ color: "var(--pv-silver)" }}>
-              Release
-              <select
-                className="ml-3 rounded-md px-2 py-1"
-                value={accessDraft.shareMode}
-                onChange={(event) =>
-                  setAccessDraft((current) => ({
-                    ...current,
-                    shareMode: event.target.value as "quick" | "standard",
-                  }))
-                }
-              >
-                <option value="quick">Quick Share — available now</option>
-                <option value="standard">Standard Share — review for 3 minutes</option>
-              </select>
-            </label>
-          )}
-          {accessError && (
-            <p className="text-xs" style={{ color: "#fca5a5" }}>
-              {accessError}
-            </p>
-          )}
-          <div className="flex flex-wrap justify-end gap-2">
-            <button
-              type="button"
-              className="rounded-md px-3 py-2 text-xs"
-              style={{ color: "var(--pv-silver)", border: "1px solid var(--pv-border)" }}
-              disabled={accessSaving}
-              onClick={() => {
-                setAccessError(null);
-                setEditingAccess(false);
-              }}
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              className="pv-btn-primary px-3 py-2 text-xs"
-              disabled={accessSaving}
-            >
-              {accessSaving ? "Saving…" : "Save sharing"}
-            </button>
-          </div>
-        </form>
-      )}
-      {photo.can_edit && photo.asset_id && (
-        <GalleryOptions
-          assetId={photo.asset_id}
-          lifecycleState={photo.lifecycle_state ?? "active"}
-          sort={sort}
-          job={intelligenceJob}
-          queueing={intelligenceQueueing}
-          intelligence={photo.intelligence}
-          onAnalysePhoto={queueGalleryIntelligence}
         />
       )}
     </section>
@@ -1606,7 +1644,7 @@ function GalleryPeopleSection({
   );
 }
 
-function GalleryIntelligenceMetadata({
+export function GalleryIntelligenceMetadata({
   photo,
   onUpdated,
   job,
@@ -1742,6 +1780,7 @@ function GalleryIntelligenceMetadata({
           )}
         </div>
       ))}
+      <GalleryCustomTags photo={photo} onUpdated={onUpdated} />
       {error && <p className="text-xs text-red-300">{error}</p>}
     </section>
   );
@@ -1767,336 +1806,456 @@ function GalleryVisualDescription({ evidence }: { evidence: AiEvidence }) {
   );
 }
 
-type GalleryOptionDialog = "menu" | "move" | "ocr" | null;
-type MovePreflight = { ready: boolean; destination_path: string | null; reason: string | null };
-type MoveCategory = "Gallery" | "Home Videos" | "Documents" | "Archives" | "Music";
-const MOVE_CATEGORIES: MoveCategory[] = [
-  "Gallery",
-  "Home Videos",
-  "Documents",
-  "Archives",
-  "Music",
-];
-
-function GalleryOptions({
-  assetId,
-  lifecycleState,
-  sort,
-  job,
-  queueing,
-  intelligence,
-  onAnalysePhoto,
+export function PhotoDialog({
+  title,
+  open,
+  onOpenChange,
+  trigger,
+  children,
 }: {
-  assetId: string;
-  lifecycleState: "active" | "hidden";
+  title: string;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  trigger: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogTrigger asChild>
+        <button
+          type="button"
+          className="inline-flex min-h-11 items-center gap-2 rounded-md border px-3 py-2 text-xs"
+        >
+          {trigger}
+        </button>
+      </DialogTrigger>
+      <DialogContent className="pv-panel z-[100] max-h-[calc(100dvh-2rem)] w-[calc(100vw-2rem)] max-w-2xl overflow-x-hidden overflow-y-auto motion-reduce:animate-none">
+        <DialogTitle>{title}</DialogTitle>
+        <DialogDescription className="sr-only">{title} for this photo</DialogDescription>
+        {children}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function PhotoTechnicalDetails({ photo }: { photo: GalleryImageDetails }) {
+  const provenance = [
+    ["Title", photo.metadata_provenance?.display_title],
+    ["Date", photo.metadata_provenance?.captured_on],
+    ["Location", photo.metadata_provenance?.location],
+  ].filter((entry): entry is [string, string] => Boolean(entry[1]));
+  return (
+    <div className="space-y-3 break-all text-sm">
+      <p>
+        {photo.name} · {formatBytes(photo.size)}
+      </p>
+      <dl className="space-y-2">
+        <div>
+          <dt>Canonical Vault path</dt>
+          <dd>{photo.vault_path}</dd>
+        </div>
+        <div>
+          <dt>MIME type</dt>
+          <dd>{photo.mime_type}</dd>
+        </div>
+        <div>
+          <dt>SHA-256</dt>
+          <dd className="font-mono text-xs">{photo.sha256}</dd>
+        </div>
+        {photo.captured_at && (
+          <div>
+            <dt>Captured source metadata</dt>
+            <dd>{photo.captured_at}</dd>
+          </div>
+        )}
+        {photo.description && (
+          <div>
+            <dt>Source description</dt>
+            <dd>{photo.description}</dd>
+          </div>
+        )}
+      </dl>
+      <h3>Metadata provenance</h3>
+      {provenance.length ? (
+        provenance.map(([label, source]) => (
+          <p key={label}>
+            {label}: {source.replaceAll("_", " ")}
+          </p>
+        ))
+      ) : (
+        <p>No provenance has been recorded.</p>
+      )}
+    </div>
+  );
+}
+
+type SectionMoveStatus = {
+  ready?: boolean;
+  reason?: string;
+  status?: string;
+  operation_id?: string;
+};
+export function GalleryOptions({
+  photo,
+  sort,
+}: {
+  photo: GalleryImageDetails;
   sort: GallerySortOrder;
-  job: GalleryIntelligenceJobStatus | null;
-  queueing: boolean;
-  intelligence: GalleryIntelligenceTerm[];
-  onAnalysePhoto: () => Promise<void>;
 }) {
   const navigate = useNavigate();
-  const [dialog, setDialog] = useState<GalleryOptionDialog>(null);
+  const [dialog, setDialog] = useState<"menu" | "move" | "technical" | "delete" | null>(null);
   const [destinations, setDestinations] = useState<string[]>([]);
-  const [category, setCategory] = useState<MoveCategory>("Gallery");
   const [destination, setDestination] = useState("");
-  const [preflight, setPreflight] = useState<MovePreflight | null>(null);
+  const [preflight, setPreflight] = useState<SectionMoveStatus | null>(null);
+  const [result, setResult] = useState<SectionMoveStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const close = () => {
-    if (!busy) {
-      setDialog(null);
-      setError(null);
-      setPreflight(null);
-    }
-  };
-  const request = async (url: string, options?: RequestInit) => {
+  const base = `/api/vault-master/assets/${photo.asset_id}/section-move`;
+  async function request(url: string, options?: RequestInit) {
     const response = await fetch(url, { credentials: "include", ...options });
-    const body = (await response.json()) as MovePreflight & { detail?: string };
-    if (!response.ok) throw new Error(body.detail ?? "Request failed");
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.detail ?? "The request could not be completed.");
     return body;
-  };
-  async function loadDestinations(selectedCategory: MoveCategory) {
+  }
+  async function run(action: () => Promise<void>) {
     setBusy(true);
     setError(null);
     try {
-      const body = await request(
-        `/api/vault-master/lifecycle/move-destinations?category=${encodeURIComponent(selectedCategory)}`,
-      );
-      const folders = (body as unknown as { destinations: string[] }).destinations;
-      setDestinations(folders);
-      setDestination(folders[0] ?? "");
+      await action();
     } catch (cause) {
-      setError(
-        cause instanceof Error ? cause.message : "Existing Vault folders could not be loaded",
-      );
+      setError(cause instanceof Error ? cause.message : "The request could not be completed.");
     } finally {
       setBusy(false);
     }
   }
   async function openMove() {
     setDialog("move");
-    await loadDestinations(category);
+    setPreflight(null);
+    setResult(null);
+    setDestinations([]);
+    setDestination("");
+    await run(async () => {
+      const body = await request(`${base}/destinations`);
+      setDestinations(body.destinations);
+      setDestination(body.destinations[0] ?? "");
+    });
   }
-  async function checkMove() {
-    setBusy(true);
-    setError(null);
-    try {
-      setPreflight(
-        await request(`/api/vault-master/assets/${assetId}/lifecycle/move-preflight`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            category,
-            destination_folder: destination.replace(
-              new RegExp(`^/vault/${category.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/?`),
-              "",
-            ),
-          }),
-        }),
-      );
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Move preflight failed");
-    } finally {
-      setBusy(false);
-    }
-  }
-  async function confirmMove() {
-    setBusy(true);
-    setError(null);
-    try {
-      await request(`/api/vault-master/assets/${assetId}/lifecycle/move-confirm`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          category,
-          destination_folder: destination.replace(
-            new RegExp(`^/vault/${category.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/?`),
-            "",
-          ),
-          confirm: true,
-        }),
-      });
-      void navigate({
-        to: "/app/gallery",
-        search: { sort, photo_type: [], content_tag: [], person: [] },
-      });
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Move was refused");
-    } finally {
-      setBusy(false);
-    }
-  }
-  async function queueGalleryIntelligence() {
-    setBusy(true);
-    setError(null);
-    try {
-      await onAnalysePhoto();
-    } catch (cause) {
-      setError(
-        cause instanceof Error
-          ? cause.message
-          : "Gallery Intelligence analysis could not be queued",
-      );
-    } finally {
-      setBusy(false);
-    }
-  }
-  async function changeLifecycle() {
-    setBusy(true);
-    setError(null);
-    try {
-      const action = lifecycleState === "hidden" ? "unhide" : "hide";
-      await request(`/api/vault-master/assets/${assetId}/lifecycle/${action}`, {
-        method: "POST",
-      });
-      void navigate({
-        to: "/app/gallery",
-        search: { sort, photo_type: [], content_tag: [], person: [] },
-      });
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Gallery visibility could not be changed");
-    } finally {
-      setBusy(false);
-    }
-  }
+  useEffect(() => {
+    if (!result?.operation_id || result.status === "completed" || result.status === "failed")
+      return;
+    const controller = new AbortController();
+    const timer = window.setInterval(() => {
+      void request(`${base}/${result.operation_id}`, { signal: controller.signal })
+        .then(setResult)
+        .catch((cause) => {
+          if (!controller.signal.aborted)
+            setError(cause instanceof Error ? cause.message : "Move status is unavailable.");
+        });
+    }, 1500);
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [base, result?.operation_id, result?.status]);
   return (
-    <div
-      className="mt-5 flex justify-end"
-      style={{ borderTop: "1px solid var(--pv-border)", paddingTop: "1.25rem" }}
+    <PhotoDialog
+      title={
+        dialog === "technical"
+          ? "Technical details"
+          : dialog === "move"
+            ? "Move photo"
+            : dialog === "delete"
+              ? "Delete this photo?"
+              : "Options"
+      }
+      open={dialog !== null}
+      trigger="Options"
+      onOpenChange={(open) => {
+        if (!busy) {
+          setDialog(open ? "menu" : null);
+          setError(null);
+        }
+      }}
     >
-      <button
-        type="button"
-        className="rounded-md px-3 py-2 text-xs"
-        style={{ color: "var(--pv-gold)", border: "1px solid var(--pv-border)" }}
-        onClick={() => setDialog("menu")}
-      >
-        Options
-      </button>
-      {dialog && dialog !== "ocr" && (
-        <div
-          className="fixed inset-0 z-[90] flex items-center justify-center bg-black/70 p-4"
-          role="dialog"
-          aria-modal="true"
-          aria-label="Gallery options"
-        >
-          <div className="pv-panel w-full max-w-md space-y-4 p-5">
-            {dialog === "menu" && (
-              <>
-                <h2 className="font-medium" style={{ color: "var(--pv-silver)" }}>
-                  Options
-                </h2>
-                <div className="grid gap-2">
-                  <button
-                    type="button"
-                    className="rounded-md px-3 py-2 text-left text-sm"
-                    onClick={() => void openMove()}
-                  >
-                    Move
-                  </button>
-                  <button
-                    type="button"
-                    className="rounded-md px-3 py-2 text-left text-sm"
-                    disabled={busy}
-                    onClick={() => void changeLifecycle()}
-                  >
-                    {lifecycleState === "hidden" ? "Restore" : "Hide"}
-                  </button>
-                  <button
-                    type="button"
-                    className="rounded-md px-3 py-2 text-left text-sm"
-                    disabled={busy || queueing}
-                    onClick={() => void queueGalleryIntelligence()}
-                  >
-                    {busy || queueing ? "Queueing photo analysis…" : "Analyse photo"}
-                  </button>
-                  <button
-                    type="button"
-                    className="rounded-md px-3 py-2 text-left text-sm"
-                    disabled={busy}
-                    onClick={() => setDialog("ocr")}
-                  >
-                    Analyse text / OCR
-                  </button>
-                </div>
-                {job && (
-                  <div className="space-y-2 text-xs" style={{ color: "var(--pv-text-dim)" }}>
-                    <ActionProgress
-                      state={job.status === "processing" ? "running" : job.status}
-                      label={`Gallery Intelligence: ${galleryIntelligenceStatusLabel(job)}`}
-                      onRetry={
-                        job.status === "failed" && !busy && !queueing
-                          ? () => void queueGalleryIntelligence()
-                          : undefined
-                      }
-                    />
-                    {job.status === "completed" && (
-                      <GalleryIntelligenceResult intelligence={intelligence} />
-                    )}
-                    {job.status === "failed" && (
-                      <>
-                        <p className="text-red-300">
-                          {job.error ?? "Gallery Intelligence analysis failed."}
-                        </p>
-                      </>
-                    )}
-                  </div>
-                )}
-              </>
-            )}
-            {dialog === "move" && (
-              <>
-                <h2 className="font-medium" style={{ color: "var(--pv-silver)" }}>
-                  Move file
-                </h2>
-                <p className="text-xs" style={{ color: "var(--pv-text-dim)" }}>
-                  Select an existing Vault-section folder. No folder is created and no file can be
-                  overwritten.
-                </p>
+      {dialog === "menu" && (
+        <div className="grid gap-2">
+          <button
+            type="button"
+            className="min-h-11 rounded-md border p-3 text-left"
+            onClick={() => void openMove()}
+          >
+            Move
+          </button>
+          <button
+            type="button"
+            className="min-h-11 rounded-md border p-3 text-left"
+            disabled={busy}
+            onClick={() =>
+              void run(async () => {
+                await request(
+                  `/api/vault-master/assets/${photo.asset_id}/lifecycle/${photo.lifecycle_state === "hidden" ? "unhide" : "hide"}`,
+                  { method: "POST" },
+                );
+                void navigate({
+                  to: "/app/gallery",
+                  search: { sort, photo_type: [], content_tag: [], person: [], private_tag: [] },
+                });
+              })
+            }
+          >
+            {photo.lifecycle_state === "hidden" ? "Restore" : "Hide"}
+          </button>
+          <button
+            type="button"
+            className="min-h-11 rounded-md border p-3 text-left"
+            disabled={busy}
+            onClick={() => setDialog("delete")}
+          >
+            Delete
+          </button>
+          <button
+            type="button"
+            className="min-h-11 rounded-md border p-3 text-left"
+            onClick={() => setDialog("technical")}
+          >
+            Technical details
+          </button>
+        </div>
+      )}
+      {dialog === "technical" && <PhotoTechnicalDetails photo={photo} />}
+      {dialog === "delete" && (
+        <div className="space-y-4">
+          <p>
+            This photo will disappear from Personal Vault for everyone, including you. It will not
+            appear in Gallery or Hidden, and existing sharing will be removed. The original file and
+            metadata will be retained. You can recover it later from Arrival Hall → Find an existing
+            Vault asset.
+          </p>
+          <p>Delete requires passkey confirmation.</p>
+          <div className="flex gap-3">
+            <button
+              type="button"
+              className="min-h-11 rounded-md border px-4"
+              disabled={busy}
+              onClick={() => setDialog("menu")}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="pv-btn-primary min-h-11 px-4"
+              disabled={busy}
+              onClick={() =>
+                void run(async () => {
+                  await confirmRecoverableDelete(photo.asset_id);
+                  void navigate({
+                    to: "/app/gallery",
+                    search: { sort, photo_type: [], content_tag: [], person: [], private_tag: [] },
+                  });
+                })
+              }
+            >
+              {busy ? "Confirming…" : "Delete"}
+            </button>
+          </div>
+        </div>
+      )}
+      {dialog === "move" && (
+        <div className="space-y-4">
+          <p>
+            Move this photo to the section where it belongs. Its identity, ownership and metadata
+            stay attached.
+          </p>
+          {busy && <p role="status">Checking…</p>}
+          {!busy && !destinations.length && !error && (
+            <p>No valid alternative destination is currently available.</p>
+          )}
+          {!!destinations.length && !result && (
+            <>
+              <label className="block">
+                Destination section
                 <select
-                  value={category}
-                  className="w-full rounded-md bg-transparent px-3 py-2 text-xs"
-                  onChange={(event) => {
-                    const selectedCategory = event.target.value as MoveCategory;
-                    setCategory(selectedCategory);
-                    setPreflight(null);
-                    void loadDestinations(selectedCategory);
-                  }}
-                >
-                  {MOVE_CATEGORIES.map((value) => (
-                    <option key={value} value={value}>
-                      {value}
-                    </option>
-                  ))}
-                </select>
-                <select
+                  className="mt-2 min-h-11 w-full rounded-md border p-2"
                   value={destination}
-                  className="w-full rounded-md bg-transparent px-3 py-2 text-xs"
+                  disabled={busy}
                   onChange={(event) => {
                     setDestination(event.target.value);
                     setPreflight(null);
                   }}
                 >
-                  {destinations.map((path) => (
-                    <option key={path} value={path}>
-                      {path}
+                  {destinations.map((section) => (
+                    <option key={section} value={section}>
+                      {section}
                     </option>
                   ))}
                 </select>
-                {preflight && (
-                  <p className="text-xs">
-                    {preflight.ready ? `Ready: ${preflight.destination_path}` : preflight.reason}
-                  </p>
-                )}
+              </label>
+              {!preflight?.ready && (
                 <button
                   type="button"
-                  className="rounded-md px-3 py-2 text-xs"
+                  className="pv-btn-primary min-h-11 px-4"
                   disabled={busy || !destination}
-                  onClick={() => void checkMove()}
+                  onClick={() =>
+                    void run(async () => {
+                      setPreflight(
+                        await request(`${base}/preflight`, {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({ destination }),
+                        }),
+                      );
+                    })
+                  }
                 >
-                  Check move
+                  Continue
                 </button>
-                {preflight?.ready && (
-                  <button
-                    type="button"
-                    className="pv-btn-primary px-3 py-2 text-xs"
-                    disabled={busy}
-                    onClick={() => void confirmMove()}
-                  >
-                    Confirm move
-                  </button>
-                )}
-              </>
-            )}
-            {error && <p className="text-xs text-red-300">{error}</p>}
-            <div className="flex justify-end">
-              <button
-                type="button"
-                className="rounded-md px-3 py-2 text-xs"
-                disabled={busy}
-                onClick={close}
-              >
-                Close
-              </button>
-            </div>
-          </div>
+              )}
+              {preflight && (
+                <p>
+                  {preflight.ready
+                    ? `Move this photo to ${destination}? The file will not be overwritten.`
+                    : preflight.reason}
+                </p>
+              )}
+              {preflight?.ready && (
+                <button
+                  type="button"
+                  className="pv-btn-primary min-h-11 px-4"
+                  disabled={busy}
+                  onClick={() =>
+                    void run(async () => {
+                      setResult(
+                        await request(base, {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({ destination, confirm: true }),
+                        }),
+                      );
+                    })
+                  }
+                >
+                  Confirm move to {destination}
+                </button>
+              )}
+            </>
+          )}
+          {result && (
+            <p role="status">
+              {result.status === "completed"
+                ? `Moved to ${destination}. The same asset and its metadata have been preserved.`
+                : result.status === "failed"
+                  ? (result.reason ?? "Move needs recovery. Your asset remains recorded.")
+                  : "Moving safely… You can close this dialog; the operation will continue."}
+            </p>
+          )}
+          {result?.status === "completed" && (
+            <Link to="/app/gallery" search={{ sort, photo_type: [], content_tag: [], person: [] }}>
+              Return to Gallery
+            </Link>
+          )}
         </div>
       )}
-      {dialog === "ocr" && <AnalysisDialog assetId={assetId} onClose={close} />}
-    </div>
+      {error && (
+        <p role="alert" className="text-red-300">
+          {error}
+        </p>
+      )}
+    </PhotoDialog>
   );
 }
 
-function GalleryIntelligenceResult({ intelligence }: { intelligence: GalleryIntelligenceTerm[] }) {
-  const photoTypes = intelligence.filter((term) => term.namespace === "photo_type");
-  const contentTags = intelligence.filter((term) => term.namespace === "content_tag");
-  if (!photoTypes.length && !contentTags.length) {
-    return <p>Analysis completed — no photo type or content tags were identified.</p>;
-  }
+function GalleryCustomTags({
+  photo,
+  onUpdated,
+}: {
+  photo: GalleryImageDetails;
+  onUpdated: (photo: GalleryImageDetails) => void;
+}) {
+  const [value, setValue] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const add = async () => {
+    if (!value.trim()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const created = await fetch("/api/gallery/custom-tags", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ display_name: value }),
+      });
+      if (!created.ok) throw new Error("Custom tag could not be saved.");
+      const tag = (await created.json()) as GalleryCustomTag;
+      const assigned = await fetch(`/api/gallery/${photo.id}/custom-tags/${tag.id}`, {
+        method: "PUT",
+        credentials: "include",
+      });
+      if (!assigned.ok) throw new Error("Custom tag could not be applied.");
+      onUpdated({ ...photo, custom_tags: [...(photo.custom_tags ?? []), tag] });
+      setValue("");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Custom tag could not be saved.");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const remove = async (tag: GalleryCustomTag) => {
+    setBusy(true);
+    try {
+      const response = await fetch(`/api/gallery/${photo.id}/custom-tags/${tag.id}`, {
+        method: "DELETE",
+        credentials: "include",
+      });
+      if (!response.ok) throw new Error();
+      onUpdated({
+        ...photo,
+        custom_tags: (photo.custom_tags ?? []).filter((item) => item.id !== tag.id),
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
   return (
-    <div className="space-y-1">
-      <p>Photo type: {photoTypes.map((term) => term.display_name).join(", ") || "None"}</p>
-      <p>Content tags: {contentTags.map((term) => term.display_name).join(", ") || "None"}</p>
+    <div className="space-y-2">
+      <h3 className="text-xs font-medium" style={{ color: "var(--pv-silver)" }}>
+        My private tags
+      </h3>
+      <p className="text-xs" style={{ color: "var(--pv-text-dim)" }}>
+        Visible only to you.
+      </p>
+      <div className="flex flex-wrap gap-2">
+        {(photo.custom_tags ?? []).map((tag) => (
+          <button
+            type="button"
+            key={tag.id}
+            disabled={busy}
+            className="rounded border px-2 py-1 text-xs"
+            style={{ borderColor: "var(--pv-border)", color: "var(--pv-silver)" }}
+            onClick={() => void remove(tag)}
+          >
+            {tag.display_name} ×
+          </button>
+        ))}
+      </div>
+      <div className="flex max-w-sm gap-2">
+        <input
+          className="min-w-0 flex-1 rounded border bg-transparent px-2 py-1 text-sm"
+          style={{ borderColor: "var(--pv-border)" }}
+          value={value}
+          onChange={(event) => setValue(event.target.value)}
+          placeholder="Add private tag"
+        />
+        <button
+          type="button"
+          className="pv-btn-secondary px-3 py-1 text-xs"
+          disabled={busy}
+          onClick={() => void add()}
+        >
+          Add
+        </button>
+      </div>
+      {error && <p className="text-xs text-red-300">{error}</p>}
     </div>
   );
 }
@@ -2123,213 +2282,6 @@ type AiEvidence = {
   jobs: AiJob[];
   suggestions: AiSuggestion[];
   visual_description: VisualDescriptionEvidence | null;
-};
-
-function AnalysisDialog({ assetId, onClose }: { assetId: string; onClose: () => void }) {
-  const [evidence, setEvidence] = useState<AiEvidence>({
-    jobs: [],
-    suggestions: [],
-    visual_description: null,
-  });
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [drafts, setDrafts] = useState<Record<string, string>>({});
-
-  const loadEvidence = useCallback(async () => {
-    const response = await fetch(`/api/vault-master/assets/${assetId}/ai`, {
-      credentials: "include",
-      headers: { Accept: "application/json" },
-    });
-    if (!response.ok) throw new Error("Analysis could not be loaded");
-    const loaded = (await response.json()) as AiEvidence;
-    setEvidence(loaded);
-    setDrafts((current) => ({
-      ...Object.fromEntries(loaded.suggestions.map((item) => [item.id, item.raw_value])),
-      ...current,
-    }));
-    return loaded;
-  }, [assetId]);
-
-  const queueAnalysis = useCallback(async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      const response = await fetch(`/api/vault-master/assets/${assetId}/ai/ocr`, {
-        method: "POST",
-        credentials: "include",
-        headers: { Accept: "application/json" },
-      });
-      if (!response.ok) throw new Error("OCR request failed");
-      await loadEvidence();
-    } catch {
-      setError("Analysis could not be started.");
-    } finally {
-      setBusy(false);
-    }
-  }, [assetId, loadEvidence]);
-
-  useEffect(() => {
-    let cancelled = false;
-    void loadEvidence()
-      .then((loaded) => {
-        const hasCompleted = loaded.jobs.some((job) => job.status === "completed");
-        const hasActive = loaded.jobs.some((job) => ["queued", "processing"].includes(job.status));
-        const hasFailed = loaded.jobs.some((job) => job.status === "failed");
-        if (!cancelled && !hasCompleted && !hasActive && !hasFailed) {
-          void queueAnalysis();
-        }
-      })
-      .catch(() => setError("Analysis could not be loaded."));
-    return () => {
-      cancelled = true;
-    };
-  }, [loadEvidence, queueAnalysis]);
-
-  async function review(id: string, status: "accepted" | "rejected" | "deferred") {
-    setBusy(true);
-    setError(null);
-    try {
-      const response = await fetch(
-        `/api/vault-master/assets/${assetId}/ai/suggestions/${id}/review`,
-        {
-          method: "POST",
-          credentials: "include",
-          headers: { "Content-Type": "application/json", Accept: "application/json" },
-          body: JSON.stringify({ status, value: status === "accepted" ? drafts[id] : null }),
-        },
-      );
-      if (!response.ok) throw new Error("Review failed");
-      await loadEvidence();
-    } catch {
-      setError("The OCR review could not be saved.");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  const active = evidence.jobs.some((job) => ["queued", "processing"].includes(job.status));
-  const completed = evidence.jobs.some((job) => job.status === "completed");
-  const failedJob = evidence.jobs.find((job) => job.status === "failed");
-  useEffect(() => {
-    if (!active) return;
-    const timer = window.setInterval(() => {
-      void loadEvidence().catch(() => setError("Analysis could not be loaded."));
-    }, 1_500);
-    return () => window.clearInterval(timer);
-  }, [active, loadEvidence]);
-  return (
-    <div
-      className="fixed inset-0 z-[90] flex items-center justify-center bg-black/70 p-4"
-      role="dialog"
-      aria-modal="true"
-      aria-label="Analyse text / OCR"
-    >
-      <div className="pv-panel max-h-[85vh] w-full max-w-2xl space-y-4 overflow-y-auto p-5">
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <div>
-            <h2 className="font-medium" style={{ color: "var(--pv-silver)" }}>
-              Analyse text / OCR
-            </h2>
-          </div>
-          {failedJob && (
-            <button
-              type="button"
-              className="pv-btn-primary px-3 py-2 text-xs"
-              disabled={busy}
-              onClick={queueAnalysis}
-            >
-              {busy ? "Analysing…" : "Retry"}
-            </button>
-          )}
-        </div>
-        {error && <p className="text-xs text-red-300">{error}</p>}
-        {active && (
-          <p className="text-xs" style={{ color: "var(--pv-text-dim)" }}>
-            Analysing…
-          </p>
-        )}
-        {failedJob && <p className="text-xs text-red-300">Analysis failed: {failedJob.error}</p>}
-        {completed && evidence.suggestions.length === 0 && (
-          <p className="text-xs" style={{ color: "var(--pv-text-dim)" }}>
-            No text found.
-          </p>
-        )}
-        {evidence.suggestions.map((suggestion) => (
-          <div
-            key={suggestion.id}
-            className="space-y-3 rounded-md p-3"
-            style={{ border: "1px solid var(--pv-border)" }}
-          >
-            <textarea
-              className="min-h-28 w-full rounded-md bg-transparent p-3 text-sm outline-none"
-              style={{ color: "var(--pv-silver)", border: "1px solid var(--pv-border)" }}
-              value={drafts[suggestion.id] ?? suggestion.raw_value}
-              disabled={suggestion.status !== "pending" || busy}
-              onChange={(event) =>
-                setDrafts((current) => ({ ...current, [suggestion.id]: event.target.value }))
-              }
-            />
-            <p className="text-[10px]" style={{ color: "var(--pv-text-dim)" }}>
-              {suggestion.model_id} · {suggestion.task_version} · {suggestion.processing_ms} ms ·{" "}
-              {suggestion.status}
-            </p>
-            {suggestion.status === "pending" && (
-              <div className="flex flex-wrap justify-end gap-2">
-                <button
-                  type="button"
-                  className="rounded-md px-3 py-2 text-xs"
-                  disabled={busy}
-                  onClick={() => review(suggestion.id, "deferred")}
-                >
-                  Later
-                </button>
-                <button
-                  type="button"
-                  className="rounded-md px-3 py-2 text-xs"
-                  disabled={busy}
-                  onClick={() => review(suggestion.id, "rejected")}
-                >
-                  Reject
-                </button>
-                <button
-                  type="button"
-                  className="pv-btn-primary px-3 py-2 text-xs"
-                  disabled={busy}
-                  onClick={() => review(suggestion.id, "accepted")}
-                >
-                  Accept text
-                </button>
-              </div>
-            )}
-          </div>
-        ))}
-        <div className="flex justify-end">
-          <button
-            type="button"
-            className="rounded-md px-3 py-2 text-xs"
-            disabled={busy}
-            onClick={onClose}
-          >
-            Close
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-type AssetSharingRecipient = {
-  user_id: string;
-  display_name: string;
-  avatar_label: string;
-};
-
-type AssetSharingState = {
-  owner_username: string;
-  mode: "private" | "everyone" | "specific";
-  recipients: AssetSharingRecipient[];
-  eligible_users: AssetSharingRecipient[];
-  pending: boolean;
 };
 
 function MetadataInput({
@@ -2379,10 +2331,16 @@ function formatBytes(bytes: number): string {
 function PhotoStage({
   photo,
   sort,
+  onPointerDown,
+  onPointerUp,
+  onPointerCancel,
   faceIdentification,
 }: {
   photo: GalleryImageDetails;
   sort: GallerySortOrder;
+  onPointerDown: (event: PointerEvent) => void;
+  onPointerUp: (event: PointerEvent) => void;
+  onPointerCancel: () => void;
   faceIdentification: {
     active: boolean;
     selectedFaceId: string | null;
@@ -2406,6 +2364,9 @@ function PhotoStage({
     <div
       className="pv-panel relative min-h-[55vh] md:min-h-[70vh] overflow-hidden flex items-center justify-center"
       style={{ background: "#050506" }}
+      onPointerDown={onPointerDown}
+      onPointerUp={onPointerUp}
+      onPointerCancel={onPointerCancel}
     >
       {(photo.media_type ?? photo.mime_type ?? "").startsWith("image/") ? (
         <div className="relative inline-block max-h-[78vh] max-w-full">
@@ -2477,16 +2438,24 @@ function BackToGallery({
   photoTypes = [],
   contentTags = [],
   people = [],
+  privateTags = [],
 }: {
   sort: GallerySortOrder;
   photoTypes?: string[];
   contentTags?: string[];
   people?: string[];
+  privateTags?: string[];
 }) {
   return (
     <Link
       to="/app/gallery"
-      search={{ sort, photo_type: photoTypes, content_tag: contentTags, person: people }}
+      search={{
+        sort,
+        photo_type: photoTypes,
+        content_tag: contentTags,
+        person: people,
+        private_tag: privateTags,
+      }}
       resetScroll={false}
       className="pv-text-link inline-flex items-center gap-2 text-sm"
     >
@@ -2505,6 +2474,7 @@ function PhotoNavigation({
   photoId: string | null;
   sort: GallerySortOrder;
 }) {
+  const { photo_type, content_tag, person, private_tag, hidden } = Route.useSearch();
   const isPrevious = direction === "previous";
   const className = `absolute top-1/2 -translate-y-1/2 ${
     isPrevious ? "left-4" : "right-4"
@@ -2527,8 +2497,8 @@ function PhotoNavigation({
     <Link
       to="/app/gallery/$photoId"
       params={{ photoId }}
-      search={{ sort, photo_type: [], content_tag: [], person: [] }}
-      className={`${className} flex transition-transform hover:scale-105`}
+      search={{ sort, photo_type, content_tag, person, private_tag, hidden }}
+      className={`${className} hidden md:flex transition-transform hover:scale-105`}
       style={style}
       aria-label={isPrevious ? "Previous photo" : "Next photo"}
     >

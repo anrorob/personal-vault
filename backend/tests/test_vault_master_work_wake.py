@@ -4,7 +4,7 @@ import inspect
 import pytest
 
 from app.incoming import complete_arrival_hall_publication
-from app.main import run_vault_master_worker
+from app.main import run_vault_master_worker, run_vault_master_intelligence_worker
 from app.vault_master_work_wake import VaultMasterWorkWake
 
 
@@ -59,7 +59,8 @@ def test_wait_cancels_promptly_for_worker_shutdown() -> None:
 def test_wake_preserves_existing_worker_priority_order() -> None:
     worker_source = inspect.getsource(run_vault_master_worker)
     publication_source = inspect.getsource(complete_arrival_hall_publication)
-    assert worker_source.index("process_next_ingestion_ai_job") < worker_source.index(
-        "process_autopilot_batch"
-    )
+    assert "process_autopilot_batch" in worker_source
+    assert "process_next_ingestion_ai_job" not in worker_source
+    assert "process_next_gallery_intelligence_job" not in worker_source
+    assert "process_next_ingestion_ai_job" in inspect.getsource(run_vault_master_intelligence_worker)
     assert "process_autopilot_batch" not in publication_source

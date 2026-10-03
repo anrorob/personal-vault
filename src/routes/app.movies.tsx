@@ -9,7 +9,7 @@ function MoviesLayout() {
   const tvShows = pathname.startsWith("/app/movies/tv-shows");
 
   return (
-    <div className="max-w-6xl mx-auto space-y-6">
+    <div className="pv-layout-container max-w-7xl mx-auto space-y-6">
       <div className="space-y-3">
         <div>
           <h2 className="pv-content-title text-xl">Theatre</h2>

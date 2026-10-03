@@ -47,8 +47,8 @@ The development Vault is a separate environment, not a production alias. Its dep
 
 ```dotenv
 PV_ENVIRONMENT=development
-PV_WEBAUTHN_RP_ID=dev-vault.pv-hq.com
-PV_WEBAUTHN_ORIGIN=https://dev-vault.pv-hq.com
+PV_WEBAUTHN_RP_ID=vault.example.test
+PV_WEBAUTHN_ORIGIN=https://vault.example.test
 ```
 
 Do not point a development environment at production data, Vault storage, configuration files, or credential material. A production RP ID/origin must not be reused in development. This repository intentionally does not create or deploy the development Vault.
@@ -69,3 +69,7 @@ No command in this repository performs these external state changes by itself. T
 Before a production release, take and verify a database backup, record the current tag/SHA and deployment configuration revision, and review the change's migration plan. Database changes must be additive and backward-compatible until a separately approved cleanup release; a failed migration stops the deployment and is investigated before retrying.
 
 To roll back application code, redeploy the prior known-good immutable tag only after confirming schema compatibility. Do not attempt a blind database schema downgrade. If data recovery is required, restore the verified backup and its matching configuration only under a specific recovery approval, then validate service health and data integrity.
+
+## v1.1.0
+
+See [release notes](release-v1.1.0.md) and [upgrade requirements](upgrade-v1.1.0.md). The repository-root VERSION remains the release-version authority.

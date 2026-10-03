@@ -84,6 +84,7 @@ class TvEpisodeSource:
     vault_path: str
     owner_user_id: UUID
     visibility: str
+    storage_placement: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -131,12 +132,14 @@ class PostgresTvShowStore:
                     UNIQUE(show_id, season_number)
                 )
             """)
-            cursor.execute("""CREATE TABLE IF NOT EXISTS vault_tv_extras (
-                asset_id UUID PRIMARY KEY REFERENCES vault_assets(id) ON DELETE RESTRICT,
-                season_id UUID NOT NULL REFERENCES vault_tv_seasons(id) ON DELETE RESTRICT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )""")
             cursor.execute("ALTER TABLE vault_tv_seasons ADD COLUMN IF NOT EXISTS owned_artwork JSONB NOT NULL DEFAULT '{}'::jsonb")
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS vault_tv_extras (
+                    asset_id UUID PRIMARY KEY REFERENCES vault_assets(id) ON DELETE RESTRICT,
+                    season_id UUID NOT NULL REFERENCES vault_tv_seasons(id) ON DELETE RESTRICT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS vault_tv_episodes (
                     id UUID PRIMARY KEY,
@@ -413,6 +416,7 @@ class PostgresTvShowStore:
                    JOIN vault_tv_shows AS show ON show.id=episode.show_id
                    JOIN vault_assets AS asset ON asset.id=episode.asset_id
                    WHERE episode.id=%s
+                     AND asset.lifecycle_state='active'
                      AND (show.owner_user_id=%s OR show.visibility='vault-wide')""",
                 (episode_id, user_id),
             )
@@ -436,6 +440,7 @@ class PostgresTvShowStore:
             cursor.execute(
                 """SELECT 1 FROM vault_tv_episodes episode
                    JOIN vault_tv_shows show ON show.id=episode.show_id
+                   JOIN vault_assets asset ON asset.id=episode.asset_id AND asset.lifecycle_state='active'
                    WHERE episode.id=%s AND (show.owner_user_id=%s OR show.visibility='vault-wide')""",
                 (episode_id, user_id),
             )
@@ -444,10 +449,15 @@ class PostgresTvShowStore:
     def visible_episode_source(self, episode_id: UUID, user_id: UUID) -> TvEpisodeSource | None:
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute(
-                """SELECT episode.id, episode.asset_id, file.vault_path, show.owner_user_id, show.visibility
+                """SELECT episode.id, episode.asset_id, file.vault_path, show.owner_user_id, show.visibility,
+                          CASE WHEN placement.file_id IS NOT NULL
+                               THEN jsonb_build_object('slot_id', placement.slot_id, 'relative_path', placement.relative_path)
+                               ELSE NULL END AS storage_placement
                    FROM vault_tv_episodes episode
                    JOIN vault_tv_shows show ON show.id=episode.show_id
-                   JOIN vault_files file ON file.asset_id=episode.asset_id
+                   JOIN vault_assets asset ON asset.id=episode.asset_id AND asset.lifecycle_state='active'
+                   JOIN vault_files file ON file.asset_id=episode.asset_id AND file.file_role='primary'
+                   LEFT JOIN vault_file_storage_placements placement ON placement.file_id=file.id
                    WHERE episode.id=%s AND (show.owner_user_id=%s OR show.visibility='vault-wide')""",
                 (episode_id, user_id),
             )
@@ -585,6 +595,8 @@ class PostgresTvShowStore:
                        asset.effective_metadata
                 FROM vault_tv_seasons AS season
                 LEFT JOIN vault_tv_episodes AS episode ON episode.season_id=season.id
+                    AND EXISTS (SELECT 1 FROM vault_assets AS active_asset
+                        WHERE active_asset.id=episode.asset_id AND active_asset.lifecycle_state='active')
                 LEFT JOIN vault_assets AS asset ON asset.id=episode.asset_id
                 WHERE season.show_id=%s ORDER BY season.season_number, episode.episode_number
             """, (show_id,))

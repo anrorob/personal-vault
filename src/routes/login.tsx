@@ -2,6 +2,7 @@ import { createFileRoute, redirect, useNavigate } from "@tanstack/react-router";
 import { getAuthSession } from "@/lib/auth";
 import { useEffect, useState } from "react";
 import { PVLogo } from "@/components/pv/Logo";
+import { fetchBuildInfo, isDevelopmentBuild } from "@/lib/build-info";
 import { authenticateWithPasskey, passkeysSupported } from "@/lib/passkeys";
 
 const LOCKOUT_STORAGE_KEY = "pv-login-lockout-until";
@@ -58,9 +59,22 @@ function LoginPage() {
   const [isPasskeySubmitting, setIsPasskeySubmitting] = useState(false);
   const [lockoutUntil, setLockoutUntil] = useState(getStoredLockoutUntil);
   const [now, setNow] = useState(Date.now);
+  const [isDevelopment, setIsDevelopment] = useState(false);
   const lockoutSeconds = Math.max(0, Math.ceil((lockoutUntil - now) / 1000));
   const isLockedOut = lockoutSeconds > 0;
   const supportsPasskeys = passkeysSupported();
+
+  useEffect(() => {
+    void fetchBuildInfo()
+      .then((identity) => {
+        const development = isDevelopmentBuild(identity);
+        setIsDevelopment(development);
+        if (development) {
+          document.title = "Personal Vault DEV — Sign in";
+        }
+      })
+      .catch(() => setIsDevelopment(false));
+  }, []);
 
   useEffect(() => {
     if (!lockoutUntil) {
@@ -168,6 +182,26 @@ function LoginPage() {
           <p className="mt-2 text-sm" style={{ color: "var(--pv-text-dim)" }}>
             Secure access to your digital world
           </p>
+          {isDevelopment ? (
+            <section
+              className="mt-6 w-full rounded-md border px-5 py-4 text-left"
+              style={{
+                borderColor: "var(--pv-gold)",
+                backgroundColor: "color-mix(in srgb, var(--pv-gold) 9%, transparent)",
+              }}
+              aria-label="Development environment notice"
+            >
+              <p
+                className="text-sm font-semibold uppercase tracking-[0.18em]"
+                style={{ color: "var(--pv-gold)" }}
+              >
+                Development Vault
+              </p>
+              <p className="mt-1 text-sm" style={{ color: "var(--pv-text)" }}>
+                Test environment — changes here do not affect your everyday Vault.
+              </p>
+            </section>
+          ) : null}
         </div>
 
         <form onSubmit={onSubmit} className="pv-panel mt-8 space-y-5 p-6">

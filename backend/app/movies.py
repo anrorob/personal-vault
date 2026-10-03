@@ -10,6 +10,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
+from app.media_formats import VIDEO_EXTENSIONS as SUPPORTED_VIDEO_EXTENSIONS
 from app.auth import AuthenticatedUsername
 from app.vault_master import (
     CataloguedAsset,
@@ -21,16 +22,6 @@ from app.vault_master import (
 router = APIRouter(prefix="/api/movies", tags=["movies"])
 logger = logging.getLogger("pv.movies")
 
-SUPPORTED_VIDEO_EXTENSIONS = frozenset(
-    {
-        ".avi",
-        ".m4v",
-        ".mkv",
-        ".mov",
-        ".mp4",
-        ".webm",
-    }
-)
 MOVIE_FOLDER_PATTERN = re.compile(
     r"^(?P<title>.+?)\s*\((?P<year>\d{4})\)$"
 )
@@ -45,6 +36,7 @@ class MovieSummary(BaseModel):
     id: str
     asset_id: str | None = None
     title: str
+    original_title: str | None = None
     year: int | None
     poster_url: str | None = None
     is_exclusive_movie: bool = False
@@ -266,6 +258,16 @@ def resolve_catalogued_movie_path(
     its main file independently movable between approved physical roots.
     """
     vault_path = PurePosixPath(asset.vault_path)
+    if "storage_placement" in asset.metadata:
+        from app.storage_placement import resolve_metadata_placement
+
+        placement = asset.metadata["storage_placement"]
+        if not isinstance(placement, dict) or placement.get("relative_path") != str(vault_path.relative_to("/vault")):
+            raise ValueError("Movie storage placement does not match its logical path")
+        candidate = resolve_metadata_placement(asset.metadata)
+        if candidate is None or not candidate.is_file():
+            raise ValueError("The Movie primary file is unavailable")
+        return candidate
     for vault_root, filesystem_root in library_roots.items():
         try:
             relative = vault_path.relative_to(vault_root)
@@ -585,6 +587,7 @@ def list_movies(
             asset_id=str(asset.id),
             title=_optional_string(asset.effective_metadata.get("display_title"))
             or asset.display_title,
+            original_title=_optional_string(asset.effective_metadata.get("original_title")),
             year=_optional_int(asset.effective_metadata.get("release_year")),
             poster_url=_owned_artwork_url(asset, "poster"),
             is_exclusive_movie=_asset_is_exclusive_movie(asset),

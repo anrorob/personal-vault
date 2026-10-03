@@ -59,7 +59,7 @@ def eligible_photo(tmp_path: Path, username: str = "owner"):
     item = assign_owner(vault_store, vault_store.list_items()[0], username)
     assert item.proposed_category == "Gallery"
     ai_store = MemoryIngestionAiStore()
-    job = ai_store.queue_analysis(item.id, username)
+    job = ai_store.queue_analysis(item.id, username, item.owner_user_id)
     claimed = ai_store.claim_next_job()
     assert claimed and claimed.id == job.id
     ai_store.complete_job(
@@ -71,6 +71,7 @@ def eligible_photo(tmp_path: Path, username: str = "owner"):
         ("Photograph indicators: people, outdoor",),
         50,
         assess_destination(item, "personal_photo", 0.95, ""),
+        item.sha256,
     )
     return arrival, gallery, source, vault_store, ai_store, item
 
@@ -87,7 +88,7 @@ def eligible_document(tmp_path: Path, username: str = "owner"):
     item = assign_owner(vault_store, vault_store.list_items()[0], username)
     assert item.proposed_category == "Documents"
     ai_store = MemoryIngestionAiStore()
-    job = ai_store.queue_analysis(item.id, username)
+    job = ai_store.queue_analysis(item.id, username, item.owner_user_id)
     claimed = ai_store.claim_next_job()
     assert claimed and claimed.id == job.id
     ai_store.complete_job(
@@ -99,6 +100,7 @@ def eligible_document(tmp_path: Path, username: str = "owner"):
         ("Receipt indicators: receipt, vat",),
         50,
         assess_destination(item, "receipt", 0.95, "RECEIPT VAT amount paid"),
+        item.sha256,
     )
     return arrival, documents, vault_store, ai_store, item
 
@@ -107,7 +109,7 @@ def test_policy_enforces_safe_minimum_and_starts_disabled() -> None:
     store = MemoryAutopilotStore()
     with pytest.raises(ValueError, match="below 80"):
         store.upsert_policy(owner_id("owner"), "owner", "personal_photo", "Gallery", 79, 50, 2, 5)
-    financial = store.upsert_policy(owner_id("owner"), "owner", "financial_document", "Ledger", 90, 50, 2, 5)
+    financial = store.upsert_policy(owner_id("owner"), "owner", "financial_document", "Documents", 90, 50, 2, 5)
     assert financial.status == "disabled"
     with pytest.raises(ValueError, match="not eligible for auto-pilot"):
         store.upsert_policy(owner_id("owner"), "owner", "publication_cover", "Library", 90, 50, 2, 5)
@@ -147,7 +149,7 @@ def test_policy_api_is_owner_scoped_and_requires_explicit_enable(
     assert client.get("/api/vault-master/autopilot").status_code == 404
 
 
-def test_enabled_policy_queues_exact_safe_item_and_reconciles(tmp_path: Path) -> None:
+def test_enabled_photo_policy_does_not_use_model_score_as_deterministic_authority(tmp_path: Path) -> None:
     arrival, gallery, _, vault_store, ai_store, item = eligible_photo(tmp_path)
     policy_store = MemoryAutopilotStore()
     policy = policy_store.upsert_policy(owner_id("owner"), "owner", "personal_photo", "Gallery", 80, 50, 2, 5)
@@ -157,20 +159,13 @@ def test_enabled_policy_queues_exact_safe_item_and_reconciles(tmp_path: Path) ->
         policy_store, ai_store, vault_store, arrival, {"Gallery": gallery}
     )
 
-    assert run_id is not None
-    run = policy_store.runs[run_id]
-    assert run.item_ids == (item.id,)
-    assert run.outcomes == {str(item.id): "queued"}
-    assert vault_store.get_item(item.id).state == "move_queued"
-    decision = next(
-        event
-        for event in vault_store.list_activity()
-        if event.action == "proposal_approved"
-    )
-    assert decision.username == AUTOPILOT_ACTIVITY_USERNAME
-    vault_store.record_move_result(item.id, "moved", "worker", "moved")
-    assert reconcile_autopilot_runs(policy_store, vault_store) == run_id
-    assert policy_store.runs[run_id].status == "completed"
+    assert run_id is None
+    assert vault_store.get_item(item.id).state == "needs_review"
+    assert policy_store.policies[policy.id].status == "enabled"
+    assert not policy_store.runs
+    # A high model-derived score is explicitly not deterministic authority.
+    evidence = ai_store.list_evidence(item.id,item.owner_user_id)[0]
+    assert evidence.decision_score >= 80
 
 
 def test_enabled_document_policy_queues_an_80_point_receipt(tmp_path: Path) -> None:
@@ -186,6 +181,41 @@ def test_enabled_document_policy_queues_an_80_point_receipt(tmp_path: Path) -> N
     assert run_id is not None
     assert policy_store.runs[run_id].outcomes == {str(item.id): "queued"}
     assert vault_store.get_item(item.id).state == "move_queued"
+
+
+@pytest.mark.parametrize(("policy_status", "threshold", "expected_reason"), [
+    (None, None, "matching_owner_policy_absent"),
+    ("disabled", 80, "owner_policy_not_enabled"),
+    ("paused", 80, "owner_policy_not_enabled"),
+    ("enabled", 100, "class_score_below_owner_threshold"),
+])
+def test_scored_receipt_stays_staged_without_current_owner_authority(
+    tmp_path: Path, policy_status: str | None, threshold: int | None,
+    expected_reason: str,
+) -> None:
+    arrival, documents, vault_store, ai_store, item = eligible_document(tmp_path)
+    policies = MemoryAutopilotStore()
+    if policy_status is not None:
+        policy = policies.upsert_policy(owner_id("owner"), "owner", "receipt",
+                                        "Documents", threshold, 50, 2, 5)
+        if policy_status != "disabled":
+            policies.set_policy_status(policy.id, owner_id("owner"), policy_status)
+    assert process_autopilot_batch(policies, ai_store, vault_store, arrival,
+                                   {"Documents": documents}) is None
+    assert vault_store.get_item(item.id).state == "needs_review"
+    decision = next(iter(policies.routing_decisions.values()))
+    assert decision.reason == expected_reason
+    assert not decision.automatic_eligible
+
+
+def test_re_evaluation_of_staged_receipt_is_idempotent(tmp_path: Path) -> None:
+    arrival, documents, vault_store, ai_store, item = eligible_document(tmp_path)
+    policies = MemoryAutopilotStore()
+    for _ in range(2):
+        assert process_autopilot_batch(policies, ai_store, vault_store, arrival,
+                                       {"Documents": documents}) is None
+    assert len(policies.routing_decisions) == 1
+    assert vault_store.get_item(item.id).state == "needs_review"
 
 
 def test_reading_room_bundle_members_are_excluded_from_document_autopilot(
@@ -218,6 +248,7 @@ def test_reading_room_bundle_members_are_excluded_from_document_autopilot(
             0.95,
             "A complete ordinary document with sufficient local text.",
         ),
+        source.sha256,
     )
     policy_store = MemoryAutopilotStore()
     policy = policy_store.upsert_policy(
@@ -234,21 +265,22 @@ def test_reading_room_bundle_members_are_excluded_from_document_autopilot(
     assert vault_store.get_item(source.id).state == "needs_review"
 
 
-def test_preflight_change_stops_and_pauses_policy(tmp_path: Path) -> None:
-    arrival, gallery, source, vault_store, ai_store, item = eligible_photo(tmp_path)
+def test_preflight_change_isolates_item_without_pausing_policy(tmp_path: Path) -> None:
+    arrival, gallery, vault_store, ai_store, item = eligible_document(tmp_path)
+    source = Path(item.source_path)
     source.write_bytes(b"changed-after-analysis")
     policy_store = MemoryAutopilotStore()
-    policy = policy_store.upsert_policy(owner_id("owner"), "owner", "personal_photo", "Gallery", 80, 50, 1, 5)
+    policy = policy_store.upsert_policy(owner_id("owner"), "owner", "receipt", "Documents", 80, 50, 1, 5)
     policy_store.set_policy_status(policy.id, owner_id("owner"), "enabled")
 
     run_id = process_autopilot_batch(
-        policy_store, ai_store, vault_store, arrival, {"Gallery": gallery}
+        policy_store, ai_store, vault_store, arrival, {"Documents": gallery}
     )
 
-    assert run_id is not None
-    assert policy_store.runs[run_id].status == "stopped"
-    assert policy_store.runs[run_id].outcomes[str(item.id)] == "source_changed"
-    assert policy_store.policies[policy.id].status == "paused"
+    assert run_id is None
+    assert any(decision.reason == "source_and_destination_preflight"
+               for decision in policy_store.routing_decisions.values())
+    assert policy_store.policies[policy.id].status == "enabled"
     assert vault_store.get_item(item.id).state == "needs_review"
 
 
@@ -323,43 +355,40 @@ def test_model_or_task_change_stops_before_any_file_is_queued(tmp_path: Path) ->
         policy_store, ai_store, vault_store, arrival, {"Gallery": gallery}
     )
 
-    assert run_id is not None
-    run = policy_store.runs[run_id]
-    assert run.status == "stopped"
-    assert run.outcomes == {str(item.id): "model_or_task_version_mismatch"}
-    assert "explicit owner review and resume" in (run.stop_reason or "")
-    assert policy_store.policies[policy.id].status == "paused"
+    assert run_id is None
+    assert policy_store.policies[policy.id].status == "enabled"
     assert vault_store.get_item(item.id).state == "needs_review"
 
 
 def test_policy_uses_item_owner_not_analysis_requester(tmp_path: Path) -> None:
     arrival = tmp_path / "Arrival Hall"
-    gallery = tmp_path / "Gallery"
+    gallery = tmp_path / "Documents"
     arrival.mkdir()
     gallery.mkdir()
-    (arrival / "owner.jpg").write_bytes(b"owner-photo")
-    (arrival / "recipient.jpg").write_bytes(b"recipient-photo")
+    (arrival / "owner.pdf").write_bytes(b"owner-photo")
+    (arrival / "recipient.pdf").write_bytes(b"recipient-photo")
     vault_store = MemoryVaultMasterStore()
     scan_root(vault_store, arrival, INCOMING_SOURCE)
     items = {item.filename: item for item in vault_store.list_items()}
-    owner = assign_owner(vault_store, items["owner.jpg"], "owner")
-    recipient = assign_owner(vault_store, items["recipient.jpg"], "recipient")
+    owner = assign_owner(vault_store, items["owner.pdf"], "owner")
+    recipient = assign_owner(vault_store, items["recipient.pdf"], "recipient")
     ai_store = MemoryIngestionAiStore()
     for item in (owner, recipient):
-        job = ai_store.queue_analysis(item.id, "owner")
+        job = ai_store.queue_analysis(item.id, "owner", item.owner_user_id)
         claimed = ai_store.claim_next_job()
         assert claimed is not None and claimed.id == job.id
         ai_store.complete_job(
-            job.id, "personal_photo", "A family photograph", "", 0.95,
+            job.id, "receipt", "Synthetic receipt", "RECEIPT VAT amount paid", 0.95,
             ("Photograph indicators",), 10,
-            assess_destination(item, "personal_photo", 0.95, ""),
+            assess_destination(item, "receipt", 0.95, "RECEIPT VAT amount paid"),
+            item.sha256,
         )
     policies = MemoryAutopilotStore()
     policy = policies.upsert_policy(
-        owner_id("owner"), "owner", "personal_photo", "Gallery", 80, 50, 2, 5
+        owner_id("owner"), "owner", "receipt", "Documents", 80, 50, 2, 5
     )
     assert policies.set_policy_status(policy.id, owner_id("owner"), "enabled")
 
-    assert process_autopilot_batch(policies, ai_store, vault_store, arrival, {"Gallery": gallery})
+    assert process_autopilot_batch(policies, ai_store, vault_store, arrival, {"Documents": gallery})
     assert vault_store.get_item(owner.id).state == "move_queued"
     assert vault_store.get_item(recipient.id).state == "needs_review"

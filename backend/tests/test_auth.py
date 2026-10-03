@@ -3,6 +3,7 @@ from uuid import UUID
 
 from fastapi.testclient import TestClient
 from httpx import Response
+import pytest
 
 from app.auth import SESSION_COOKIE_NAME
 from app.auth_store import MemoryAuthenticationStore
@@ -29,9 +30,10 @@ def test_health_reports_database_ready(client: TestClient) -> None:
         "status": "ok",
         "service": "pv-backend",
         "database": "ok",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "commit": "test",
         "environment": "test",
+        "repository": "example-owner/personal-vault",
     }
 
 
@@ -98,6 +100,18 @@ def test_unexpected_host_is_rejected_before_authentication(client: TestClient) -
 
     assert response.status_code == 400
     assert response.json() == {"detail": "Invalid host"}
+
+
+def test_explicit_development_lan_host_allowlist_is_exact(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PV_ALLOWED_HOSTS", "vault.example.test,vault-server.local")
+
+    assert client.get("/api/health", headers={"Host": "vault.example.test"}).status_code == 200
+    assert client.get("/api/health", headers={"Host": "vault-server.local"}).status_code == 200
+    assert client.get("/api/health", headers={"Host": "vault-server.local:8444"}).status_code == 200
+    assert client.get("/api/health", headers={"Host": "unrelated.local"}).status_code == 400
+    assert client.get("/api/health", headers={"Host": "anything.local"}).status_code == 400
 
 
 def test_password_session_persists_available_client_metadata(client: TestClient, authentication_store: MemoryAuthenticationStore) -> None:

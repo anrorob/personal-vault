@@ -19,10 +19,18 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { formatPhotoDate } from "@/lib/gallery";
 import { getAuthSession } from "@/lib/auth";
 import { TvResolverActions, type TvResolverAction } from "@/components/TvResolverActions";
-import { normalizeTvResolverBatches, tvCounts, type TvResolverBatch } from "@/lib/tv-resolver";
+import { ArrivalRecovery } from "@/components/ArrivalRecovery";
+import { ArrivalMusicImports } from "@/components/ArrivalMusicImports";
+import {
+  normalizeTvResolverBatches,
+  tvCounts,
+  tvGroupedEpisodeIds,
+  type TvResolverBatch,
+} from "@/lib/tv-resolver";
 import {
   encodeArrivalHallPath,
   formatBytes,
+  isActiveArrivalState,
   type AssetRelationshipCandidateListing,
   type ArrivalHallListing,
   type AutopilotListing,
@@ -75,8 +83,8 @@ const AUTOPILOT_POLICY_OPTIONS = [
   { content_type: "receipt", destination: "Documents", label: "Receipts to Documents" },
   {
     content_type: "financial_document",
-    destination: "Ledger",
-    label: "Financial documents to Ledger",
+    destination: "Documents",
+    label: "Financial documents to Documents",
   },
   { content_type: "general_document", destination: "Documents", label: "Documents to Documents" },
   { content_type: "artwork", destination: "Archives", label: "Artwork to Archives" },
@@ -181,49 +189,71 @@ function ArrivalHallPage() {
     );
   }
 
+  const [policyLoadState, setPolicyLoadState] = useState<"loading" | "ready" | "unavailable">(
+    "loading",
+  );
+
   const loadArrivalHall = useCallback(async () => {
     const loadVersion = ++loadVersionRef.current;
     setRefreshing(true);
     setError(null);
     setTvResolverError(null);
 
-    const tvRequest = fetch("/api/vault-master/tv-resolver/batches", {
-      credentials: "include",
-      headers: { Accept: "application/json" },
-    });
-
     try {
-      const [response, vaultMasterResponse, aiResponse, batchesResponse, controlResponses] =
-        await Promise.all([
-          fetch("/api/arrival-hall", {
+      const [
+        response,
+        vaultMasterResponse,
+        aiResponse,
+        batchesResponse,
+        controlResponses,
+        tvResponse,
+      ] = await Promise.all([
+        fetch("/api/arrival-hall", {
+          credentials: "include",
+          headers: { Accept: "application/json" },
+        }),
+        fetch("/api/vault-master/items", {
+          credentials: "include",
+          headers: { Accept: "application/json" },
+        }),
+        fetch("/api/vault-master/items/ai", {
+          credentials: "include",
+          headers: { Accept: "application/json" },
+        }),
+        fetch("/api/vault-master/items/ai/batches", {
+          credentials: "include",
+          headers: { Accept: "application/json" },
+        }),
+        Promise.all([
+          fetch("/api/vault-master/autopilot", {
             credentials: "include",
             headers: { Accept: "application/json" },
-          }),
-          fetch("/api/vault-master/items", {
-            credentials: "include",
-            headers: { Accept: "application/json" },
-          }),
-          fetch("/api/vault-master/items/ai", {
-            credentials: "include",
-            headers: { Accept: "application/json" },
-          }),
-          fetch("/api/vault-master/items/ai/batches", {
-            credentials: "include",
-            headers: { Accept: "application/json" },
-          }),
-          Promise.all([
-            fetch("/api/vault-master/autopilot", {
-              credentials: "include",
-              headers: { Accept: "application/json" },
+          })
+            .then(async (policyResponse) => {
+              if (!policyResponse.ok) throw new Error("Policy request failed");
+              const data = (await policyResponse.clone().json()) as AutopilotListing;
+              if (loadVersion === loadVersionRef.current) {
+                setAutopilot(data);
+                setPolicyLoadState("ready");
+              }
+              return policyResponse;
+            })
+            .catch((error: unknown) => {
+              if (loadVersion === loadVersionRef.current) setPolicyLoadState("unavailable");
+              throw error;
             }),
-            isAdministrator
-              ? fetch("/api/vault-master/publication-bundles", {
-                  credentials: "include",
-                  headers: { Accept: "application/json" },
-                })
-              : Promise.resolve(null),
-          ]),
-        ]);
+          isAdministrator
+            ? fetch("/api/vault-master/publication-bundles", {
+                credentials: "include",
+                headers: { Accept: "application/json" },
+              })
+            : Promise.resolve(null),
+        ]),
+        fetch("/api/vault-master/tv-resolver/batches", {
+          credentials: "include",
+          headers: { Accept: "application/json" },
+        }),
+      ]);
       const [autopilotResponse, publicationResponse] = controlResponses;
 
       if (response.status === 401) {
@@ -273,15 +303,12 @@ function ArrivalHallPage() {
       setAiEvidence(nextAiEvidence);
       setAnalysisBatches(nextAnalysisBatches);
       setAutopilot(nextAutopilot);
-      try {
-        const tvResponse = await tvRequest;
-        if (!tvResponse.ok) throw new Error("TV Resolver request failed");
+      if (tvResponse.ok) {
         const normalized = normalizeTvResolverBatches(await tvResponse.json());
         setTvBatches(normalized.batches);
-        if (normalized.dropped) {
+        if (normalized.dropped)
           setTvResolverError("Some TV Resolver proposals could not be displayed.");
-        }
-      } catch {
+      } else {
         setTvBatches([]);
         setTvResolverError("TV Resolver proposal could not be displayed.");
       }
@@ -700,11 +727,17 @@ function ArrivalHallPage() {
   }
 
   useEffect(() => {
-    void loadArrivalHall();
-    const refresh = window.setInterval(() => {
-      void loadArrivalHall();
-    }, 5000);
-    return () => window.clearInterval(refresh);
+    let stopped = false;
+    let refresh: ReturnType<typeof window.setTimeout> | undefined;
+    const poll = async () => {
+      await loadArrivalHall();
+      if (!stopped) refresh = window.setTimeout(() => void poll(), 5000);
+    };
+    void poll();
+    return () => {
+      stopped = true;
+      window.clearTimeout(refresh);
+    };
   }, [loadArrivalHall]);
 
   async function updateProposal(
@@ -882,36 +915,6 @@ function ArrivalHallPage() {
       replaceVaultMasterItem((await response.json()) as VaultMasterItem);
     } catch {
       setError("The rejected file could not be returned to review.");
-    } finally {
-      setSavingDecision(null);
-    }
-  }
-
-  async function removeRejected(item: VaultMasterItem) {
-    const confirmation = window.prompt(
-      `Permanently remove ${item.relative_path} from the Arrival Hall?\n\nType REMOVE FROM ARRIVAL HALL to confirm.`,
-    );
-    if (confirmation !== "REMOVE FROM ARRIVAL HALL") return;
-    setSavingDecision(item.id);
-    setError(null);
-    try {
-      const response = await fetch(`/api/vault-master/items/${item.id}/rejected/remove`, {
-        method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json", Accept: "application/json" },
-        body: JSON.stringify({ confirmation }),
-      });
-      if (!response.ok) {
-        const body = (await response.json()) as { detail?: string };
-        throw new Error(body.detail ?? "Removal failed");
-      }
-      await loadArrivalHall();
-    } catch (removeError) {
-      setError(
-        removeError instanceof Error
-          ? removeError.message
-          : "The rejected file could not be removed.",
-      );
     } finally {
       setSavingDecision(null);
     }
@@ -1108,8 +1111,13 @@ function ArrivalHallPage() {
       ["inventoried", "needs_review"].includes(item.state)
     );
   }).length;
+  const activeStagedFiles =
+    listing?.files.filter((file) =>
+      isActiveArrivalState(incomingAnalysis.get(file.relative_path)?.state),
+    ) ?? [];
+  const groupedTvEpisodeIds = tvGroupedEpisodeIds(tvBatches);
   const visibleFiles =
-    listing?.files.filter((file) => {
+    activeStagedFiles.filter((file) => {
       const publicationItemIds = new Set(
         publicationBundles.bundles.flatMap((bundle) => [
           ...bundle.source_item_ids,
@@ -1118,6 +1126,8 @@ function ArrivalHallPage() {
         ]),
       );
       const publicationItem = incomingAnalysis.get(file.relative_path);
+      if (publicationItem?.album_group_id) return false;
+      if (publicationItem && groupedTvEpisodeIds.has(publicationItem.id)) return false;
       if (publicationItem && publicationItemIds.has(publicationItem.id)) return false;
       if (reviewFilter === "all") return true;
       const item = incomingAnalysis.get(file.relative_path);
@@ -1148,10 +1158,10 @@ function ArrivalHallPage() {
     });
   }
   const stagedFolderCount = new Set(
-    listing?.files.flatMap((file) => (file.folder ? [file.folder] : [])) ?? [],
+    activeStagedFiles.flatMap((file) => (file.folder ? [file.folder] : [])),
   ).size;
   return (
-    <div className="max-w-5xl mx-auto space-y-6">
+    <div className="max-w-7xl mx-auto space-y-6">
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <p className="pv-display-title text-2xl tracking-tight md:text-3xl">
@@ -1210,7 +1220,7 @@ function ArrivalHallPage() {
               Series batch review
             </h3>
             <p className="text-xs" style={{ color: "var(--pv-text-dim)" }}>
-              Publish episodes first, then publish the classified extras in their existing seasons.
+              Publish episodes first, then publish classified extras in their existing seasons.
             </p>
           </div>
           {tvBatches
@@ -1260,8 +1270,8 @@ function ArrivalHallPage() {
                   </div>
                   {["publishing", "published", "failed"].includes(batch.status) && (
                     <p className="text-xs" style={{ color: "var(--pv-text-dim)" }}>
-                      {counts.published} of {counts.episodes} episodes
-                      {` · ${counts.extrasRemaining} extras remaining`}
+                      {counts.published} of {counts.episodes} episodes · {counts.extrasRemaining}{" "}
+                      extras remaining
                     </p>
                   )}
                   <div className="flex flex-wrap gap-2">
@@ -1722,16 +1732,20 @@ function ArrivalHallPage() {
                     {option.label}
                   </p>
                   <p className="mt-1 text-[11px]" style={{ color: "var(--pv-text-dim)" }}>
-                    {policy
-                      ? `Threshold ${policy.threshold} - maximum ${policy.max_items} files - stop at ${policy.max_failures} failures or ${policy.max_failure_percent}%`
-                      : "No owner policy yet; eligible files remain staged."}
+                    {policyLoadState !== "ready"
+                      ? policyLoadState === "loading"
+                        ? "Loading owner policy…"
+                        : "Owner policy unavailable. Refresh to check its status."
+                      : policy
+                        ? `Threshold ${policy.threshold} - maximum ${policy.max_items} files - stop at ${policy.max_failures} failures or ${policy.max_failure_percent}%`
+                        : "No owner policy yet; eligible files remain staged."}
                   </p>
                 </div>
                 {!policy ? (
                   <button
                     type="button"
                     className="pv-btn-secondary"
-                    disabled={autopilotBusy}
+                    disabled={autopilotBusy || policyLoadState !== "ready"}
                     onClick={() => void configureAutopilot(option.content_type, option.destination)}
                   >
                     Create disabled policy
@@ -1748,7 +1762,7 @@ function ArrivalHallPage() {
                       <button
                         type="button"
                         className="pv-btn-secondary"
-                        disabled={autopilotBusy}
+                        disabled={autopilotBusy || policyLoadState !== "ready"}
                         onClick={() => void setAutopilotStatus(policy.id, "paused")}
                       >
                         Stop and pause
@@ -1757,7 +1771,7 @@ function ArrivalHallPage() {
                       <button
                         type="button"
                         className="pv-btn-secondary"
-                        disabled={autopilotBusy}
+                        disabled={autopilotBusy || policyLoadState !== "ready"}
                         onClick={() => void setAutopilotStatus(policy.id, "enabled")}
                       >
                         {policy.status === "paused" ? "Explicitly resume" : "Enable policy"}
@@ -1766,7 +1780,9 @@ function ArrivalHallPage() {
                     <button
                       type="button"
                       className="pv-btn-primary"
-                      disabled={autopilotBusy || policy.status !== "enabled"}
+                      disabled={
+                        autopilotBusy || policyLoadState !== "ready" || policy.status !== "enabled"
+                      }
                       onClick={() => void runAutopilotNow()}
                     >
                       Process eligible now
@@ -1798,7 +1814,13 @@ function ArrivalHallPage() {
         )}
       </section>
 
-      {listing?.files.length === 0 && (
+      <ArrivalMusicImports items={vaultMaster?.items ?? []} onChanged={loadArrivalHall} />
+      <ArrivalRecovery
+        onChanged={loadArrivalHall}
+        revision={vaultMaster?.items.map((item) => `${item.id}:${item.state}`).join("|")}
+      />
+
+      {listing && activeStagedFiles.length === 0 && (
         <div className="pv-panel p-10 text-center">
           <span
             className="mx-auto h-12 w-12 rounded-full flex items-center justify-center"
@@ -1815,7 +1837,7 @@ function ArrivalHallPage() {
         </div>
       )}
 
-      {listing && listing.files.length > 0 && (
+      {listing && activeStagedFiles.length > 0 && (
         <div className="space-y-3">
           <div className="pv-panel p-5 space-y-4">
             <div className="flex flex-wrap items-start justify-between gap-3">
@@ -1992,7 +2014,7 @@ function ArrivalHallPage() {
             {(
               [
                 ["all", "All"],
-                ["automatic_eligible", "Automatic eligible"],
+                ["automatic_eligible", "Preliminary eligible"],
                 ["batch_review", "Batch review"],
                 ["individual_review", "Individual review"],
                 ["conflicts", "Conflicts"],
@@ -2023,10 +2045,10 @@ function ArrivalHallPage() {
                 Staged files
               </p>
               <p className="text-xs" style={{ color: "var(--pv-text-dim)" }}>
-                {listing.files.length} {listing.files.length === 1 ? "file" : "files"}
+                {activeStagedFiles.length} {activeStagedFiles.length === 1 ? "file" : "files"}
                 {stagedFolderCount > 0 &&
                   ` in ${stagedFolderCount} ${stagedFolderCount === 1 ? "folder" : "folders"}`}{" "}
-                · {formatBytes(listing.files.reduce((total, file) => total + file.size, 0))}
+                · {formatBytes(activeStagedFiles.reduce((total, file) => total + file.size, 0))}
               </p>
             </div>
             <div className="divide-y" style={{ borderColor: "var(--pv-border)" }}>
@@ -2063,7 +2085,7 @@ function ArrivalHallPage() {
                                   : analysis.state === "moved"
                                     ? "Moved"
                                     : latestEvidence?.routing_band === "automatic_eligible"
-                                      ? "Ready for auto-pilot"
+                                      ? "Preliminary evidence eligible"
                                       : latestEvidence
                                         ? "Awaiting review"
                                         : analysis.mime_type.startsWith("image/")
@@ -2234,7 +2256,7 @@ function ArrivalHallPage() {
                               <p className="mt-1 text-xs" style={{ color: "var(--pv-text-dim)" }}>
                                 {isPdf
                                   ? "Evidence stays private and review-only."
-                                  : "Evidence stays private; only safe ordinary photos can continue to auto-pilot."}
+                                  : "Evidence stays private and informs Vault Master's routing decision."}
                               </p>
                             </div>
                             <button
@@ -2282,54 +2304,15 @@ function ArrivalHallPage() {
                                       ? `Suggested destination: ${latestEvidence.recommended_destination}`
                                       : "No safe destination suggested"}
                                   </p>
-                                  <span
-                                    className="rounded-full border px-2 py-0.5 text-[10px]"
-                                    style={{
-                                      color: "var(--pv-gold)",
-                                      borderColor: "rgba(var(--pv-gold-rgb), 0.32)",
-                                    }}
-                                  >
-                                    {latestEvidence.routing_band.replaceAll("_", " ")} · score{" "}
-                                    {latestEvidence.decision_score}/100
+                                  <span style={{ color: "var(--pv-text-dim)" }}>
+                                    Semantic evidence for Vault Master review
                                   </span>
-                                </div>
-                                <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 md:grid-cols-3">
-                                  {Object.entries(latestEvidence.confidence_components)
-                                    .filter(([name]) => name !== "learned_routing")
-                                    .map(([name, value]) => (
-                                      <p key={name} style={{ color: "var(--pv-text-dim)" }}>
-                                        {name === "visual_classification" &&
-                                        latestEvidence.content_type === "unknown"
-                                          ? `category evidence: ${Math.round(value)} (insufficient)`
-                                          : `${name.replaceAll("_", " ")}: ${Math.round(value)}`}
-                                      </p>
-                                    ))}
                                 </div>
                                 {latestEvidence.conflicts.map((conflict) => (
                                   <p key={conflict} className="mt-2 text-amber-300">
                                     Conflict: {conflict}
                                   </p>
                                 ))}
-                                {latestEvidence.automatic_disqualifiers.length > 0 ? (
-                                  <div className="mt-2">
-                                    <p style={{ color: "var(--pv-silver-dim)" }}>
-                                      Requires review because:
-                                    </p>
-                                    <ul
-                                      className="mt-1 list-disc space-y-1 pl-4"
-                                      style={{ color: "var(--pv-text-dim)" }}
-                                    >
-                                      {latestEvidence.automatic_disqualifiers.map((reason) => (
-                                        <li key={reason}>{reason}</li>
-                                      ))}
-                                    </ul>
-                                  </div>
-                                ) : (
-                                  <p className="mt-2 text-emerald-300">
-                                    Eligible for a future owner-enabled auto-pilot policy. No file
-                                    will move automatically in this stage.
-                                  </p>
-                                )}
                               </div>
                               {latestEvidence.caption && (
                                 <p style={{ color: "var(--pv-silver-dim)" }}>
@@ -2432,32 +2415,25 @@ function ArrivalHallPage() {
                           </p>
                         </div>
                       )}
-                      {analysis?.state === "rejected" && !duplicate && (
-                        <div className="mt-4 flex flex-wrap items-center gap-2">
-                          <button
-                            type="button"
-                            className="pv-btn-primary px-3 py-2 text-xs flex items-center gap-2"
-                            disabled={savingDecision === analysis.id}
-                            onClick={() => void returnToReview(analysis.id)}
-                          >
-                            <Undo2 size={13} />
-                            Return to review
-                          </button>
-                          <button
-                            type="button"
-                            className="rounded-md px-3 py-2 text-xs flex items-center gap-2"
-                            style={{
-                              color: "rgb(252 165 165)",
-                              border: "1px solid rgba(248,113,113,0.35)",
-                            }}
-                            disabled={savingDecision === analysis.id}
-                            onClick={() => void removeRejected(analysis)}
-                          >
-                            <Trash2 size={13} />
-                            Remove from Arrival Hall
-                          </button>
-                        </div>
-                      )}
+                      {analysis &&
+                        !duplicate &&
+                        ["rejected", "needs_review", "approved", "move_failed"].includes(
+                          analysis.state,
+                        ) && (
+                          <div className="mt-4 flex flex-wrap items-center gap-2">
+                            {analysis.state === "rejected" && (
+                              <button
+                                type="button"
+                                className="pv-btn-primary px-3 py-2 text-xs flex items-center gap-2"
+                                disabled={savingDecision === analysis.id}
+                                onClick={() => void returnToReview(analysis.id)}
+                              >
+                                <Undo2 size={13} />
+                                Return to review
+                              </button>
+                            )}
+                          </div>
+                        )}
                       {analysis &&
                         !duplicate &&
                         !["rejected", "moved"].includes(analysis.state) && (
@@ -2482,6 +2458,7 @@ function ArrivalHallPage() {
                               <option value="Documents">Documents</option>
                               <option value="Archives">Archives</option>
                               <option value="Music">Music</option>
+                              <option value="Music Videos">Music → Music Videos</option>
                             </select>
                             {(analysis.proposed_category === "Movies" ||
                               analysis.proposed_category === "TV Shows") && (
@@ -2851,6 +2828,47 @@ function VaultHistory() {
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
   const [expandedAsset, setExpandedAsset] = useState<string | null>(null);
+  const [restoringAsset, setRestoringAsset] = useState<string | null>(null);
+  const [restoreError, setRestoreError] = useState<string | null>(null);
+
+  async function restoreDeletedAsset(asset: VaultAsset) {
+    setRestoringAsset(asset.id);
+    setRestoreError(null);
+    try {
+      const response = await fetch(
+        `/api/vault-master/assets/${asset.id}/lifecycle/restore-deleted`,
+        { method: "POST", credentials: "include" },
+      );
+      if (response.status === 401) {
+        await navigate({ to: "/login" });
+        return;
+      }
+      if (!response.ok) {
+        const body = (await response.json()) as { detail?: string };
+        throw new Error(body.detail ?? "Restore could not be completed.");
+      }
+      const updated = (await response.json()) as VaultAsset;
+      setResults(
+        (current) =>
+          current?.map((candidate) =>
+            candidate.id === asset.id
+              ? {
+                  ...candidate,
+                  ...updated,
+                  current_location: ["Movies", "Movie", "TV Shows"].includes(asset.asset_type)
+                    ? "Theatre"
+                    : (asset.original_section ?? asset.asset_type),
+                  original_section: undefined,
+                }
+              : candidate,
+          ) ?? current,
+      );
+    } catch (error) {
+      setRestoreError(error instanceof Error ? error.message : "Restore could not be completed.");
+    } finally {
+      setRestoringAsset(null);
+    }
+  }
 
   async function searchCatalogue(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -2862,7 +2880,7 @@ function VaultHistory() {
 
     try {
       const response = await fetch(
-        `/api/vault-master/assets/search?query=${encodeURIComponent(cleanedQuery)}`,
+        `/api/vault-master/assets/recovery/search?query=${encodeURIComponent(cleanedQuery)}`,
         {
           credentials: "include",
           headers: { Accept: "application/json" },
@@ -2905,7 +2923,8 @@ function VaultHistory() {
             Find an existing Vault asset
           </h3>
           <p className="mt-1 text-xs" style={{ color: "var(--pv-text-dim)" }}>
-            Search the permanent catalogue by title, filename, location, or Vault path.
+            Search your Vault assets by filename, title, description, OCR text, tag, date, or
+            section.
           </p>
         </div>
       </div>
@@ -2924,7 +2943,7 @@ function VaultHistory() {
             type="search"
             value={query}
             maxLength={240}
-            placeholder="Title, filename, location, or /vault path"
+            placeholder="Filename, title, description, OCR text, or section"
             className="w-full rounded-md bg-transparent py-3 pl-10 pr-3 text-sm outline-none"
             style={{ color: "var(--pv-silver)", border: "1px solid var(--pv-border)" }}
             onChange={(event) => setQuery(event.target.value)}
@@ -2946,6 +2965,12 @@ function VaultHistory() {
           style={{ color: "#fca5a5", border: "1px solid rgba(248,113,113,0.3)" }}
         >
           {searchError}
+        </p>
+      )}
+
+      {restoreError && (
+        <p role="alert" className="text-sm text-red-300">
+          {restoreError}
         </p>
       )}
 
@@ -2992,7 +3017,10 @@ function VaultHistory() {
                         {asset.display_title}
                       </span>
                       <span className="mt-1 block text-xs" style={{ color: "var(--pv-text-dim)" }}>
-                        {asset.asset_type}
+                        {asset.current_location ?? asset.asset_type}
+                        {asset.lifecycle_state === "deleted" && asset.original_section
+                          ? ` · Original section: ${asset.original_section}`
+                          : ""}
                         {asset.captured_on ? ` · ${formatPhotoDate(asset.captured_on)}` : ""}
                         {asset.location ? ` · ${asset.location}` : ""}
                       </span>
@@ -3001,7 +3029,22 @@ function VaultHistory() {
                       {expanded ? "Hide details" : "View details"}
                     </span>
                   </button>
-                  {expanded && (
+                  {expanded && asset.lifecycle_state === "deleted" && (
+                    <div className="mt-3 space-y-3">
+                      <p className="text-sm" style={{ color: "var(--pv-text-dim)" }}>
+                        This asset is Deleted and cannot be opened until it is restored.
+                      </p>
+                      <button
+                        type="button"
+                        className="pv-btn-primary min-h-11 px-4"
+                        disabled={restoringAsset === asset.id}
+                        onClick={() => void restoreDeletedAsset(asset)}
+                      >
+                        {restoringAsset === asset.id ? "Restoring…" : "Restore"}
+                      </button>
+                    </div>
+                  )}
+                  {expanded && asset.lifecycle_state !== "deleted" && (
                     <VaultAssetDetails
                       asset={asset}
                       onUpdated={(updated) =>

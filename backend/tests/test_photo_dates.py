@@ -9,33 +9,33 @@ from app.photo_dates import (
 
 def test_filename_date_parser_recovers_timestamp_style_names() -> None:
     assert parse_filename_date(
-        "2012-07-15T21-52-31_0.jpg"
-    ).isoformat() == "2012-07-15"
+        "2001-02-03T04-05-06_0.jpg"
+    ).isoformat() == "2001-02-03"
     assert parse_filename_date(
-        "PXL_20250613_182754557.jpg"
-    ).isoformat() == "2025-06-13"
+        "PXL_20020304_050607008.jpg"
+    ).isoformat() == "2002-03-04"
 
 
-def test_oldest_plausible_date_wins_across_all_sources() -> None:
+def test_embedded_capture_wins_over_filename_and_pv_modified_time() -> None:
     selected, source = select_oldest_photo_date(
-        "2012-07-15T21-52-31_0.jpg",
+        "2001-02-03T04-05-06_0.jpg",
         datetime(2026, 7, 27, tzinfo=timezone.utc),
         ["2015:10:20 12:00:00"],
     )
 
-    assert selected.isoformat() == "2012-07-15"
-    assert source == "filename"
+    assert selected and selected.isoformat() == "2015-10-20"
+    assert source == "embedded"
 
 
-def test_invalid_and_future_dates_are_ignored() -> None:
+def test_no_embedded_or_original_source_date_is_unknown() -> None:
     selected, source = select_oldest_photo_date(
         "photo-2099-01-01.jpg",
         datetime(2018, 4, 3, tzinfo=timezone.utc),
         ["not-a-date"],
     )
 
-    assert selected.isoformat() == "2018-04-03"
-    assert source == "file_modified"
+    assert selected is None
+    assert source == "unavailable"
 
 
 def test_embedded_date_parser_accepts_xmp_and_iptc_dates() -> None:

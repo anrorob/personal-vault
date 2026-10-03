@@ -1,0 +1,31 @@
+name: Release security
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  gitleaks:
+    name: Gitleaks / public history
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  privacy:
+    name: Source privacy / release tree
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: python scripts/check_source_privacy.py --revision "$GITHUB_SHA"
+      - run: git diff --check HEAD^ HEAD
+      - run: python -m compileall -q backend/app

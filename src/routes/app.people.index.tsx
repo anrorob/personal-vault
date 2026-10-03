@@ -75,7 +75,7 @@ function PeoplePage() {
   };
 
   return (
-    <div className="mx-auto max-w-6xl space-y-6">
+    <div className="pv-layout-container mx-auto max-w-7xl space-y-6">
       <section className="flex flex-col justify-between gap-4 sm:flex-row sm:items-end">
         <div>
           <h2 className="pv-content-title text-2xl md:text-3xl">People</h2>
@@ -106,7 +106,7 @@ function PeoplePage() {
       </label>
       {error && <div className="pv-panel pv-status-error p-6 text-center text-sm">{error}</div>}
       {!error && people === null && (
-        <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
+        <div className="pv-card-grid">
           {Array.from({ length: 5 }, (_, index) => (
             <div key={index} className="pv-panel aspect-[3/4] animate-pulse" />
           ))}
@@ -134,7 +134,7 @@ function PeoplePage() {
         </div>
       )}
       {!error && people && people.length > 0 && (
-        <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
+        <div className="pv-card-grid">
           {people.map((person) => (
             <PersonCard
               key={person.person_id}

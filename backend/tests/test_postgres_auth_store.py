@@ -200,6 +200,9 @@ def test_legacy_identity_migration_is_idempotent(
     try:
         migrated = PostgresAuthenticationStore(postgres_conninfo)
         migrated.initialize()
+        migrated.initialize()  # UUID progress-key migration is restart-safe.
+        with psycopg.connect(postgres_conninfo) as connection:
+            assert connection.execute("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='user_movie_progress'::regclass AND contype='p'").fetchone()[0] == "PRIMARY KEY (user_id, movie_id)"
         account = migrated.get_account('legacy-user')
 
         assert account is not None
@@ -241,3 +244,59 @@ def test_legacy_identity_migration_is_idempotent(
                     "DROP TABLE IF EXISTS auth_sessions, auth_login_attempts, "
                     "user_movie_progress, user_gallery_state, auth_accounts CASCADE"
                 )
+
+def test_hidden_video_authority_persists_only_for_matching_live_session(postgres_store,postgres_conninfo):
+    from uuid import uuid4
+    owner=postgres_store.ensure_initial_administrator('owner','synthetic-hash')
+    expires=datetime.now(timezone.utc)+timedelta(hours=1)
+    postgres_store.create_session('video-session',owner.user_id,owner.username,expires)
+    postgres_store.create_session('other-session',owner.user_id,owner.username,expires)
+    assert not postgres_store.authorize_hidden_videos_session('video-session',uuid4())
+    assert postgres_store.authorize_hidden_videos_session('video-session',owner.user_id)
+    recreated=PostgresAuthenticationStore(postgres_conninfo)
+    assert recreated.has_hidden_videos_authorization('video-session',owner.user_id)
+    assert not recreated.has_hidden_videos_authorization('other-session',owner.user_id)
+    assert not recreated.has_hidden_photos_authorization('video-session',owner.user_id)
+    recreated.delete_session('video-session')
+    assert not recreated.has_hidden_videos_authorization('video-session',owner.user_id)
+
+@pytest.mark.parametrize("episode", [False, True])
+def test_theatre_durable_state_is_atomic_idempotent_and_uuid_scoped(postgres_store, postgres_conninfo, episode):
+    from uuid import uuid4
+    from concurrent.futures import ThreadPoolExecutor
+    from app.auth_store import EpisodeProgress
+    owner = postgres_store.ensure_initial_administrator("example-"+str(uuid4()), "test-hash")
+    other = postgres_store.ensure_initial_administrator("example-"+str(uuid4()), "test-hash")
+    identity = uuid4() if episode else "example-"+str(uuid4())
+    cls = EpisodeProgress if episode else MovieProgress
+    save = postgres_store.save_episode_progress if episode else postgres_store.save_movie_progress
+    get = postgres_store.get_episode_progress if episode else postgres_store.get_movie_progress
+    listing = postgres_store.list_episode_progress if episode else postgres_store.list_movie_progress
+    table, key = ("user_episode_progress", "episode_id") if episode else ("user_movie_progress", "movie_id")
+    try:
+        initial = cls(identity, 120, 600, False)
+        assert save(owner.user_id, initial) == initial
+        with psycopg.connect(postgres_conninfo) as connection:
+            stamp = connection.execute(f"SELECT updated_at FROM {table} WHERE user_id=%s AND {key}=%s", (owner.user_id,identity)).fetchone()[0]
+        save(owner.user_id, initial)
+        with psycopg.connect(postgres_conninfo) as connection:
+            assert connection.execute(f"SELECT updated_at FROM {table} WHERE user_id=%s AND {key}=%s", (owner.user_id,identity)).fetchone()[0] == stamp
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(save, owner.user_id, cls(identity, p, 600, done), preserve_completed=True) for p,done in [(575,True),(125,False)]]
+            for future in futures: future.result()
+        assert get(owner.user_id, identity).completed is True
+        assert get(other.user_id, identity) is None
+        assert listing(other.user_id) == []
+        saved = save(owner.user_id, cls(identity,125,600,False))
+        assert not saved.completed and saved.position_seconds == 125
+        if not episode:
+            # Reusing a human label cannot transfer or collide with another viewer's state.
+            with psycopg.connect(postgres_conninfo) as connection:
+                connection.execute("UPDATE auth_accounts SET username=%s WHERE user_id=%s", ("renamed-"+str(uuid4()), owner.user_id))
+            replacement = postgres_store.ensure_initial_administrator(owner.username, "test-hash")
+            save(replacement.user_id, cls(identity,0,600,True))
+            assert get(owner.user_id,identity) == saved
+            assert get(replacement.user_id,identity).completed
+    finally:
+        with psycopg.connect(postgres_conninfo) as connection:
+            connection.execute(f"DELETE FROM {table} WHERE {key}=%s", (identity,))

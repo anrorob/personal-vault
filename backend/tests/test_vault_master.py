@@ -1,3 +1,4 @@
+from tests.managed_arrival import complete_gallery_receipt
 from dataclasses import replace
 from datetime import date, datetime, timezone
 from io import BytesIO
@@ -900,6 +901,7 @@ def test_xmp_descriptive_metadata_is_normalised() -> None:
         "description": "Outside the town hall",
         "creator": "Owner",
         "xmp_created_at": "1995-09-03T14:30:00",
+        "xmp_original_at": "1995-09-03T14:30:00",
         "location": "Starogard Gdanski, Pomorskie, Poland",
         "keywords": ["family", "wedding"],
     }
@@ -1323,7 +1325,7 @@ def test_arrival_hall_owner_survives_scan_move_and_catalogue(
 
     assert store.record_decision(item.id, "approved", "recipient") is not None
     assert store.queue_move(item.id, "recipient") is not None
-    assert process_next_move(store, incoming, {"Gallery": gallery}) == item.id
+    assert complete_gallery_receipt(store, incoming, {"Gallery": gallery}) == item.id
 
     asset = store.get_catalogued_asset("/vault/Gallery/recipient-photo.jpg")
     assert asset is not None
@@ -1337,17 +1339,17 @@ def test_arrival_hall_uuid_owner_survives_system_scan_without_admin_identity(
     incoming.mkdir()
     uploaded = incoming / "recipient-photo.jpg"
     uploaded.write_bytes(b"recipient-photo")
-    anita_user_id = uuid4()
+    example_recipient_user_id = uuid4()
     store = MemoryVaultMasterStore(default_asset_owner="owner")
 
     batch_id = enqueue_root(store, incoming, INCOMING_SOURCE)
 
     assert process_next_batch(
         store,
-        owner_lookup=lambda path: anita_user_id if path == uploaded else None,
+        owner_lookup=lambda path: example_recipient_user_id if path == uploaded else None,
     ) == batch_id
     item = store.list_items()[0]
-    assert item.owner_user_id == anita_user_id
+    assert item.owner_user_id == example_recipient_user_id
 
 
 def test_inventory_scan_publishes_discovered_permanent_file(
@@ -1468,7 +1470,7 @@ def test_queued_move_is_restart_safe_until_worker_claims_it(
         raise RuntimeError("Jellyfin unavailable")
 
     assert (
-        process_next_move(
+        complete_gallery_receipt(
             store,
             incoming,
             {"Gallery": gallery},
@@ -1490,6 +1492,7 @@ def test_queued_move_is_restart_safe_until_worker_claims_it(
         "display_title": "user_override",
         "captured_on": "user_override",
         "location": "user_override",
+        "storage_placement": "root_verified_receipt",
     }
     assert asset.imported_metadata == {}
     assert asset.user_overrides == {
@@ -1833,6 +1836,39 @@ def test_safe_move_refuses_changed_source_and_existing_destination(
         safely_move_approved_file(item, incoming, gallery)
     assert source.read_bytes() == b"approved"
     assert (gallery / "photo.jpeg").read_bytes() == b"existing"
+
+
+def test_documents_move_requires_managed_publisher_and_can_retry(
+    tmp_path: Path,
+) -> None:
+    incoming = tmp_path / "Arrival Hall"
+    documents = tmp_path / "Documents"
+    incoming.mkdir()
+    source = incoming / "phone receipt (Vault Supplier a1b2c3d4).pdf"
+    source.write_bytes(b"supplier receipt")
+    store = MemoryVaultMasterStore()
+    scan_root(store, incoming, INCOMING_SOURCE)
+    item = store.list_items()[0]
+    assert item.proposed_category == "Documents"
+    assert store.record_decision(item.id, "approved", "owner") is not None
+    assert store.queue_move(item.id, "owner") is not None
+
+    assert process_next_move(store, incoming, {"Documents": documents}) == item.id
+    failed = store.get_item(item.id)
+    assert failed is not None and failed.state == "move_failed"
+    assert source.read_bytes() == b"supplier receipt"
+    assert not documents.exists()
+
+    assert store.queue_move(item.id, "owner") is not None
+    request_id = uuid4()
+    assert process_next_move(store, incoming, {"Documents": documents},
+                             theatre_queue=lambda _: request_id) == item.id
+    pending = store.get_item(item.id)
+    assert pending is not None and pending.state == "theatre_promotion_pending"
+    assert pending.metadata["managed_request_id"] == str(request_id)
+    assert source.read_bytes() == b"supplier receipt"
+    assert not documents.exists()
+    assert store.queue_move(item.id, "owner") is None
 
 
 def test_safe_music_move_preserves_album_folder(

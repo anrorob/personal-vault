@@ -47,6 +47,8 @@ def synthetic_resolver(tmp_path, monkeypatch):
     base = os.getenv('PV_TEST_DATABASE_URL')
     if not base:
         pytest.skip('PV_TEST_DATABASE_URL is not configured')
+    from tests.test_arrival_recovery import configure_recovery
+    configure_recovery(tmp_path, monkeypatch)
     schema = 'removal_' + uuid4().hex
     with psycopg.connect(base) as conn:
         conn.execute(sql.SQL('CREATE SCHEMA {}').format(sql.Identifier(schema)))
@@ -61,7 +63,8 @@ def synthetic_resolver(tmp_path, monkeypatch):
             user_id = owner
         principal = Principal('test-user-a')
         vault = PostgresVaultMasterStore(conninfo, sidecar_root=tmp_path / 'metadata'); vault.initialize()
-        # Public catalogue publication reads the separately bootstrapped AI evidence store.
+        # Publication reads optional enrichment evidence even when this fixture has
+        # none. Match application bootstrap rather than omit the evidence schema.
         from app.vault_master_ingestion_ai import PostgresIngestionAiStore
         PostgresIngestionAiStore(conninfo).initialize()
         tv = PostgresTvShowStore(conninfo); tv.initialize()

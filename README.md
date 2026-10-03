@@ -7,10 +7,12 @@ Personal Vault is a self-hosted digital archive for privately owned media and do
 
 > **Project status:** active, early open-source development. Personal Vault is for technically capable developers and self-hosting experimenters. It is not yet a polished installer or finished consumer appliance; do not treat the current Compose configuration as a supported production recipe.
 
+Current release: **v1.1.0**. Read the [release notes](docs/release-v1.1.0.md) and [upgrade guide](docs/upgrade-v1.1.0.md).
+
 ## Current capabilities
 
-- Theatre for Movies and TV Shows, backed by a replaceable playback service
-- Gallery, Home Videos, Music, Documents, Archives, Library, and People areas
+- Theatre for Movies and TV Shows, quality selection, watched progress, episode continuation and manual movie franchises
+- Gallery pagination/date navigation and recoverable Delete/Restore; Home Videos, Music, Documents, Archives, Library, and People areas
 - Vault Master ingestion, catalogue, routing, and metadata workflows
 - Florence and gallery/people intelligence integration where configured
 - Multi-user accounts, passkey-first authentication, and administrative Vault Control
@@ -45,7 +47,7 @@ The backend is the authorization boundary. Read the public [architecture overvie
 | --- | --- |
 | `src/` | React/TanStack frontend |
 | `backend/` | FastAPI application, PostgreSQL stores, and tests |
-| `ai/`, `rampp/`, `people/`, `face_detector/` | Optional model-service containers |
+| `ai/`, `rampp/`, `people/`, `face_detector/`, `video_analyser/` | Optional model-service containers |
 | `public/` | Public application assets and fonts |
 | `docs/` | Public project, development, and release documentation |
 | `.github/` | Continuous-integration workflow |

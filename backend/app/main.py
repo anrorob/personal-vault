@@ -1,26 +1,30 @@
 import asyncio
+from app.ken_service import enabled as ken_enabled, get_ken_store, run_worker as run_ken_worker
+from app.ken_api import ken_router
 from contextlib import asynccontextmanager, suppress
 import logging
 import os
 from pathlib import Path
 import time
-from urllib.parse import urlsplit
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.exceptions import RequestValidationError
 from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from app.vault_supplier_lan import lan_endpoint_hint
-from app.vault_supplier import get_pairing_origin, PostgresVaultSupplierStore, get_vault_supplier_store, router as vault_supplier_router
 from app.auth import get_authentication_store, get_enrolment_store, get_passkey_store, router as auth_router
 from app.build_info import build_info, load_project_version
 from app.auth_store import AuthenticationStore, PostgresAuthenticationStore
 from app.passkeys import PostgresPasskeyStore
+from app.vault_supplier import get_pairing_origin, PostgresVaultSupplierStore, get_vault_supplier_store, router as vault_supplier_router
+from app.vault_supplier_lan import lan_endpoint_hint
 from app.vault_supplier_transfer import backfill_arrival_hall_source_context, PostgresTransferStore, get_transfer_store, router as vault_supplier_transfer_router
-from app.config import get_admin_username, get_database_conninfo, get_webauthn_origin
+from app.vault_supplier_filename_remediation import PostgresSupplierFilenameRemediationExecutor
+from app.config import get_admin_username, get_allowed_hosts, get_database_conninfo, get_webauthn_origin, request_host_name
 from app.request_security import trusted_proxy_networks
+from app.gallery_section_move import SectionMoves, router as gallery_section_move_router
+from app.section_counts import router as section_counts_router
 from app.gallery import router as gallery_router
 from app.people import router as people_router
 from app.gallery_intelligence import (
@@ -28,7 +32,9 @@ from app.gallery_intelligence import (
     get_gallery_intelligence_store,
     process_next_gallery_intelligence_job,
 )
+from app.gallery_florence import PostgresGalleryFlorenceStore, get_gallery_florence_store
 from app.gallery_people import PostgresGalleryPeopleStore, get_gallery_people_store
+from app.gallery_custom_tags import PostgresGalleryCustomTagStore, get_gallery_custom_tag_store
 from app.video_intelligence import (
     PostgresVideoIntelligenceStore,
     get_video_intelligence_store,
@@ -47,7 +53,10 @@ from app.movies import (
     router as movies_router,
 )
 from app.movie_playback import router as movie_playback_router
+from app.movie_franchises import PostgresMovieFranchiseStore, router as movie_franchises_router
+from app.music_videos import router as music_videos_router
 from app.music import router as music_router
+from app.asset_favorites import PostgresAssetFavorites, get_asset_favorites
 from app.music_playback import router as music_playback_router
 from app.reading_room_catalogue import router as reading_room_catalogue_router
 from app.vault_libraries import router as vault_libraries_router
@@ -75,6 +84,7 @@ from app.theatre_movie_rename import (
 from app.vault_master_jellyfin import (
     get_jellyfin_metadata_client,
     publish_jellyfin_media_updates,
+    request_managed_movie_library_scan,
     request_jellyfin_library_scan,
     run_jellyfin_movie_import,
     run_jellyfin_music_import,
@@ -148,13 +158,26 @@ def queue_gallery_intelligence_for_published_asset(
     assets are processed only through the explicit administrator backfill API.
     """
     moved_item = store.get_item(item_id)
-    if moved_item is None or not moved_item.proposed_destination:
+    if moved_item is None or moved_item.state != "moved" or not moved_item.proposed_destination:
         return False
     published_asset = store.get_catalogued_asset(moved_item.proposed_destination)
+    # A publication may preserve an existing canonical asset and change its
+    # logical path before this post-publication hook runs.  The Arrival path is
+    # historical, never the scheduling identity; resolve the one owner-scoped
+    # immutable asset instead.
+    if published_asset is None and moved_item.owner_user_id is not None:
+        matches = [
+            asset for asset in store.list_owned_catalogued_assets_by_user_id(moved_item.owner_user_id)
+            if asset.sha256 == moved_item.sha256 and asset.size_bytes == moved_item.size_bytes
+        ]
+        if len(matches) == 1:
+            published_asset = matches[0]
     if published_asset is None or published_asset.asset_type.casefold() != "gallery":
         return False
-    gallery_store.queue(published_asset.id, username)
-    return True
+    from app.gallery_publication import queue_gallery_publication
+    from app.gallery_florence import get_gallery_florence_store
+    return queue_gallery_publication(store, gallery_store, get_ingestion_ai_store(),
+                                     get_gallery_florence_store(), published_asset, username)
 
 
 def queue_video_intelligence_for_published_asset(store, video_store, item_id) -> bool:
@@ -245,9 +268,63 @@ def queue_video_intelligence_for_published_asset(store, video_store, item_id) ->
     return True
 
 
+def jellyfin_enabled() -> bool:
+    return os.getenv("PV_JELLYFIN_ENABLED", "true").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+async def run_vault_master_intelligence_worker() -> None:
+    """Fair serial model queues; long calls never occupy publication work."""
+    poll_seconds = max(1, int(os.getenv("PV_VAULT_MASTER_POLL_SECONDS", "5")))
+    while True:
+        try:
+            store = get_vault_master_store()
+            intake_open = await asyncio.to_thread(get_intake_store().global_enabled)
+        except Exception:
+            logger.exception("Vault Master intelligence configuration unavailable")
+            await asyncio.sleep(poll_seconds)
+            continue
+        from app.gallery_florence import get_gallery_florence_store, process_next_gallery_florence_job
+
+        def ingestion():
+            queue_pending_ingestion_image_analysis(get_ingestion_ai_store(), store, get_admin_username())
+            return process_next_ingestion_ai_job(get_ingestion_ai_store(), store)
+
+        def video():
+            processed = process_next_video_analysis_job(
+                get_video_intelligence_store(), store, get_gallery_people_store())
+            if processed is not None:
+                reconcile_video_analysis_job(get_video_intelligence_store(), store,
+                    get_gallery_people_store(), get_gallery_intelligence_store(), processed)
+
+        queues = []
+        if intake_open:
+            # Florence precedes GI so reconciliation can use its evidence in
+            # this round; neither is an ingestion or publication prerequisite.
+            queues.extend([
+                lambda: process_next_gallery_florence_job(get_gallery_florence_store(), store),
+                lambda: process_next_gallery_intelligence_job(
+                    get_gallery_intelligence_store(), store, None, get_ingestion_ai_store()),
+            ])
+            if os.getenv("PV_VAULT_MASTER_AI_ENABLED", "false").lower() in {"1", "true", "yes", "on"}:
+                queues.extend([lambda: process_next_ai_job(get_ai_store(), store), ingestion])
+        queues.append(video)
+        for queue in queues:
+            try:
+                await asyncio.to_thread(queue)
+            except Exception:
+                logger.exception("Vault Master intelligence queue iteration failed")
+        await asyncio.sleep(poll_seconds)
+
+
 async def run_vault_master_worker() -> None:
     work_wake = get_vault_master_work_wake()
     seen_work_generation = work_wake.generation()
+    jellyfin_enabled_for_worker = jellyfin_enabled()
     poll_seconds = max(
         1,
         int(os.getenv("PV_VAULT_MASTER_POLL_SECONDS", "5")),
@@ -289,6 +366,7 @@ async def run_vault_master_worker() -> None:
         store = None
         intake_open = False
         moved = None
+        managed_arrival = None
         processed = None
         try:
             store = get_vault_master_store()
@@ -325,11 +403,25 @@ async def run_vault_master_worker() -> None:
                 logger.info("Federated Theatre download receipt reconciled: asset_id=%s", theatre_download)
                 processed = theatre_download
             else:
+                supplier_remediation = await asyncio.to_thread(
+                    PostgresSupplierFilenameRemediationExecutor(get_database_conninfo()).reconcile_next_receipt
+                )
+                if supplier_remediation is not None:
+                    logger.info("Supplier filename remediation receipt reconciled: action_id=%s", supplier_remediation)
+                    processed = supplier_remediation
+            if processed is None:
+                supplier_remediation_rejected = await asyncio.to_thread(
+                    PostgresSupplierFilenameRemediationExecutor(get_database_conninfo()).reconcile_next_rejected_request
+                )
+                if supplier_remediation_rejected is not None:
+                    logger.error("Supplier filename remediation requires recovery: action_id=%s", supplier_remediation_rejected)
+                    processed = supplier_remediation_rejected
+            if processed is None:
                 managed_arrival = await asyncio.to_thread(reconcile_next_arrival_managed_receipt, store)
                 if managed_arrival is not None:
                     logger.info("Arrival Hall managed receipt reconciled: asset_id=%s", managed_arrival)
-                    # A resolver batch requests one bounded scan per completed
-                    # episode/extras publication phase. Scan
+                    # A resolver batch requests exactly one bounded scan after
+                    # all of its canonical episode receipts are durable.  Scan
                     # failure never reverses canonical publication.
                     published_batches = await asyncio.to_thread(
                         PostgresTvResolverStore(get_database_conninfo()).reconcile
@@ -340,6 +432,22 @@ async def run_vault_master_worker() -> None:
                         except Exception:
                             logger.exception("TV resolver Jellyfin handoff failed: batch_id=%s", batch_id)
                     processed = managed_arrival
+                    # Canonical publication is complete before enrichment is queued.
+                    asset = await asyncio.to_thread(store.get_catalogued_asset_by_id, managed_arrival)
+                    if asset is not None:
+                        try:
+                            await asyncio.to_thread(request_managed_movie_library_scan, asset.asset_type)
+                        except Exception:
+                            logger.exception("Movie Jellyfin scan handoff failed: asset_id=%s", managed_arrival)
+                    if asset is not None and asset.asset_type == "Gallery":
+                        try:
+                            from app.gallery_publication import queue_gallery_publication
+                            from app.gallery_florence import get_gallery_florence_store
+                            await asyncio.to_thread(queue_gallery_publication, store,
+                                get_gallery_intelligence_store(), get_ingestion_ai_store(),
+                                get_gallery_florence_store(), asset, get_admin_username())
+                        except Exception:
+                            logger.exception("Post-publication Gallery intelligence queue failed")
             if processed is None and intake_open:
                 moved = await asyncio.to_thread(
                     process_next_move,
@@ -360,10 +468,15 @@ async def run_vault_master_worker() -> None:
                         _arrival_hall_source_context_reference,
                     )
                 )
+            # A rejected signed request becomes a durable, failed resolver
+            # track. The action's request id prevents a stale rejection from
+            # affecting a later retry.
             from app.arrival_managed_publisher import reconcile_rejected_request
             rejected = await asyncio.to_thread(reconcile_rejected_request, store)
             if rejected is not None:
-                await asyncio.to_thread(PostgresTvResolverStore(get_database_conninfo()).reconcile)
+                await asyncio.to_thread(
+                    PostgresTvResolverStore(get_database_conninfo()).reconcile
+                )
             # Move failures do not produce a managed receipt, but they still
             # need to become durable resolver-batch failure state for retry.
             if processed is not None and managed_arrival is None:
@@ -393,27 +506,6 @@ async def run_vault_master_worker() -> None:
                     get_video_intelligence_store(),
                     moved,
                 )
-            if (
-                processed is None
-                and intake_open
-                and os.getenv("PV_VAULT_MASTER_AI_ENABLED", "false").lower()
-                in {"1", "true", "yes", "on"}
-            ):
-                processed = await asyncio.to_thread(
-                    process_next_ai_job, get_ai_store(), store
-                )
-                if processed is None:
-                    await asyncio.to_thread(
-                        queue_pending_ingestion_image_analysis,
-                        get_ingestion_ai_store(),
-                        store,
-                        get_admin_username(),
-                    )
-                    processed = await asyncio.to_thread(
-                        process_next_ingestion_ai_job,
-                        get_ingestion_ai_store(),
-                        store,
-                    )
             if processed is None and intake_open:
                 processed = await asyncio.to_thread(
                     reconcile_autopilot_runs,
@@ -429,63 +521,24 @@ async def run_vault_master_worker() -> None:
                     get_arrival_hall_path(),
                     get_destination_paths(),
                 )
-            # Gallery Intelligence is deliberately a post-publication metadata
-            # worker.  It never participates in Arrival Hall routing or scores.
-            if processed is None and intake_open:
-                gallery_store = get_gallery_intelligence_store()
-                processed = await asyncio.to_thread(
-                    process_next_gallery_intelligence_job,
-                    gallery_store,
-                    store,
-                    None,
-                    get_ingestion_ai_store(),
-                )
-            # Video Intelligence is a post-publication worker. V5 queues only
-            # the just-published Home Video above; it never performs a
-            # historic sweep and still uses the same manual queue contract.
-            if processed is None:
-                processed = await asyncio.to_thread(
-                    process_next_video_analysis_job,
-                    get_video_intelligence_store(),
-                    store,
-                    get_gallery_people_store(),
-                )
-                if processed is not None:
-                    # V3 reconciles only the selected V2 job just processed;
-                    # it deliberately does not sweep historical videos.
-                    await asyncio.to_thread(
-                        reconcile_video_analysis_job,
-                        get_video_intelligence_store(), store,
-                        get_gallery_people_store(), get_gallery_intelligence_store(), processed,
-                    )
         except Exception:
             logger.exception("Vault Master worker iteration failed")
             processed = None
 
-        if (
-            processed is None
-            and intake_open
-            and time.monotonic() >= next_automatic_scan
-        ):
+        if intake_open and time.monotonic() >= next_automatic_scan:
             if store is not None:
                 try:
-                    enqueue_root(
-                        store,
-                        get_arrival_hall_path(),
-                        INCOMING_SOURCE,
+                    from app.arrival_incremental_scan import scan_arrival_from_manifest
+                    await asyncio.to_thread(
+                        scan_arrival_from_manifest, store, get_arrival_hall_path(),
                     )
                 except Exception:
-                    logger.exception(
-                        "Vault Master automatic Arrival Hall scan could not "
-                        "be queued"
-                    )
-            next_automatic_scan = (
-                time.monotonic() + automatic_scan_seconds
-            )
+                    logger.exception("Vault Master incremental Arrival Hall scan failed")
+            next_automatic_scan = time.monotonic() + automatic_scan_seconds
 
         # Movie metadata import has its own bounded schedule. Ordinary Arrival
         # Hall or catalogue work must not postpone that external-source import.
-        if time.monotonic() >= next_movie_import:
+        if jellyfin_enabled_for_worker and time.monotonic() >= next_movie_import:
             if store is not None:
                 try:
                     imported, failed = await asyncio.to_thread(
@@ -504,7 +557,11 @@ async def run_vault_master_worker() -> None:
                     )
             next_movie_import = time.monotonic() + movie_import_seconds
 
-        if processed is None and time.monotonic() >= next_music_import:
+        if (
+            jellyfin_enabled_for_worker
+            and processed is None
+            and time.monotonic() >= next_music_import
+        ):
             if store is not None:
                 try:
                     imported, failed = await asyncio.to_thread(
@@ -522,7 +579,7 @@ async def run_vault_master_worker() -> None:
                     logger.exception("Vault Master music metadata import could not run")
             next_music_import = time.monotonic() + movie_import_seconds
 
-        if time.monotonic() >= next_tv_import:
+        if jellyfin_enabled_for_worker and time.monotonic() >= next_tv_import:
             try:
                 imported = await asyncio.to_thread(
                     import_pending_tv_metadata,
@@ -616,7 +673,10 @@ def bootstrap_application_schema() -> None:
     stores = (
         get_vault_master_store(),
         get_gallery_intelligence_store(),
+        get_gallery_florence_store(),
         get_gallery_people_store(),
+        get_gallery_custom_tag_store(),
+        get_asset_favorites(),
         get_video_intelligence_store(),
         get_ai_store(),
         get_ingestion_ai_store(),
@@ -628,7 +688,10 @@ def bootstrap_application_schema() -> None:
     expected_store_types = (
         PostgresVaultMasterStore,
         PostgresGalleryIntelligenceStore,
+        PostgresGalleryFlorenceStore,
         PostgresGalleryPeopleStore,
+        PostgresGalleryCustomTagStore,
+        PostgresAssetFavorites,
         PostgresVideoIntelligenceStore,
         PostgresAiStore,
         PostgresIngestionAiStore,
@@ -642,14 +705,17 @@ def bootstrap_application_schema() -> None:
             raise RuntimeError(f"Backend schema bootstrap requires {store_type.__name__}")
         store.initialize()
     PostgresTvShowStore(get_database_conninfo()).initialize()
-    supplier_store = get_vault_supplier_store()
-    if not isinstance(supplier_store, PostgresVaultSupplierStore):
-        raise RuntimeError("Backend schema bootstrap requires PostgresVaultSupplierStore")
-    supplier_store.initialize()
     PostgresTvResolverStore(get_database_conninfo()).initialize()
+    PostgresMovieFranchiseStore(get_database_conninfo()).initialize()
+    if ken_enabled():
+        get_ken_store().initialize()
 
     vault_store = stores[0]
     assert isinstance(vault_store, PostgresVaultMasterStore)
+    SectionMoves(vault_store).initialize()
+    from app.intake_recovery_authorization import initialize_recovery_authorizations
+    with vault_store._connect() as connection:
+        initialize_recovery_authorizations(connection)
     arrival_hall_root = os.getenv("PV_ARRIVAL_HALL_PATH")
     if arrival_hall_root:
         vault_store.migrate_source_root(
@@ -657,10 +723,19 @@ def bootstrap_application_schema() -> None:
             os.getenv("PV_INCOMING_PATH", "/vault/Incoming"),
             arrival_hall_root,
         )
+    supplier_store = get_vault_supplier_store()
+    if not isinstance(supplier_store, PostgresVaultSupplierStore):
+        raise RuntimeError("Backend schema bootstrap requires PostgreSQL Vault Supplier storage")
+    supplier_store.initialize()
     transfer_store = get_transfer_store()
     if not isinstance(transfer_store, PostgresTransferStore):
         raise RuntimeError("Backend schema bootstrap requires PostgreSQL Vault Supplier transfer storage")
     transfer_store.initialize()
+    from app.vault_supplier_transfer import migrate_transfer_original_filename
+    migrate_transfer_original_filename(get_database_conninfo())
+    # Schema only: remediation remains an explicit, privileged operation and
+    # startup never discovers or applies a filename repair.
+    PostgresSupplierFilenameRemediationExecutor(get_database_conninfo()).initialize()
     restored = backfill_arrival_hall_source_context(get_arrival_hall_path(), transfer_store)
     if restored:
         logger.info("Restored Supplier source context for %s staged Arrival Hall files", restored)
@@ -674,6 +749,7 @@ async def lifespan(app: FastAPI):
     # Required application schemas are not worker-owned.  Complete this
     # controlled bootstrap before either worker-enabled or API-only traffic.
     await asyncio.to_thread(bootstrap_application_schema)
+    ken_worker = asyncio.create_task(run_ken_worker()) if ken_enabled() else None
     worker_enabled = os.getenv(
         "PV_VAULT_MASTER_WORKER_ENABLED",
         "true",
@@ -681,13 +757,25 @@ async def lifespan(app: FastAPI):
     if not worker_enabled:
         set_worker_state("disabled")
         yield
+        if ken_worker:
+            ken_worker.cancel()
+            with suppress(asyncio.CancelledError):
+                await ken_worker
         return
     worker = asyncio.create_task(run_vault_master_worker())
+    intelligence_worker = asyncio.create_task(run_vault_master_intelligence_worker())
     set_worker_state("running")
     yield
+    if ken_worker:
+        ken_worker.cancel()
+        with suppress(asyncio.CancelledError):
+            await ken_worker
     worker.cancel()
+    intelligence_worker.cancel()
     with suppress(asyncio.CancelledError):
         await worker
+    with suppress(asyncio.CancelledError):
+        await intelligence_worker
     get_vault_master_work_wake().detach_worker_loop()
     set_worker_state("stopped")
 
@@ -707,7 +795,8 @@ def _is_vault_supplier_receiver_path(path: str) -> bool:
 
 
 @app.exception_handler(RequestValidationError)
-async def supplier_validation_error(request: Request, error: RequestValidationError):
+async def vault_supplier_receiver_validation_error(request: Request, error: RequestValidationError):
+    """Give Supplier receiver clients one stable malformed-request envelope."""
     if request.url.path == "/api/vault-supplier/pair":
         fields = {item["loc"][-1] for item in error.errors()}
         code = "invalid_installation_key" if fields & {"installation_public_key", "key_algorithm"} else "invalid_pairing_descriptor"
@@ -736,9 +825,8 @@ async def enforce_browser_request_boundary(request: Request, call_next):
             return JSONResponse({"detail": error.detail}, status_code=error.status_code, headers={"Cache-Control": "no-store"})
     else:
         canonical_origin = get_webauthn_origin()
-    expected_host = urlsplit(canonical_origin).netloc.casefold()
-    host = request.headers.get("host", "").casefold()
-    if host != expected_host:
+    host = request_host_name(request.headers.get("host", ""))
+    if host not in get_allowed_hosts():
         return JSONResponse({"detail": "Invalid host"}, status_code=400)
     if (
         request.method not in {"GET", "HEAD", "OPTIONS"}
@@ -757,15 +845,20 @@ app.include_router(user_state_router)
 app.include_router(tv_shows_router)
 app.include_router(tv_playback_router)
 app.include_router(gallery_router)
+app.include_router(section_counts_router)
+app.include_router(gallery_section_move_router)
 app.include_router(people_router)
 app.include_router(arrival_hall_router, prefix="/api/arrival-hall")
 app.include_router(arrival_hall_router, prefix="/api/incoming")
 app.include_router(movies_router)
+app.include_router(movie_franchises_router)
 app.include_router(movie_playback_router)
 app.include_router(music_router)
+app.include_router(music_videos_router)
 app.include_router(music_playback_router)
 app.include_router(reading_room_catalogue_router)
 app.include_router(vault_libraries_router)
+app.include_router(ken_router)
 app.include_router(vault_master_router)
 app.include_router(vault_master_intake_router)
 app.include_router(vault_master_music_router)

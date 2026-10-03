@@ -66,6 +66,9 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements-dev.txt
 
+      - name: Validate source privacy
+        run: python ../scripts/check_source_privacy.py --revision "$GITHUB_SHA"
+
       - name: Run backend and architecture tests
         run: python -m pytest -q
 
@@ -89,3 +92,5 @@ jobs:
         run: bun test tests
       - name: Build frontend
         run: bun run build
+      - name: Verify frontend cache policy
+        run: node scripts/check-frontend-cache.mjs

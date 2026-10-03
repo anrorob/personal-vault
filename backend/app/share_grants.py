@@ -401,23 +401,11 @@ def active_user_id(cursor: psycopg.Cursor, username: str) -> UUID | None:
     return UUID(str(row["user_id"])) if row is not None else None
 
 
-def visible_asset_ids(
-    cursor: psycopg.Cursor,
-    user_id: UUID,
-    asset_ids: list[UUID],
-) -> set[UUID]:
-    """Return asset UUIDs authorized by current owner/grant state only."""
-    # This request-time evaluator is the Stage 2C background mechanism: a
-    # browser need not remain open for a Standard Share to release.
-    evaluate_due_share_operations(cursor)
-    if not asset_ids:
-        return set()
-    cursor.execute(
-        """
-        SELECT asset.id
-        FROM vault_assets AS asset
-        WHERE asset.id = ANY(%s)
-          AND (
+ASSET_ACCESS_PREDICATE = """
+(
+              asset.lifecycle_state <> 'deleted'
+              AND
+              (
               asset.owner_user_id = %s
               OR asset.visibility = 'vault-wide'
               OR EXISTS (
@@ -448,7 +436,29 @@ def visible_asset_ids(
                         )
                     )
               )
+              )
           )
+"""
+
+
+def visible_asset_ids(
+    cursor: psycopg.Cursor,
+    user_id: UUID,
+    asset_ids: list[UUID],
+) -> set[UUID]:
+    """Return asset UUIDs authorized by current owner/grant state only."""
+    # This request-time evaluator is the Stage 2C background mechanism: a
+    # browser need not remain open for a Standard Share to release.
+    evaluate_due_share_operations(cursor)
+    if not asset_ids:
+        return set()
+    cursor.execute(
+        f"""
+        SELECT asset.id
+        FROM vault_assets AS asset
+        WHERE asset.id = ANY(%s)
+          AND {ASSET_ACCESS_PREDICATE}
+
         """,
         (asset_ids, user_id, user_id, user_id),
     )
@@ -501,6 +511,9 @@ def sync_stage2c_local_share_grants(
     Legacy fields remain an auditable compatibility snapshot.  Pending grants
     never authorize access; private revokes every open grant immediately.
     """
+    if visibility != "private":
+        from app.home_video_privacy import require_shareable
+        require_shareable(cursor, [asset_id])
     evaluate_due_share_operations(cursor)
     recipients: list[UUID] = []
     if visibility == "shared" and not local_all:
@@ -738,6 +751,8 @@ class PostgresShareGrantStore:
         asset_id: UUID,
         grantor_user_id: UUID,
     ) -> UUID:
+        from app.home_video_privacy import require_shareable
+        require_shareable(cursor, [asset_id])
         cursor.execute(
             """
             SELECT owner_user_id, origin_vault_id
@@ -819,6 +834,8 @@ class PostgresShareGrantStore:
     ) -> None:
         if not asset_ids or len(asset_ids) != len(set(asset_ids)):
             raise ValueError("A collection needs distinct owned assets")
+        from app.home_video_privacy import require_shareable
+        require_shareable(cursor, asset_ids)
         cursor.execute(
             """
             SELECT id FROM vault_assets
@@ -955,6 +972,8 @@ class PostgresShareGrantStore:
         with self._connect() as connection:
             with connection.cursor() as cursor:
                 collection = self._collection_for_owner(cursor, collection_id, owner_user_id)
+                from app.home_video_privacy import require_collection_shareable
+                require_collection_shareable(cursor, collection_id)
                 cursor.execute("SELECT 1 FROM vault_shared_collection_members WHERE collection_id = %s LIMIT 1", (collection_id,))
                 if cursor.fetchone() is None:
                     raise ValueError("An empty collection cannot be shared")
@@ -1430,6 +1449,7 @@ class PostgresShareGrantStore:
                     FROM vault_assets AS asset
                     JOIN auth_accounts AS owner ON owner.user_id = asset.owner_user_id
                     WHERE asset.owner_user_id <> %s
+                      AND asset.lifecycle_state = 'active'
                       AND (
                           EXISTS (
                               SELECT 1 FROM vault_share_grants AS share_grant
@@ -1468,6 +1488,26 @@ class PostgresShareGrantStore:
                     )
                     for row in cursor.fetchall()
                 ]
+
+    def has_active_share_for_asset(self, asset_id: UUID, owner_user_id: UUID) -> bool:
+        """Whether an owner's asset has any live direct or collection grant."""
+        with self._connect() as connection:
+            with connection.cursor() as cursor:
+                evaluate_due_share_operations(cursor)
+                cursor.execute(
+                    """
+                    SELECT 1 FROM vault_assets AS asset
+                    WHERE asset.id=%s AND asset.owner_user_id=%s AND (
+                      EXISTS (SELECT 1 FROM vault_share_grants AS share_grant
+                        WHERE share_grant.asset_id=asset.id AND share_grant.state='active')
+                      OR EXISTS (SELECT 1 FROM vault_shared_collection_members AS member
+                        JOIN vault_shared_collections AS collection ON collection.collection_id=member.collection_id AND collection.archived_at IS NULL
+                        JOIN vault_collection_share_grants AS collection_grant ON collection_grant.collection_id=collection.collection_id AND collection_grant.state='active'
+                        WHERE member.asset_id=asset.id)
+                    )
+                    """, (asset_id, owner_user_id)
+                )
+                return cursor.fetchone() is not None
 
     def list_outgoing_operations(self, grantor_user_id: UUID) -> list[tuple[ShareOperation, list[ShareGrant]]]:
         with self._connect() as connection:

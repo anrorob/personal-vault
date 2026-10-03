@@ -90,14 +90,14 @@ def test_people_api_lists_searches_details_and_returns_only_safe_asset_summaries
     owner = client.post(
         "/api/people",
         json={
-            "full_name": "Owner Kowalski",
+            "full_name": "Example Owner",
             "preferred_name": "Rob",
             "aliases": ["Bobby"],
             "date_of_birth": "1980-01-02",
             "profile_asset_id": str(asset.id),
         },
     )
-    duplicate = client.post("/api/people", json={"full_name": "Owner Kowalski"})
+    duplicate = client.post("/api/people", json={"full_name": "Example Owner"})
     assert owner.status_code == 201 and duplicate.status_code == 201
     assert owner.json()["person_id"] != duplicate.json()["person_id"]
     person_id = UUID(owner.json()["person_id"])
@@ -186,19 +186,19 @@ def test_people_api_includes_only_currently_shared_assets_explicitly_linked_to_l
     authenticate(client)
     recipient = client.post("/api/people", json={"full_name": "Recipient"}).json()
     same_name = client.post("/api/people", json={"full_name": "Recipient"}).json()
-    local_anita_id = UUID(recipient["person_id"])
+    local_example_recipient_id = UUID(recipient["person_id"])
     active = {"value": True}
 
     class SharedLocalPeople:
         def included_gallery_assets_for_local_people(
             self, recipient_user_id: UUID, person_ids: tuple[UUID, ...]
         ) -> set[UUID]:
-            if active["value"] and recipient_user_id == owner_id(TEST_USERNAME) and person_ids == (local_anita_id,):
+            if active["value"] and recipient_user_id == owner_id(TEST_USERNAME) and person_ids == (local_example_recipient_id,):
                 return {shared.id}
             return set()
 
     app.dependency_overrides[get_share_grant_store] = lambda: SharedLocalPeople()
-    detail = client.get(f"/api/people/{local_anita_id}")
+    detail = client.get(f"/api/people/{local_example_recipient_id}")
     assert detail.status_code == 200
     assert detail.json()["associated_assets"] == [{
         "asset_id": str(shared.id), "display_title": "Family portrait",
@@ -212,13 +212,13 @@ def test_people_api_includes_only_currently_shared_assets_explicitly_linked_to_l
 
     # Recipient cannot use the owner-only correction endpoint to change origin metadata.
     assert client.put(
-        f"/api/people/{local_anita_id}/assets",
-        json={"asset_id": str(shared.id), "person_id": str(local_anita_id), "decision": "include"},
+        f"/api/people/{local_example_recipient_id}/assets",
+        json={"asset_id": str(shared.id), "person_id": str(local_example_recipient_id), "decision": "include"},
     ).status_code == 404
 
     # A revoked share is not retained by the local association.
     active["value"] = False
-    assert client.get(f"/api/people/{local_anita_id}").json()["associated_assets"] == []
+    assert client.get(f"/api/people/{local_example_recipient_id}").json()["associated_assets"] == []
 
 
 def test_people_profile_frame_merge_and_asset_correction_preserve_owner_scoped_identity(

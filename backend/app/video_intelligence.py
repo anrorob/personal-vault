@@ -185,7 +185,9 @@ def video_source_path(asset) -> Path:
     prefix = "/vault/Home Videos/"
     if asset.asset_type != "Home Videos" or not asset.vault_path.startswith(prefix):
         raise ValueError("Video Intelligence requires a published Home Video")
-    return Path(os.getenv("PV_PERSONAL_VIDEOS_PATH", "/media/personal-videos")) / asset.vault_path.removeprefix(prefix)
+    from app.home_videos import get_home_videos_path
+
+    return get_home_videos_path() / asset.vault_path.removeprefix(prefix)
 
 
 def probe_video_duration_ms(source: Path) -> int:
@@ -214,15 +216,64 @@ def _ffmpeg_diagnostic(
     return f"ffmpeg frame extraction failed (exit {error.returncode}){suffix}"
 
 
-def extract_frame(source: Path, timestamp_ms: int, destination: Path) -> None:
+def extract_frame(source: Path, timestamp_ms: int, destination: Path, *, max_dimension: int | None = None) -> None:
+    filters = []
+    if max_dimension is not None:
+        if not 1 <= max_dimension <= 4096:
+            raise ValueError("Invalid frame dimension")
+        filters = ["-vf", f"scale=w='min({max_dimension},iw)':h='min({max_dimension},ih)':force_original_aspect_ratio=decrease"]
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
         subprocess.run(
-            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-ss", f"{timestamp_ms / 1000:.3f}", "-i", str(source), "-frames:v", "1", "-q:v", "3", str(destination)],
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-ss", f"{timestamp_ms / 1000:.3f}", "-i", str(source), *filters, "-frames:v", "1", "-q:v", "3", str(destination)],
             check=True, capture_output=True, timeout=120,
         )
     except subprocess.CalledProcessError as error:
         raise RuntimeError(_ffmpeg_diagnostic(error, source, destination)) from error
+
+
+def probe_video_stream(source: Path) -> dict:
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+         "stream=codec_name,width,height,duration,r_frame_rate:stream_side_data=rotation:format=duration", "-of", "json", str(source)],
+        check=True, capture_output=True, text=True, timeout=60,
+    )
+    data = json.loads(result.stdout)
+    stream = data["streams"][0]
+    duration = float(stream.get("duration") if stream.get("duration") not in (None, "N/A", "") else data["format"]["duration"])
+    if not 0 < duration < float("inf") or not 0 < stream["width"] or not 0 < stream["height"]:
+        raise ValueError("Invalid video stream")
+    return {"duration_ms": max(1, round(duration * 1000)), "width": stream["width"],
+            "height": stream["height"], "codec": stream["codec_name"], "frame_rate": stream.get("r_frame_rate"),
+            "rotation": next((item["rotation"] for item in stream.get("side_data_list", []) if "rotation" in item), 0)}
+
+
+def prepare_compatible_video(source: Path, destination: Path, *, max_dimension: int = 672) -> None:
+    """Rebuildable continuous video; preserve temporal coverage, never a JPEG slideshow."""
+    if not 2 <= max_dimension <= 4096:
+        raise ValueError("Invalid video dimension")
+    if shutil.disk_usage(destination.parent).free < 128 * 1024**2:
+        raise RuntimeError("Insufficient temporary disk for video preparation")
+    command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-threads", "4",
+               "-i", str(source), "-map", "0:v:0", "-an", "-map_metadata", "-1",
+               "-vf", f"scale=w='min({max_dimension},iw)':h='min({max_dimension},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+               "-fps_mode", "vfr", "-c:v", "libx264", "-threads", "4", "-filter_threads", "2",
+               "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(destination)]
+    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    started = time.monotonic()
+    try:
+        while process.poll() is None:
+            if time.monotonic() - started > 1800:
+                raise RuntimeError("Video preparation timed out")
+            if shutil.disk_usage(destination.parent).free < 128 * 1024**2:
+                raise RuntimeError("Insufficient temporary disk for video preparation")
+            time.sleep(0.25)
+        if process.returncode:
+            raise RuntimeError("Video preparation failed")
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
 
 
 def _scene_candidates(source: Path, config: VideoSamplingConfig) -> tuple[int, ...]:

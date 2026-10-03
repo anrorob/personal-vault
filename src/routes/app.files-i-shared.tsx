@@ -119,7 +119,7 @@ function FilesISharedPage() {
     await load();
   };
   return (
-    <section className="mx-auto max-w-4xl space-y-5">
+    <section className="mx-auto max-w-7xl space-y-5">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h2 className="pv-page-title">Files I Shared</h2>

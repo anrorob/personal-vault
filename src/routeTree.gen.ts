@@ -46,11 +46,16 @@ import { Route as AppVaultControlOverviewRouteImport } from './routes/app.vault-
 import { Route as AppVaultControlIntakeRouteImport } from './routes/app.vault-control.intake'
 import { Route as AppVaultControlFederationRouteImport } from './routes/app.vault-control.federation'
 import { Route as AppPeoplePersonIdRouteImport } from './routes/app.people.$personId'
+import { Route as AppMusicVideosRouteImport } from './routes/app.music_.videos'
+import { Route as AppMusicPlaylistsRouteImport } from './routes/app.music_.playlists'
 import { Route as AppMoviesTvShowsRouteImport } from './routes/app.movies.tv-shows'
 import { Route as AppMoviesMovieIdRouteImport } from './routes/app.movies.$movieId'
 import { Route as AppGalleryPhotoIdRouteImport } from './routes/app.gallery.$photoId'
+import { Route as AppMusicSongsIndexRouteImport } from './routes/app.music_.songs.index'
+import { Route as AppMusicAlbumsIndexRouteImport } from './routes/app.music_.albums.index'
 import { Route as AppMoviesTvShowsIndexRouteImport } from './routes/app.movies.tv-shows.index'
 import { Route as AppReadingRoomPublicationIdReadRouteImport } from './routes/app.reading-room.$publicationId.read'
+import { Route as AppMusicAlbumsAlbumIdRouteImport } from './routes/app.music_.albums.$albumId'
 import { Route as AppMoviesTvShowsShowIdRouteImport } from './routes/app.movies.tv-shows.$showId'
 
 const LoginRoute = LoginRouteImport.update({
@@ -239,6 +244,16 @@ const AppPeoplePersonIdRoute = AppPeoplePersonIdRouteImport.update({
   path: '/$personId',
   getParentRoute: () => AppPeopleRoute,
 } as any)
+const AppMusicVideosRoute = AppMusicVideosRouteImport.update({
+  id: '/music_/videos',
+  path: '/music/videos',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppMusicPlaylistsRoute = AppMusicPlaylistsRouteImport.update({
+  id: '/music_/playlists',
+  path: '/music/playlists',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppMoviesTvShowsRoute = AppMoviesTvShowsRouteImport.update({
   id: '/tv-shows',
   path: '/tv-shows',
@@ -254,6 +269,16 @@ const AppGalleryPhotoIdRoute = AppGalleryPhotoIdRouteImport.update({
   path: '/$photoId',
   getParentRoute: () => AppGalleryRoute,
 } as any)
+const AppMusicSongsIndexRoute = AppMusicSongsIndexRouteImport.update({
+  id: '/music_/songs/',
+  path: '/music/songs/',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppMusicAlbumsIndexRoute = AppMusicAlbumsIndexRouteImport.update({
+  id: '/music_/albums/',
+  path: '/music/albums/',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppMoviesTvShowsIndexRoute = AppMoviesTvShowsIndexRouteImport.update({
   id: '/',
   path: '/',
@@ -265,6 +290,11 @@ const AppReadingRoomPublicationIdReadRoute =
     path: '/$publicationId/read',
     getParentRoute: () => AppReadingRoomRoute,
   } as any)
+const AppMusicAlbumsAlbumIdRoute = AppMusicAlbumsAlbumIdRouteImport.update({
+  id: '/music_/albums/$albumId',
+  path: '/music/albums/$albumId',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppMoviesTvShowsShowIdRoute = AppMoviesTvShowsShowIdRouteImport.update({
   id: '/$showId',
   path: '/$showId',
@@ -300,6 +330,8 @@ export interface FileRoutesByFullPath {
   '/app/gallery/$photoId': typeof AppGalleryPhotoIdRoute
   '/app/movies/$movieId': typeof AppMoviesMovieIdRoute
   '/app/movies/tv-shows': typeof AppMoviesTvShowsRouteWithChildren
+  '/app/music/playlists': typeof AppMusicPlaylistsRoute
+  '/app/music/videos': typeof AppMusicVideosRoute
   '/app/people/$personId': typeof AppPeoplePersonIdRoute
   '/app/vault-control/federation': typeof AppVaultControlFederationRoute
   '/app/vault-control/intake': typeof AppVaultControlIntakeRoute
@@ -313,8 +345,11 @@ export interface FileRoutesByFullPath {
   '/app/people/': typeof AppPeopleIndexRoute
   '/app/vault-control/': typeof AppVaultControlIndexRoute
   '/app/movies/tv-shows/$showId': typeof AppMoviesTvShowsShowIdRoute
+  '/app/music/albums/$albumId': typeof AppMusicAlbumsAlbumIdRoute
   '/app/reading-room/$publicationId/read': typeof AppReadingRoomPublicationIdReadRoute
   '/app/movies/tv-shows/': typeof AppMoviesTvShowsIndexRoute
+  '/app/music/albums/': typeof AppMusicAlbumsIndexRoute
+  '/app/music/songs/': typeof AppMusicSongsIndexRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -339,6 +374,8 @@ export interface FileRoutesByTo {
   '/app': typeof AppIndexRoute
   '/app/gallery/$photoId': typeof AppGalleryPhotoIdRoute
   '/app/movies/$movieId': typeof AppMoviesMovieIdRoute
+  '/app/music/playlists': typeof AppMusicPlaylistsRoute
+  '/app/music/videos': typeof AppMusicVideosRoute
   '/app/people/$personId': typeof AppPeoplePersonIdRoute
   '/app/vault-control/federation': typeof AppVaultControlFederationRoute
   '/app/vault-control/intake': typeof AppVaultControlIntakeRoute
@@ -352,8 +389,11 @@ export interface FileRoutesByTo {
   '/app/people': typeof AppPeopleIndexRoute
   '/app/vault-control': typeof AppVaultControlIndexRoute
   '/app/movies/tv-shows/$showId': typeof AppMoviesTvShowsShowIdRoute
+  '/app/music/albums/$albumId': typeof AppMusicAlbumsAlbumIdRoute
   '/app/reading-room/$publicationId/read': typeof AppReadingRoomPublicationIdReadRoute
   '/app/movies/tv-shows': typeof AppMoviesTvShowsIndexRoute
+  '/app/music/albums': typeof AppMusicAlbumsIndexRoute
+  '/app/music/songs': typeof AppMusicSongsIndexRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -385,6 +425,8 @@ export interface FileRoutesById {
   '/app/gallery/$photoId': typeof AppGalleryPhotoIdRoute
   '/app/movies/$movieId': typeof AppMoviesMovieIdRoute
   '/app/movies/tv-shows': typeof AppMoviesTvShowsRouteWithChildren
+  '/app/music_/playlists': typeof AppMusicPlaylistsRoute
+  '/app/music_/videos': typeof AppMusicVideosRoute
   '/app/people/$personId': typeof AppPeoplePersonIdRoute
   '/app/vault-control/federation': typeof AppVaultControlFederationRoute
   '/app/vault-control/intake': typeof AppVaultControlIntakeRoute
@@ -398,8 +440,11 @@ export interface FileRoutesById {
   '/app/people/': typeof AppPeopleIndexRoute
   '/app/vault-control/': typeof AppVaultControlIndexRoute
   '/app/movies/tv-shows/$showId': typeof AppMoviesTvShowsShowIdRoute
+  '/app/music_/albums/$albumId': typeof AppMusicAlbumsAlbumIdRoute
   '/app/reading-room/$publicationId/read': typeof AppReadingRoomPublicationIdReadRoute
   '/app/movies/tv-shows/': typeof AppMoviesTvShowsIndexRoute
+  '/app/music_/albums/': typeof AppMusicAlbumsIndexRoute
+  '/app/music_/songs/': typeof AppMusicSongsIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -432,6 +477,8 @@ export interface FileRouteTypes {
     | '/app/gallery/$photoId'
     | '/app/movies/$movieId'
     | '/app/movies/tv-shows'
+    | '/app/music/playlists'
+    | '/app/music/videos'
     | '/app/people/$personId'
     | '/app/vault-control/federation'
     | '/app/vault-control/intake'
@@ -445,8 +492,11 @@ export interface FileRouteTypes {
     | '/app/people/'
     | '/app/vault-control/'
     | '/app/movies/tv-shows/$showId'
+    | '/app/music/albums/$albumId'
     | '/app/reading-room/$publicationId/read'
     | '/app/movies/tv-shows/'
+    | '/app/music/albums/'
+    | '/app/music/songs/'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -471,6 +521,8 @@ export interface FileRouteTypes {
     | '/app'
     | '/app/gallery/$photoId'
     | '/app/movies/$movieId'
+    | '/app/music/playlists'
+    | '/app/music/videos'
     | '/app/people/$personId'
     | '/app/vault-control/federation'
     | '/app/vault-control/intake'
@@ -484,8 +536,11 @@ export interface FileRouteTypes {
     | '/app/people'
     | '/app/vault-control'
     | '/app/movies/tv-shows/$showId'
+    | '/app/music/albums/$albumId'
     | '/app/reading-room/$publicationId/read'
     | '/app/movies/tv-shows'
+    | '/app/music/albums'
+    | '/app/music/songs'
   id:
     | '__root__'
     | '/'
@@ -516,6 +571,8 @@ export interface FileRouteTypes {
     | '/app/gallery/$photoId'
     | '/app/movies/$movieId'
     | '/app/movies/tv-shows'
+    | '/app/music_/playlists'
+    | '/app/music_/videos'
     | '/app/people/$personId'
     | '/app/vault-control/federation'
     | '/app/vault-control/intake'
@@ -529,8 +586,11 @@ export interface FileRouteTypes {
     | '/app/people/'
     | '/app/vault-control/'
     | '/app/movies/tv-shows/$showId'
+    | '/app/music_/albums/$albumId'
     | '/app/reading-room/$publicationId/read'
     | '/app/movies/tv-shows/'
+    | '/app/music_/albums/'
+    | '/app/music_/songs/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -803,6 +863,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppPeoplePersonIdRouteImport
       parentRoute: typeof AppPeopleRoute
     }
+    '/app/music_/videos': {
+      id: '/app/music_/videos'
+      path: '/music/videos'
+      fullPath: '/app/music/videos'
+      preLoaderRoute: typeof AppMusicVideosRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/app/music_/playlists': {
+      id: '/app/music_/playlists'
+      path: '/music/playlists'
+      fullPath: '/app/music/playlists'
+      preLoaderRoute: typeof AppMusicPlaylistsRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/app/movies/tv-shows': {
       id: '/app/movies/tv-shows'
       path: '/tv-shows'
@@ -824,6 +898,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppGalleryPhotoIdRouteImport
       parentRoute: typeof AppGalleryRoute
     }
+    '/app/music_/songs/': {
+      id: '/app/music_/songs/'
+      path: '/music/songs'
+      fullPath: '/app/music/songs/'
+      preLoaderRoute: typeof AppMusicSongsIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/app/music_/albums/': {
+      id: '/app/music_/albums/'
+      path: '/music/albums'
+      fullPath: '/app/music/albums/'
+      preLoaderRoute: typeof AppMusicAlbumsIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/app/movies/tv-shows/': {
       id: '/app/movies/tv-shows/'
       path: '/'
@@ -837,6 +925,13 @@ declare module '@tanstack/react-router' {
       fullPath: '/app/reading-room/$publicationId/read'
       preLoaderRoute: typeof AppReadingRoomPublicationIdReadRouteImport
       parentRoute: typeof AppReadingRoomRoute
+    }
+    '/app/music_/albums/$albumId': {
+      id: '/app/music_/albums/$albumId'
+      path: '/music/albums/$albumId'
+      fullPath: '/app/music/albums/$albumId'
+      preLoaderRoute: typeof AppMusicAlbumsAlbumIdRouteImport
+      parentRoute: typeof AppRoute
     }
     '/app/movies/tv-shows/$showId': {
       id: '/app/movies/tv-shows/$showId'
@@ -963,6 +1058,11 @@ interface AppRouteChildren {
   AppSecurityRoute: typeof AppSecurityRoute
   AppVaultControlRoute: typeof AppVaultControlRouteWithChildren
   AppIndexRoute: typeof AppIndexRoute
+  AppMusicPlaylistsRoute: typeof AppMusicPlaylistsRoute
+  AppMusicVideosRoute: typeof AppMusicVideosRoute
+  AppMusicAlbumsAlbumIdRoute: typeof AppMusicAlbumsAlbumIdRoute
+  AppMusicAlbumsIndexRoute: typeof AppMusicAlbumsIndexRoute
+  AppMusicSongsIndexRoute: typeof AppMusicSongsIndexRoute
 }
 
 const AppRouteChildren: AppRouteChildren = {
@@ -985,6 +1085,11 @@ const AppRouteChildren: AppRouteChildren = {
   AppSecurityRoute: AppSecurityRoute,
   AppVaultControlRoute: AppVaultControlRouteWithChildren,
   AppIndexRoute: AppIndexRoute,
+  AppMusicPlaylistsRoute: AppMusicPlaylistsRoute,
+  AppMusicVideosRoute: AppMusicVideosRoute,
+  AppMusicAlbumsAlbumIdRoute: AppMusicAlbumsAlbumIdRoute,
+  AppMusicAlbumsIndexRoute: AppMusicAlbumsIndexRoute,
+  AppMusicSongsIndexRoute: AppMusicSongsIndexRoute,
 }
 
 const AppRouteWithChildren = AppRoute._addFileChildren(AppRouteChildren)

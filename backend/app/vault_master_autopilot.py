@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from functools import lru_cache
 import json
@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 
 import psycopg
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 from app.config import get_database_conninfo
 from app.vault_master import (
@@ -18,22 +19,23 @@ from app.vault_master import (
     has_hard_coded_screenshot_marker,
     require_file_within_root,
     sha256_file,
+    proposed_destination_path,
+    logical_filename,
 )
-from app.vault_master_ai import AI_MODEL_ID, AI_MODEL_REVISION
 from app.reading_room_intake import build_publication_bundles
 from app.vault_master_ingestion_ai import (
     AUTO_PILOT_ELIGIBILITY_SCORE,
-    INGESTION_TASK_VERSION,
     IngestionAiEvidence,
     IngestionAiStore,
 )
+from app.vault_master_routing_score import RoutingDecision, build_routing_decision
 
 
 AUTOPILOT_POLICY_VERSION = "universal-autopilot-v3"
 AUTOPILOT_SAFE_CONTENT_DESTINATIONS = {
     "personal_photo": "Gallery",
     "receipt": "Documents",
-    "financial_document": "Ledger",
+    "financial_document": "Documents",
     "general_document": "Documents",
     "artwork": "Archives",
 }
@@ -88,6 +90,8 @@ class GalleryScreenshotSuspect:
 
 
 class AutopilotStore(Protocol):
+    def save_routing_decision(self, decision: RoutingDecision) -> RoutingDecision: ...
+    def list_routing_decisions(self, item_id: UUID, owner_user_id: UUID) -> list[dict[str, object]]: ...
     def list_policies(self, owner_user_id: UUID | None = None) -> list[AutopilotPolicy]: ...
     def upsert_policy(
         self,
@@ -141,6 +145,19 @@ class MemoryAutopilotStore:
     def __init__(self) -> None:
         self.policies: dict[UUID, AutopilotPolicy] = {}
         self.runs: dict[UUID, AutopilotRun] = {}
+        self.routing_decisions: dict[UUID, RoutingDecision] = {}
+        self.routing_authorizations: dict[UUID, dict[str, object]] = {}
+
+    def save_routing_decision(self, decision: RoutingDecision) -> RoutingDecision:
+        prior = next((value for value in reversed(tuple(self.routing_decisions.values()))
+                      if value.item_id == decision.item_id and value.id != decision.id), None)
+        stored = replace(decision, supersedes_id=prior.id if prior else None)
+        return self.routing_decisions.setdefault(stored.id, stored)
+
+    def list_routing_decisions(self, item_id: UUID, owner_user_id: UUID) -> list[dict[str, object]]:
+        return [json.loads(json.dumps(asdict(value), default=str))
+                for value in reversed(tuple(self.routing_decisions.values()))
+                if value.item_id == item_id and value.owner_user_id == owner_user_id]
 
     def list_policies(self, owner_user_id: UUID | None = None) -> list[AutopilotPolicy]:
         return sorted(
@@ -289,8 +306,42 @@ class PostgresAutopilotStore:
     def _connect(self):
         return psycopg.connect(self._conninfo, row_factory=dict_row)
 
+    def save_routing_decision(self, decision: RoutingDecision) -> RoutingDecision:
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT id FROM vault_routing_decisions WHERE id=%s", (decision.id,))
+            if cursor.fetchone():
+                return decision
+            cursor.execute("""SELECT id FROM vault_routing_decisions
+                WHERE item_id=%s AND owner_user_id=%s ORDER BY created_at DESC LIMIT 1""",
+                (decision.item_id, decision.owner_user_id))
+            prior = cursor.fetchone()
+            stored = replace(decision, supersedes_id=prior["id"] if prior else None)
+            payload = json.loads(json.dumps(asdict(stored), default=str))
+            cursor.execute("""INSERT INTO vault_routing_decisions
+                (id,item_id,owner_user_id,source_sha256,version,evidence_id,supersedes_id,decision,created_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(id) DO NOTHING""",
+                (stored.id, stored.item_id, stored.owner_user_id, stored.source_sha256,
+                 stored.version, stored.evidence_id, stored.supersedes_id,
+                 Jsonb(payload), stored.created_at))
+            return stored
+
+    def list_routing_decisions(self, item_id: UUID, owner_user_id: UUID) -> list[dict[str, object]]:
+        with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute("""SELECT decision FROM vault_routing_decisions
+                WHERE item_id=%s AND owner_user_id=%s ORDER BY created_at DESC, id DESC""",
+                (item_id, owner_user_id))
+            return [row["decision"] for row in cursor.fetchall()]
+
     def initialize(self) -> None:
         with self._connect() as connection, connection.cursor() as cursor:
+            cursor.execute("""CREATE TABLE IF NOT EXISTS vault_routing_decisions (
+                id UUID PRIMARY KEY, item_id UUID NOT NULL,
+                owner_user_id UUID NOT NULL,
+                source_sha256 TEXT NOT NULL, version TEXT NOT NULL,
+                evidence_id UUID,
+                supersedes_id UUID REFERENCES vault_routing_decisions(id),
+                decision JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL)""")
+            cursor.execute("CREATE INDEX IF NOT EXISTS vault_routing_decisions_item_idx ON vault_routing_decisions(item_id,created_at DESC)")
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS vault_autopilot_policies (
@@ -313,6 +364,12 @@ class PostgresAutopilotStore:
                 )
                 """
             )
+            cursor.execute("""CREATE TABLE IF NOT EXISTS vault_routing_authorizations (
+                id UUID PRIMARY KEY, decision_id UUID NOT NULL UNIQUE REFERENCES vault_routing_decisions(id),
+                item_id UUID NOT NULL,
+                owner_user_id UUID NOT NULL,
+                policy_id UUID NOT NULL,
+                policy_snapshot JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS vault_autopilot_runs (
@@ -541,28 +598,45 @@ def _latest_evidence(
     return latest
 
 
-def _eligible(
-    item: ImportItem,
-    evidence: IngestionAiEvidence,
-    policy: AutopilotPolicy,
-    publication_item_ids: set[UUID],
-) -> bool:
-    return (
-        item.source_kind == INCOMING_SOURCE
-        and item.state == "needs_review"
-        and item.duplicate_of_id is None
+def camera_photo_eligible(item, evidence, policy, publication_item_ids):
+    """Retired Boolean authorization: camera metadata does not prove a score.
+
+    There is no approved deterministic-score producer/record contract yet.
+    Fail closed even for an enabled policy; arbitrary metadata scores and
+    Florence/RAM++ confidence cannot substitute for that missing authority.
+    Technical camera checks remain usable by explicit historical recovery.
+    """
+    return False
+
+
+def camera_photo_safety_eligible(item, evidence, publication_item_ids):
+    """Technical camera-photo safety only; callers must separately authorize movement."""
+    metadata = item.metadata
+    from app.photo_dates import normalize_source_date
+    if normalize_source_date(metadata.get("exif_original_at")) is None:
+        return False
+    if not (
+        item.owner_user_id is not None
+        and item.source_kind == INCOMING_SOURCE and item.state == "needs_review"
+        and item.proposed_category == "Gallery" and item.duplicate_of_id is None
         and item.id not in publication_item_ids
-        and item.proposed_category == policy.destination
-        and evidence.content_type == policy.content_type
-        and evidence.recommended_destination == policy.destination
-        and evidence.routing_band == "automatic_eligible"
-        and evidence.decision_score >= policy.threshold
-        and not evidence.conflicts
-        and not evidence.automatic_disqualifiers
-        and evidence.model_id == AI_MODEL_ID
-        and evidence.model_revision == AI_MODEL_REVISION
-        and evidence.task_version == INGESTION_TASK_VERSION
-    )
+        and item.mime_type in {"image/jpeg", "image/png", "image/heic", "image/heif", "image/tiff"}
+        and isinstance(metadata.get("camera_make"), str) and metadata["camera_make"].strip()
+        and isinstance(metadata.get("camera_model"), str) and metadata["camera_model"].strip()
+        and metadata.get("exif_original_at")
+        and isinstance(metadata.get("width"), int) and metadata["width"] > 0
+        and isinstance(metadata.get("height"), int) and metadata["height"] > 0
+        and not has_hard_coded_screenshot_marker(item.filename, metadata)
+        and not has_hard_coded_screenshot_marker(str(metadata.get("logical_filename", "")), metadata)
+    ):
+        return False
+    if evidence is not None and (
+        evidence.conflicts
+        or evidence.content_type not in {"personal_photo", "unknown"}
+        or evidence.recommended_destination not in {None, "Gallery"}
+    ):
+        return False
+    return True
 
 
 def _preflight(
@@ -577,6 +651,9 @@ def _preflight(
         )
         if source.stat().st_size != item.size_bytes or sha256_file(source) != item.sha256:
             return "source_changed"
+        if item.mime_type.startswith("image/"):
+            from app.vault_master import verify_camera_photo
+            verify_camera_photo(source)
         destination_root = destination_roots[item.proposed_category or ""].resolve(strict=True)
         if not destination_root.is_dir():
             return "destination_mount_unavailable"
@@ -593,94 +670,191 @@ def _preflight(
     return None
 
 
+def _authorize_scored_item(policy_store: AutopilotStore, vault_store: VaultMasterStore,
+                           item: ImportItem, decision: RoutingDecision,
+                           incoming_root: Path,
+                           destination_roots: dict[str, Path]) -> ImportItem | None:
+    """The only normal automatic approval boundary, with a live policy check."""
+    if not decision.automatic_eligible or decision.policy_snapshot is None or decision.destination is None:
+        return None
+    proposed_for_preflight = replace(
+        item, proposed_category=decision.destination,
+        proposed_destination=proposed_destination_path(
+            decision.destination, item.relative_path, logical_filename(item)))
+    if _preflight(proposed_for_preflight, incoming_root, destination_roots) is not None:
+        return None
+    try:
+        root = incoming_root.resolve(strict=True)
+        source = require_file_within_root(root.joinpath(*item.relative_path.split("/")), root)
+        if source.stat().st_size != item.size_bytes or sha256_file(source) != decision.source_sha256:
+            return None
+    except (OSError, ValueError):
+        return None
+    snapshot = decision.policy_snapshot
+    authorization_id = uuid4()
+    rule = {
+        "version": decision.version, "decision_id": str(decision.id),
+        "authorization_id": str(authorization_id),
+        "policy_id": snapshot["id"], "policy_state": snapshot["status"],
+        "policy_updated_at": snapshot["updated_at"],
+        "threshold": snapshot["threshold"], "score": decision.score,
+        "semantic_class": decision.winning_class,
+        "destination": decision.destination,
+        "owner_user_id": str(decision.owner_user_id),
+        "source_sha256": decision.source_sha256,
+    }
+    from app.arrival_photo_approval import _queue_authorized_gallery_photo
+
+    if isinstance(policy_store, MemoryAutopilotStore):
+        policy = policy_store.policies.get(UUID(str(snapshot["id"])))
+        current = vault_store.get_item(item.id)
+        if (policy is None or current is None or policy.status != "enabled"
+                or policy.updated_at.isoformat() != snapshot["updated_at"]
+                or policy.owner_user_id != decision.owner_user_id
+                or policy.content_type != decision.winning_class
+                or policy.destination != decision.destination
+                or current.owner_user_id != decision.owner_user_id
+                or current.sha256 != decision.source_sha256
+                or current.state != "needs_review"
+                or (current.proposal_reason == "Category selected by the user."
+                    and current.proposed_category != decision.destination)):
+            return None
+        updated = replace(current, proposed_category=decision.destination,
+                          proposed_destination=proposed_destination_path(
+                              decision.destination, current.relative_path, logical_filename(current)))
+        vault_store.items[current.source_path] = updated
+        queued = _queue_authorized_gallery_photo(vault_store, updated, rule, AUTOPILOT_ACTIVITY_USERNAME)
+        if queued:
+            policy_store.routing_authorizations[authorization_id] = rule
+        else:
+            vault_store.items[current.source_path] = current
+        return queued
+
+    if not isinstance(policy_store, PostgresAutopilotStore):
+        return None
+    with policy_store._connect() as connection, connection.cursor() as cursor:
+        cursor.execute("SELECT * FROM vault_autopilot_policies WHERE id=%s FOR UPDATE", (snapshot["id"],))
+        policy = cursor.fetchone()
+        if (policy is None or policy["status"] != "enabled"
+                or policy["updated_at"].isoformat() != snapshot["updated_at"]
+                or policy["owner_user_id"] != decision.owner_user_id
+                or policy["content_type"] != decision.winning_class
+                or policy["destination"] != decision.destination
+                or policy["threshold"] != snapshot["threshold"]
+                or decision.score is None or decision.score < policy["threshold"]):
+            return None
+        cursor.execute("SELECT * FROM vault_master_items WHERE id=%s FOR UPDATE", (item.id,))
+        row = cursor.fetchone()
+        if (row is None or row["owner_user_id"] != decision.owner_user_id
+                or row["sha256"] != decision.source_sha256
+                or row["state"] != "needs_review"
+                or (row["proposal_reason"] == "Category selected by the user."
+                    and row["proposed_category"] != decision.destination)):
+            return None
+        current = vault_store._to_item(row)
+        destination = proposed_destination_path(decision.destination,
+                                                current.relative_path, logical_filename(current))
+        cursor.execute("""UPDATE vault_master_items SET proposed_category=%s,
+            proposed_destination=%s, proposal_reason=%s, updated_at=CURRENT_TIMESTAMP
+            WHERE id=%s RETURNING *""",
+            (decision.destination, destination, "Vault Master scored routing decision.", item.id))
+        updated = vault_store._to_item(cursor.fetchone())
+        queued = _queue_authorized_gallery_photo(vault_store, updated, rule,
+                                                  AUTOPILOT_ACTIVITY_USERNAME, cursor=cursor)
+        if queued is None:
+            connection.rollback()
+            return None
+        cursor.execute("""INSERT INTO vault_routing_authorizations
+            (id,decision_id,item_id,owner_user_id,policy_id,policy_snapshot)
+            VALUES (%s,%s,%s,%s,%s,%s)""",
+            (authorization_id, decision.id, item.id, decision.owner_user_id,
+             policy["id"], Jsonb(snapshot)))
+        return queued
+
+
 def _process_autopilot_batch_unlocked(
     policy_store: AutopilotStore,
     ai_store: IngestionAiStore,
     vault_store: VaultMasterStore,
     incoming_root: Path,
     destination_roots: dict[str, Path],
+    *, allowed_item_ids: set[UUID] | None = None,
 ) -> UUID | None:
-    for policy in policy_store.list_policies():
-        if policy.status != "enabled" or policy.owner_user_id is None:
+    all_items = vault_store.list_items()
+    publication_item_ids = {
+        item_id
+        for bundle in build_publication_bundles(all_items)
+        for item_id in (*bundle.source_item_ids, *bundle.front_cover_item_ids,
+                        *bundle.back_cover_item_ids)
+    }
+    policies = policy_store.list_policies()
+    evidence_by_item: dict[UUID, IngestionAiEvidence] = {}
+    for evidence in ai_store.list_all_evidence():
+        evidence_by_item.setdefault(evidence.item_id, evidence)
+    candidates_by_policy: dict[UUID, list[tuple[ImportItem, RoutingDecision]]] = {}
+    for item in all_items:
+        if (item.source_kind != INCOMING_SOURCE or item.state != "needs_review"
+                or item.owner_user_id is None
+                or (allowed_item_ids is not None and item.id not in allowed_item_ids)):
             continue
-        owned_items = [
-            item for item in vault_store.list_items()
-            if item.owner_user_id == policy.owner_user_id
-        ]
-        owned_item_ids = {item.id for item in owned_items}
-        evidence_by_item = _latest_evidence(
-            ai_store, policy.owner_user_id, owned_item_ids
-        )
-        version_mismatches = [
-            item
-            for item in owned_items
-            if item.source_kind == INCOMING_SOURCE
-            and item.state == "needs_review"
-            and (evidence := evidence_by_item.get(item.id)) is not None
-            and evidence.content_type == policy.content_type
-            and evidence.recommended_destination == policy.destination
-            and (
-                evidence.model_id != AI_MODEL_ID
-                or evidence.model_revision != AI_MODEL_REVISION
-                or evidence.task_version != INGESTION_TASK_VERSION
-            )
-        ]
-        if version_mismatches:
-            affected = tuple(item.id for item in version_mismatches[: policy.max_items])
-            run = policy_store.create_run(policy, affected)
-            outcomes = {str(item_id): "model_or_task_version_mismatch" for item_id in affected}
-            reason = "Model or task version changed; explicit owner review and resume required"
-            policy_store.set_policy_status(policy.id, policy.owner_user_id, "paused")
-            policy_store.update_run(run.id, outcomes, "stopped", reason)
-            return run.id
-        publication_item_ids = {
-            item_id
-            for bundle in build_publication_bundles(vault_store.list_items())
-            for item_id in (
-                *bundle.source_item_ids,
-                *bundle.front_cover_item_ids,
-                *bundle.back_cover_item_ids,
-            )
+        evidence = evidence_by_item.get(item.id)
+        gates = {
+            "not_duplicate": item.duplicate_of_id is None,
+            "not_publication_bundle": item.id not in publication_item_ids,
         }
-        candidates = [
-            item
-            for item in owned_items
-            if (evidence := evidence_by_item.get(item.id)) is not None
-            and _eligible(item, evidence, policy, publication_item_ids)
-        ][: policy.max_items]
+        preliminary = build_routing_decision(item, evidence, None, gates)
+        policy = next((value for value in policies
+                       if value.owner_user_id == item.owner_user_id
+                       and value.content_type == preliminary.winning_class
+                       and value.destination == preliminary.destination
+                       and AUTOPILOT_SAFE_CONTENT_DESTINATIONS.get(value.content_type)
+                           == value.destination), None)
+        if preliminary.destination == "Gallery":
+            gates["gallery_not_screenshot_capture"] = not has_hard_coded_screenshot_marker(
+                item.filename, item.metadata)
+            gates["gallery_no_competing_content_class"] = not any(
+                candidate.content_type in {
+                    "receipt", "financial_document", "general_document",
+                    "artwork", "publication_cover", "screenshot",
+                }
+                for candidate in preliminary.candidates
+            )
+        if preliminary.destination is not None:
+            proposed = replace(item, proposed_category=preliminary.destination,
+                               proposed_destination=proposed_destination_path(
+                                   preliminary.destination, item.relative_path,
+                                   logical_filename(item)))
+            preflight_failure = _preflight(proposed, incoming_root, destination_roots)
+            gates["source_and_destination_preflight"] = preflight_failure is None
+            if preflight_failure is not None:
+                gates[f"preflight:{preflight_failure}"] = False
+            if item.proposal_reason == "Category selected by the user.":
+                gates["owner_selected_destination_agrees"] = (
+                    item.proposed_category == preliminary.destination)
+        decision = policy_store.save_routing_decision(
+            build_routing_decision(item, evidence, policy, gates))
+        if decision.automatic_eligible and policy is not None:
+            candidates_by_policy.setdefault(policy.id, []).append((item, decision))
+
+    for policy in policies:
+        candidates = candidates_by_policy.get(policy.id, [])
         if not candidates:
             continue
-        run = policy_store.create_run(policy, tuple(item.id for item in candidates))
+        selected = candidates[:policy.max_items]
+        run = policy_store.create_run(policy, tuple(item.id for item, _ in selected))
         outcomes: dict[str, str] = {}
         failures = 0
         stop_reason = None
-        for item in candidates:
-            failure = _preflight(item, incoming_root, destination_roots)
-            if failure:
-                outcomes[str(item.id)] = failure
-                failures += 1
-            else:
-                approved = vault_store.record_decision(
-                    item.id,
-                    "approved",
-                    AUTOPILOT_ACTIVITY_USERNAME,
-                )
-                queued = (
-                    vault_store.queue_move(
-                        item.id,
-                        AUTOPILOT_ACTIVITY_USERNAME,
-                    )
-                    if approved
-                    else None
-                )
-                outcomes[str(item.id)] = "queued" if queued else "queue_failed"
-                failures += 0 if queued else 1
-            failure_percent = failures * 100 / max(1, len(candidates))
-            if failures >= policy.max_failures or failure_percent >= policy.max_failure_percent:
-                stop_reason = "Auto-pilot circuit breaker reached during preflight"
+        for item, decision in selected:
+            queued = _authorize_scored_item(policy_store, vault_store, item, decision,
+                                            incoming_root, destination_roots)
+            outcomes[str(item.id)] = "queued" if queued else "authorization_or_state_conflict"
+            failures += 0 if queued else 1
+            if failures >= policy.max_failures or failures * 100 / len(selected) >= policy.max_failure_percent:
+                stop_reason = "Auto-pilot circuit breaker reached during authorization"
                 break
         if stop_reason:
-            for item in candidates:
+            for item, _ in selected:
                 outcomes.setdefault(str(item.id), "not_processed_circuit_breaker")
             policy_store.set_policy_status(policy.id, policy.owner_user_id, "paused")
             policy_store.update_run(run.id, outcomes, "stopped", stop_reason)
@@ -769,6 +943,7 @@ def process_autopilot_batch(
     vault_store: VaultMasterStore,
     incoming_root: Path,
     destination_roots: dict[str, Path],
+    *, allowed_item_ids: set[UUID] | None = None,
 ) -> UUID | None:
     if not _AUTOPILOT_PROCESS_LOCK.acquire(blocking=False):
         return None
@@ -779,6 +954,7 @@ def process_autopilot_batch(
             vault_store,
             incoming_root,
             destination_roots,
+            allowed_item_ids=allowed_item_ids,
         )
     finally:
         _AUTOPILOT_PROCESS_LOCK.release()
@@ -808,9 +984,9 @@ def reconcile_autopilot_runs(policy_store: AutopilotStore, vault_store: VaultMas
             continue
         policy = next((value for value in policy_store.list_policies() if value.id == run.policy_id), None)
         if failures and policy:
-            if policy.owner_user_id is not None:
-                policy_store.set_policy_status(policy.id, policy.owner_user_id, "paused")
-            policy_store.update_run(run.id, outcomes, "stopped", "A queued automatic move failed; explicit owner resume required")
+            # Failed items retain their own terminal recovery state. They must
+            # not stop unrelated eligible items from a large intake burst.
+            policy_store.update_run(run.id, outcomes, "stopped", "Failed items isolated for recovery; remaining intake continues")
         else:
             policy_store.update_run(run.id, outcomes, "completed")
         return run.id

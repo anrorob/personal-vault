@@ -208,6 +208,8 @@ class JellyfinMovieDetails:
     collections: tuple[str, ...] = ()
     chapters: tuple[JellyfinChapter, ...] = ()
     subtitles: tuple[JellyfinSubtitle, ...] = ()
+    release_date: str | None = None
+    original_title: str | None = None
 
 
 @dataclass
@@ -234,6 +236,7 @@ class HlsResource:
     user_id: UUID
     url: str
     expires_at: float
+    scope: str | None = None
 
 
 class HlsResourceStore:
@@ -247,7 +250,7 @@ class HlsResourceStore:
         self._resources: dict[str, HlsResource] = {}
         self._lock = Lock()
 
-    def issue(self, user_id: UUID, url: str) -> str:
+    def issue(self, user_id: UUID, url: str, scope: str | None = None) -> str:
         now = time.monotonic()
 
         with self._lock:
@@ -264,18 +267,19 @@ class HlsResourceStore:
                 user_id=user_id,
                 url=url,
                 expires_at=now + self._ttl_seconds,
+                scope=scope,
             )
 
         return token
 
-    def resolve(self, user_id: UUID, token: str) -> str | None:
+    def resolve(self, user_id: UUID, token: str, scope: str | None = None) -> str | None:
         now = time.monotonic()
 
         with self._lock:
             self._purge_expired(now)
             resource = self._resources.get(token)
 
-            if resource is None or resource.user_id != user_id:
+            if resource is None or resource.user_id != user_id or resource.scope != scope:
                 return None
 
             return resource.url
@@ -368,12 +372,141 @@ class JellyfinClient:
                 "Playback service is unavailable"
             ) from error
 
-    def _path_mutation(self, method: str, name: str, path: str, *, refresh_library: bool) -> None:
+    def _playback_user_id(self) -> str:
+        users = self._get_json("/Users")
+        first_user = users[0] if isinstance(users, list) and users else None
+        user_id = first_user.get("Id") if isinstance(first_user, dict) else None
+        if not isinstance(user_id, str) or not user_id:
+            raise JellyfinUnavailableError("Playback service has no usable user context")
+        return user_id
+
+    def playback_source_info(self, movie: JellyfinMovie) -> dict[str, object]:
+        """Return an allowlisted source summary; never return provider paths or URLs."""
+        item = self._get_json(
+            f"/Items/{movie.item_id}",
+            {"userId": self._playback_user_id(), "Fields": "MediaSources"},
+        )
+        sources = item.get("MediaSources") if isinstance(item, dict) else None
+        source = next(
+            (
+                entry for entry in sources
+                if isinstance(entry, dict) and entry.get("Id") == movie.media_source_id
+            ),
+            None,
+        ) if isinstance(sources, list) else None
+        if source is None:
+            raise JellyfinUnavailableError("Playback media source is unavailable")
+        streams = source.get("MediaStreams")
+        streams = streams if isinstance(streams, list) else []
+        video = next((entry for entry in streams if isinstance(entry, dict) and entry.get("Type") == "Video"), {})
+        audio = [entry for entry in streams if isinstance(entry, dict) and entry.get("Type") == "Audio"]
+        subtitles = [entry for entry in streams if isinstance(entry, dict) and entry.get("Type") == "Subtitle"]
+        def fields(entry: dict[str, object], names: tuple[str, ...]) -> dict[str, object]:
+            return {name: entry.get(name) if isinstance(entry.get(name), (str, int, float, bool)) else None for name in names}
+        return {
+            "container": source.get("Container") if isinstance(source.get("Container"), str) else None,
+            "bitrate": source.get("Bitrate") if isinstance(source.get("Bitrate"), int) else None,
+            "video": fields(video, ("Codec", "Profile", "Level", "Width", "Height", "BitRate", "RealFrameRate", "AverageFrameRate", "BitDepth", "VideoRange", "ColorPrimaries", "ColorSpace", "ColorTransfer")),
+            "audio_tracks": [fields(track, ("Index", "Codec", "Profile", "Language", "DisplayTitle", "Channels", "SampleRate", "BitRate", "IsDefault")) for track in audio],
+            "subtitle_tracks": [fields(track, ("Index", "Codec", "Language", "DisplayTitle", "IsDefault", "IsForced")) for track in subtitles],
+        }
+
+    def request_playback_info(self, movie: JellyfinMovie, payload: dict) -> dict:
         request = Request(
-            f"{self._base_url}/Library/VirtualFolders/MediaPaths?{urlencode({'name': name, 'path': path, 'refreshLibrary': str(refresh_library).lower()})}",
-            data=b"" if method == "POST" else None,
+            f"{self._base_url}/Items/{movie.item_id}/PlaybackInfo?{urlencode({'UserId': self._playback_user_id()})}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Accept": "application/json", "Content-Type": "application/json", "X-Emby-Token": self._api_key},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=self._timeout_seconds) as response:
+                body = json.load(response)
+        except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError):
+            raise JellyfinUnavailableError("Playback decision is unavailable") from None
+        if not isinstance(body, dict):
+            raise JellyfinUnavailableError("Invalid playback decision")
+        return body
+
+    def playback_decision(self, movie: JellyfinMovie, *, h264_supported: bool) -> dict[str, object]:
+        """Ask Jellyfin for a proposed browser path without changing PV delivery."""
+        profile = {
+            "Name": "Personal Vault browser observation",
+            "MaxStreamingBitrate": 120000000,
+            "DirectPlayProfiles": ([{
+                "Type": "Video", "Container": "mp4,m4v", "VideoCodec": "h264", "AudioCodec": "aac,mp3"
+            }] if h264_supported else []),
+            "TranscodingProfiles": [{
+                "Type": "Video", "Container": "ts", "Protocol": "hls",
+                "VideoCodec": "h264", "AudioCodec": "aac", "MaxAudioChannels": "2"
+            }],
+        }
+        payload = {
+            "MediaSourceId": movie.media_source_id,
+            "DeviceProfile": profile,
+            "EnableDirectPlay": True,
+            "EnableDirectStream": True,
+            "EnableTranscoding": True,
+            "AllowVideoStreamCopy": True,
+            "AllowAudioStreamCopy": True,
+        }
+        request = Request(
+            f"{self._base_url}/Items/{movie.item_id}/PlaybackInfo?{urlencode({'UserId': self._playback_user_id()})}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Accept": "application/json", "Content-Type": "application/json", "X-Emby-Token": self._api_key},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=self._timeout_seconds) as response:
+                body = json.load(response)
+        except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
+            raise JellyfinUnavailableError("Playback decision is unavailable") from error
+        sources = body.get("MediaSources") if isinstance(body, dict) else None
+        source = next((entry for entry in sources if isinstance(entry, dict) and entry.get("Id") == movie.media_source_id), None) if isinstance(sources, list) else None
+        if source is None:
+            raise JellyfinUnavailableError("Playback decision media source does not match")
+        reasons = source.get("TranscodeReasons")
+        allowed_reasons = {
+            "ContainerNotSupported", "VideoCodecNotSupported", "AudioCodecNotSupported",
+            "SubtitleCodecNotSupported", "VideoProfileNotSupported", "VideoLevelNotSupported",
+            "VideoResolutionNotSupported", "VideoBitDepthNotSupported", "VideoFramerateNotSupported",
+            "AudioChannelsNotSupported", "ContainerBitrateExceedsLimit", "VideoBitrateNotSupported",
+            "AudioBitrateNotSupported", "VideoRangeTypeNotSupported", "DirectPlayError",
+        }
+        if isinstance(reasons, str):
+            reasons = reasons.split(",")
+        direct_play = source.get("SupportsDirectPlay") if isinstance(source.get("SupportsDirectPlay"), bool) else None
+        remux = source.get("SupportsDirectStream") if isinstance(source.get("SupportsDirectStream"), bool) else None
+        transcode = source.get("SupportsTranscoding") if isinstance(source.get("SupportsTranscoding"), bool) else None
+        return {
+            "direct_play_supported": direct_play,
+            "remux_supported": remux,
+            "transcode_supported": transcode,
+            "transcode_required": (not direct_play and not remux and transcode) if None not in (direct_play, remux, transcode) else None,
+            "transcoding_url_available": bool(source.get("TranscodingUrl")),
+            "reasons": [reason for reason in reasons if reason in allowed_reasons] if isinstance(reasons, list) else [],
+            "transcoding_container": source.get("TranscodingContainer") if isinstance(source.get("TranscodingContainer"), str) and source.get("TranscodingContainer") in {"ts", "mp4", "webm", "mkv"} else None,
+            "selected_media_source_matches_pv": True,
+            "profile": "conservative browser H.264/AAC probe",
+        }
+
+    def _path_mutation(self, method: str, name: str, path: str, *, refresh_library: bool) -> None:
+        parameters = {"refreshLibrary": str(refresh_library).lower()}
+        if method == "DELETE":
+            parameters.update({"name": name, "path": path})
+        data = (
+            json.dumps({"Name": name, "Path": path}).encode("utf-8")
+            if method == "POST"
+            else None
+        )
+        request = Request(
+            f"{self._base_url}/Library/VirtualFolders/Paths?{urlencode(parameters)}",
+            data=data,
             method=method,
-            headers={"Accept": "application/json", "X-Emby-Token": self._api_key},
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "X-Emby-Token": self._api_key,
+            },
         )
         try:
             with urlopen(request, timeout=self._timeout_seconds):
@@ -858,7 +991,7 @@ class JellyfinClient:
 
         user_query = {
             "userId": user_id,
-            "Fields": "Chapters,MediaSources",
+            "Fields": "Chapters,MediaSources,OriginalTitle,ProviderIds",
         }
         item = self._get_json(
             f"/Items/{movie.item_id}",
@@ -1088,6 +1221,8 @@ class JellyfinClient:
                 else None
             ),
             collections=collections,
+            release_date=item.get("PremiereDate") if isinstance(item.get("PremiereDate"), str) else None,
+            original_title=item.get("OriginalTitle") if isinstance(item.get("OriginalTitle"), str) else None,
             chapters=chapters,
             subtitles=subtitles,
         )
@@ -1219,7 +1354,7 @@ class JellyfinClient:
             )
         )
 
-    def open_resource(self, url: str) -> JellyfinStream:
+    def open_resource(self, url: str, range_header: str | None = None) -> JellyfinStream:
         if not url.startswith(f"{self._base_url}/"):
             raise JellyfinUnavailableError(
                 "Playback resource is invalid"
@@ -1230,6 +1365,7 @@ class JellyfinClient:
             headers={
                 "Accept": "*/*",
                 "X-Emby-Token": self._api_key,
+                **({"Range": range_header} if range_header else {}),
             },
         )
 
@@ -1251,6 +1387,7 @@ class JellyfinClient:
         response_headers = {
             name: value
             for name in (
+                "Accept-Ranges",
                 "Content-Length",
                 "Content-Range",
             )

@@ -212,7 +212,7 @@ function VaultCommonsPage() {
     return () => controller.abort();
   }, [openedCollection]);
   return (
-    <section className="mx-auto max-w-6xl space-y-5">
+    <section className="pv-layout-container mx-auto max-w-7xl space-y-5">
       <div>
         <h2 className="pv-page-title">Vault Commons</h2>
         <p className="mt-1 text-sm" style={{ color: "var(--pv-text-dim)" }}>
@@ -278,7 +278,7 @@ function VaultCommonsPage() {
                 Opening collection…
               </p>
             ) : (
-              <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
+              <div className="pv-card-grid">
                 {collectionAssets.map((asset) => (
                   <SharedAssetCard key={asset.asset_id} asset={asset} onOpen={setOpenedAsset} />
                 ))}
@@ -313,9 +313,7 @@ function VaultCommonsPage() {
         ) : (
           <div
             className={
-              category === "gallery"
-                ? "grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4"
-                : "grid gap-3 sm:grid-cols-2 lg:grid-cols-3"
+              category === "gallery" ? "pv-card-grid" : "grid gap-3 sm:grid-cols-2 lg:grid-cols-3"
             }
           >
             {assets.map((asset) => (

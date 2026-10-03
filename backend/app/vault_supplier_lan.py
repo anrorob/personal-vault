@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 
 LAN_PROTOCOL_VERSION = 1
 LAN_KEY_ALGORITHM = "ECDSA_P256_SHA256"
+LAN_PORT = 8443
 VERIFY_PATH = "/api/vault-supplier/lan/verify"
 _NONCE_RE = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 _DNS_HOST_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\Z", re.ASCII | re.IGNORECASE)
@@ -58,7 +59,7 @@ class ServerIdentityUnavailable(RuntimeError):
 
 
 def lan_port() -> int:
-    value = os.getenv("PV_VAULT_SUPPLIER_LAN_PORT", "")
+    value = os.getenv("PV_VAULT_SUPPLIER_LAN_PORT", str(LAN_PORT))
     try:
         port = int(value)
     except ValueError as error:
@@ -76,10 +77,10 @@ class LanServerIdentity:
 
     @classmethod
     def load(cls) -> "LanServerIdentity":
-        configured_path = os.getenv("PV_VAULT_SUPPLIER_SERVER_IDENTITY_KEY_PATH")
-        if not configured_path:
-            raise ServerIdentityUnavailable("Vault Supplier signing identity is not configured")
-        path = Path(configured_path)
+        path = Path(os.getenv(
+            "PV_VAULT_SUPPLIER_SERVER_IDENTITY_KEY_PATH",
+            "/run/secrets/personal-vault-development/vault-supplier-lan-server-key.pem",
+        ))
         try:
             key = serialization.load_pem_private_key(path.read_bytes(), password=None)
         except Exception as error:

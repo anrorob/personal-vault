@@ -37,9 +37,12 @@ class DurableTvResolverBatch:
 
 
 def _source_identity(items: Iterable[ImportItem], show_title: str | None) -> str:
+    """Return a durable logical-show key, never a Supplier authority key."""
     if show_title:
-        return f"show:{' '.join(show_title.casefold().split())}"
-    # Supplier provenance remains per-track evidence, not batch identity.
+        normalized = " ".join(show_title.casefold().split())
+        return f"show:{normalized}"
+    # A missing show title remains review-only, but retains a stable Arrival
+    # Hall fallback identity.  Supplier provenance stays per-track evidence.
     parents = {
         PurePosixPath(item.relative_path.replace("\\", "/")).parent.as_posix()
         for item in items
@@ -128,11 +131,26 @@ class PostgresTvResolverStore:
                     UNIQUE(batch_id, arrival_item_id)
                 )
             """)
-
-            cursor.execute("ALTER TABLE vault_tv_resolver_batches DROP CONSTRAINT IF EXISTS vault_tv_resolver_batches_status_check")
-            cursor.execute("ALTER TABLE vault_tv_resolver_batches ADD CONSTRAINT vault_tv_resolver_batches_status_check CHECK (status IN ('proposed','needs_review','approved','publishing','published','failed','superseded','complete'))")
-            cursor.execute("CREATE INDEX IF NOT EXISTS vault_tv_resolver_tracks_arrival_item_idx ON vault_tv_resolver_tracks (arrival_item_id, batch_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS vault_tv_resolver_batches_owner_status_idx ON vault_tv_resolver_batches (owner_user_id, status)")
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS vault_tv_resolver_tracks_arrival_item_idx
+                ON vault_tv_resolver_tracks (arrival_item_id, batch_id)
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS vault_tv_resolver_batches_owner_status_idx
+                ON vault_tv_resolver_batches (owner_user_id, status)
+            """)
+            # Existing installations have the former named CHECK constraint.
+            # Replacing only that constraint is additive/idempotent schema work.
+            cursor.execute(
+                "ALTER TABLE vault_tv_resolver_batches "
+                "DROP CONSTRAINT IF EXISTS vault_tv_resolver_batches_status_check"
+            )
+            cursor.execute(
+                "ALTER TABLE vault_tv_resolver_batches "
+                "ADD CONSTRAINT vault_tv_resolver_batches_status_check "
+                "CHECK (status IN ('proposed','needs_review','approved','publishing',"
+                "'published','failed','complete','superseded'))"
+            )
 
     def sync_proposal(self, owner_user_id: UUID, items: Iterable[ImportItem], proposal: TvBatchProposal) -> DurableTvResolverBatch:
         members = tuple(items)
@@ -146,16 +164,27 @@ class PostgresTvResolverStore:
             if row:
                 return DurableTvResolverBatch(row["id"], row["owner_user_id"], row["status"], row["proposed_show_title"], row["confidence"], row["source_identity"], row["resolver_version"], row["proposal_fingerprint"])
             member_ids = [item.id for item in members]
-            cursor.execute("SELECT * FROM vault_tv_resolver_batches WHERE id IN (SELECT track.batch_id FROM vault_tv_resolver_tracks track JOIN vault_tv_resolver_batches batch ON batch.id=track.batch_id WHERE batch.owner_user_id=%s AND track.arrival_item_id=ANY(%s) AND batch.status IN ('proposed','needs_review','approved','publishing','published','failed','complete')) FOR UPDATE", (owner_user_id, member_ids))
+            cursor.execute("""
+                SELECT * FROM vault_tv_resolver_batches
+                WHERE id IN (
+                    SELECT track.batch_id FROM vault_tv_resolver_tracks track
+                    JOIN vault_tv_resolver_batches batch ON batch.id=track.batch_id
+                    WHERE batch.owner_user_id=%s AND track.arrival_item_id=ANY(%s)
+                      AND batch.status IN ('proposed','needs_review','approved','publishing','published','failed','complete')
+                )
+                FOR UPDATE
+            """, (owner_user_id, member_ids))
+            overlapping = [dict(existing) for existing in cursor.fetchall()]
+            newer_members = set(member_ids)
             supersede: list[UUID] = []
-            for existing in [dict(entry) for entry in cursor.fetchall()]:
+            for existing in overlapping:
                 cursor.execute("SELECT arrival_item_id FROM vault_tv_resolver_tracks WHERE batch_id=%s", (existing["id"],))
-                old_members = {entry["arrival_item_id"] for entry in cursor.fetchall()}
+                existing_members = {entry["arrival_item_id"] for entry in cursor.fetchall()}
                 if existing["status"] in {"approved", "publishing", "published", "failed", "complete"}:
                     raise ValueError("TV resolver proposal overlaps a protected publication batch; review is required")
-                if set(member_ids) < old_members:
+                if newer_members < existing_members:
                     return DurableTvResolverBatch(existing["id"], existing["owner_user_id"], existing["status"], existing["proposed_show_title"], existing["confidence"], existing["source_identity"], existing["resolver_version"], existing["proposal_fingerprint"])
-                if old_members <= set(member_ids):
+                if existing_members <= newer_members:
                     supersede.append(existing["id"])
                 else:
                     raise ValueError("TV resolver proposal partially overlaps an active review batch; review is required")
@@ -230,16 +259,20 @@ class PostgresTvResolverStore:
                 for track in members:
                     original = items[track["arrival_item_id"]]
                     authority = {
-                        "track_id": str(track["id"]), "item_id": str(track["arrival_item_id"]),
-                        "owner_user_id": str(owner_user_id), "sha256": track["checksum"],
+                        "track_id": str(track["id"]),
+                        "item_id": str(track["arrival_item_id"]),
+                        "owner_user_id": str(owner_user_id),
+                        "sha256": track["checksum"],
                         "canonical_destination": track["canonical_destination"],
                     }
-                    cursor.execute("UPDATE vault_master_items SET metadata=metadata || %s WHERE id=%s", (
-                        Jsonb({"tv_resolver_publication": authority, "tv_resolver_original_proposal": {
-                            "category": original["proposed_category"], "destination": original["proposed_destination"],
+                    cursor.execute(
+                        "UPDATE vault_master_items SET metadata=metadata || %s WHERE id=%s",
+                        (Jsonb({"tv_resolver_publication": authority, "tv_resolver_original_proposal": {
+                            "category": original["proposed_category"],
+                            "destination": original["proposed_destination"],
                             "reason": original["proposal_reason"],
-                        }}), track["arrival_item_id"],
-                    ))
+                        }}), track["arrival_item_id"]),
+                    )
                     cursor.execute("""UPDATE vault_master_items SET state='move_queued', proposed_category='TV Shows', proposed_destination=%s, publication_audience=%s, metadata=metadata || %s, updated_at=CURRENT_TIMESTAMP WHERE id=%s""", (track["canonical_destination"], audience, Jsonb({"tv_publication_set": marker, "tv_resolver_batch_id": str(batch_id), "routing_superseded_reason": "TV batch approved by user"}), track["arrival_item_id"]))
                     cursor.execute("INSERT INTO vault_master_decisions (id,item_id,decision,username) VALUES (%s,%s,'approved',%s)", (uuid4(), track["arrival_item_id"], username))
                     cursor.execute("INSERT INTO vault_master_activity (id,batch_id,item_id,action,username,detail,succeeded) VALUES (%s,%s,%s,'tv_resolver_batch_approved',%s,%s,TRUE)", (uuid4(), items[track["arrival_item_id"]]["batch_id"], track["arrival_item_id"], username, f"TV resolver batch {batch_id} approved"))
@@ -250,47 +283,58 @@ class PostgresTvResolverStore:
         return {"id": batch_id, "status": "publishing"}
 
     def publish_extras(self, batch_id: UUID, owner_user_id: UUID, username: str) -> dict[str, object]:
+        """Queue only still-staged, classified extras after episodes are durable."""
         from app.tv_extras import extra_destination
+
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute("SELECT * FROM vault_tv_resolver_batches WHERE id=%s AND owner_user_id=%s FOR UPDATE", (batch_id, owner_user_id))
             batch = cursor.fetchone()
             if batch is None:
                 raise LookupError("TV resolver batch not found")
-            if batch['review_metadata'].get('extras_approved_at') or batch['status'] == 'complete':
-                return {'id': batch_id, 'status': batch['status']}
+            if batch["review_metadata"].get("extras_approved_at") or batch["status"] == "complete":
+                return {"id": batch_id, "status": batch["status"]}
             cursor.execute("SELECT * FROM vault_tv_resolver_tracks WHERE batch_id=%s AND publication_state <> 'cancelled' FOR UPDATE", (batch_id,))
-            tracks = cursor.fetchall()
-            episodes = [t for t in tracks if t['classification'] == 'likely_episode']
-            if batch['status'] != 'published' or not episodes or any(t['publication_state'] != 'published' for t in episodes):
-                raise ValueError('Publish episodes before publishing extras')
-            extras = [t for t in tracks if t['classification'] == 'likely_extra']
+            tracks = [dict(row) for row in cursor.fetchall()]
+            episodes = [track for track in tracks if track["classification"] == EPISODE_CLASSIFICATION]
+            if batch["status"] != "published" or not episodes or any(track["publication_state"] != "published" for track in episodes):
+                raise ValueError("Publish episodes before publishing extras")
+            extras = [track for track in tracks if track["classification"] == "likely_extra"]
             if not extras:
-                raise ValueError('No classified extras remain')
-            destinations = [extra_destination(batch['proposed_show_title'], t['proposed_season_number'], t['original_filename']) for t in extras]
-            if len(set(destinations)) != len(destinations):
-                raise ValueError('TV extra destination collision requires review')
-            audience = batch['review_metadata'].get('audience')
-            if audience not in {'private', 'vault-wide'}:
-                raise ValueError('TV batch approved audience is unavailable')
+                raise ValueError("No classified extras remain")
+            destinations = [extra_destination(batch["proposed_show_title"], track["proposed_season_number"], track["original_filename"]) for track in extras]
+            if len(destinations) != len(set(destinations)):
+                raise ValueError("TV extra destination collision requires review")
+            audience = batch["review_metadata"].get("audience")
+            if audience not in {"private", "vault-wide"}:
+                raise ValueError("TV batch approved audience is unavailable")
             for track, destination in zip(extras, destinations):
-                cursor.execute("SELECT * FROM vault_master_items WHERE id=%s FOR UPDATE", (track['arrival_item_id'],))
+                cursor.execute("SELECT * FROM vault_master_items WHERE id=%s FOR UPDATE", (track["arrival_item_id"],))
                 item = cursor.fetchone()
-                if (item is None or item['owner_user_id'] != owner_user_id or item['source_kind'] != INCOMING_SOURCE
-                    or item['state'] != 'needs_review' or item['sha256'] != track['checksum']
-                    or track['proposed_episode_number'] is not None):
-                    raise ValueError('TV extra staged evidence is no longer eligible')
-                cursor.execute("SELECT 1 FROM vault_tv_seasons s JOIN vault_tv_shows show ON show.id=s.show_id WHERE show.title=%s AND show.owner_user_id=%s AND show.visibility=%s AND s.season_number=%s", (batch['proposed_show_title'], owner_user_id, audience, track['proposed_season_number']))
+                if (
+                    item is None
+                    or item["owner_user_id"] != owner_user_id
+                    or item["source_kind"] != INCOMING_SOURCE
+                    or item["state"] != "needs_review"
+                    or item["sha256"] != track["checksum"]
+                    or track["proposed_episode_number"] is not None
+                ):
+                    raise ValueError("TV extra staged evidence is no longer eligible")
+                cursor.execute(
+                    """SELECT 1 FROM vault_tv_seasons season JOIN vault_tv_shows show ON show.id=season.show_id
+                       WHERE show.title=%s AND show.owner_user_id=%s AND show.visibility=%s AND season.season_number=%s""",
+                    (batch["proposed_show_title"], owner_user_id, audience, track["proposed_season_number"]),
+                )
                 if cursor.fetchone() is None:
-                    raise ValueError('TV extra published season is unavailable')
+                    raise ValueError("TV extra published season is unavailable")
                 cursor.execute("SELECT 1 FROM vault_files WHERE vault_path=%s", (destination,))
                 if cursor.fetchone() is not None:
-                    raise ValueError('TV extra destination collision requires review')
-                cursor.execute("UPDATE vault_tv_resolver_tracks SET canonical_destination=%s, publication_state='queued', failure_detail=NULL WHERE id=%s", (destination, track['id']))
-                cursor.execute("UPDATE vault_master_items SET state='move_queued', proposed_category='TV Shows', proposed_destination=%s, publication_audience=%s, updated_at=CURRENT_TIMESTAMP WHERE id=%s", (destination, audience, item['id']))
-                cursor.execute("INSERT INTO vault_master_decisions(id,item_id,decision,username) VALUES (%s,%s,'approved',%s)", (uuid4(), item['id'], username))
-            cursor.execute("UPDATE vault_tv_resolver_batches SET status='publishing', review_metadata=review_metadata || %s, updated_at=CURRENT_TIMESTAMP WHERE id=%s", (Jsonb({'extras_approved_at': datetime.now(UTC).isoformat(), 'extras_approved_by': str(owner_user_id)}), batch_id))
-            cursor.execute("INSERT INTO vault_master_activity(id,action,username,detail,succeeded) VALUES (%s,'tv_resolver_extras_approved',%s,%s,TRUE)", (uuid4(), username, f'TV resolver extras approved for batch {batch_id}'))
-        return {'id': batch_id, 'status': 'publishing'}
+                    raise ValueError("TV extra destination collision requires review")
+                cursor.execute("UPDATE vault_tv_resolver_tracks SET canonical_destination=%s, publication_state='queued', failure_detail=NULL WHERE id=%s", (destination, track["id"]))
+                cursor.execute("UPDATE vault_master_items SET state='move_queued', proposed_category='TV Shows', proposed_destination=%s, publication_audience=%s, updated_at=CURRENT_TIMESTAMP WHERE id=%s", (destination, audience, item["id"]))
+                cursor.execute("INSERT INTO vault_master_decisions(id,item_id,decision,username) VALUES (%s,%s,'approved',%s)", (uuid4(), item["id"], username))
+            cursor.execute("UPDATE vault_tv_resolver_batches SET status='publishing', review_metadata=review_metadata || %s, updated_at=CURRENT_TIMESTAMP WHERE id=%s", (Jsonb({"extras_approved_at": datetime.now(UTC).isoformat(), "extras_approved_by": str(owner_user_id)}), batch_id))
+            cursor.execute("INSERT INTO vault_master_activity(id,action,username,detail,succeeded) VALUES (%s,'tv_resolver_extras_approved',%s,%s,TRUE)", (uuid4(), username, f"TV resolver extras approved for batch {batch_id}"))
+        return {"id": batch_id, "status": "publishing"}
 
     def retire_removed(self, item_id: UUID | None = None) -> None:
         """Retain removed staging as cancelled history without touching publication."""
@@ -327,55 +371,59 @@ class PostgresTvResolverStore:
             cursor.execute("SELECT to_regclass('vault_tv_episodes') AS relation")
             if cursor.fetchone()["relation"] is None:
                 return ready
-            cursor.execute("""SELECT id AS batch_id FROM vault_tv_resolver_batches WHERE status IN ('publishing','failed','published') FOR UPDATE SKIP LOCKED""")
+            # SKIP LOCKED serialises reconciliation with owner actions without
+            # making the worker block an approval transaction.
+            cursor.execute("SELECT id AS batch_id FROM vault_tv_resolver_batches WHERE status IN ('publishing','failed','published') FOR UPDATE SKIP LOCKED")
             for row in cursor.fetchall():
                 batch_id = row["batch_id"]
-                cursor.execute("""UPDATE vault_tv_resolver_tracks track SET
-                    publication_state=CASE WHEN item.state='moved' AND EXISTS (
-                        SELECT 1 FROM vault_arrival_managed_publications publication
-                        JOIN vault_files file ON file.id=publication.file_id AND file.asset_id=publication.asset_id
-                        JOIN vault_assets asset ON asset.id=file.asset_id
-                        JOIN vault_file_storage_placements placement ON placement.file_id=file.id
-                        LEFT JOIN vault_tv_episodes episode ON episode.asset_id=asset.id
-                        LEFT JOIN vault_tv_extras extra ON extra.asset_id=asset.id
-                        JOIN vault_tv_seasons season ON season.id=COALESCE(episode.season_id,extra.season_id)
-                        JOIN vault_tv_shows show ON show.id=season.show_id
-                        JOIN vault_tv_resolver_batches batch ON batch.id=track.batch_id
-                        WHERE publication.item_id=item.id AND publication.owner_user_id=batch.owner_user_id
-                          AND asset.owner_user_id=batch.owner_user_id AND show.owner_user_id=batch.owner_user_id
-                          AND asset.lifecycle_state='active' AND asset.asset_type='TV Shows'
-                          AND file.vault_path=track.canonical_destination AND file.sha256=track.checksum
-                          AND file.size_bytes=item.size_bytes AND publication.logical_destination=file.vault_path
-                          AND publication.logical_area='Theatre / TV Shows'
-                          AND placement.slot_id=publication.slot_id AND placement.relative_path=publication.relative_path
-                          AND show.title=batch.proposed_show_title
-                          AND season.season_number=track.proposed_season_number
-                          AND ((track.classification='likely_episode' AND episode.episode_number=track.proposed_episode_number)
-                            OR (track.classification='likely_extra' AND extra.asset_id IS NOT NULL AND episode.id IS NULL))
-                    ) THEN 'published' WHEN item.state='move_failed' THEN 'failed' ELSE 'queued' END,
-                    failure_detail=CASE WHEN item.state='move_failed' THEN 'Arrival Hall managed publication failed' ELSE NULL END
-                    FROM vault_master_items item WHERE track.batch_id=%s AND item.id=track.arrival_item_id AND track.publication_state <> 'cancelled'
-                    AND (track.classification='likely_episode' OR (track.classification='likely_extra' AND track.publication_state IN ('queued','failed','published')))""", (batch_id,))
-                cursor.execute("SELECT classification,publication_state FROM vault_tv_resolver_tracks WHERE batch_id=%s AND publication_state <> 'cancelled'", (batch_id,))
+                cursor.execute(
+                    """UPDATE vault_tv_resolver_tracks track SET
+                        publication_state=CASE WHEN item.state='moved' AND EXISTS (
+                          SELECT 1 FROM vault_arrival_managed_publications publication
+                          JOIN vault_files file ON file.id=publication.file_id AND file.asset_id=publication.asset_id
+                          JOIN vault_assets asset ON asset.id=file.asset_id
+                          JOIN vault_file_storage_placements placement ON placement.file_id=file.id
+                          LEFT JOIN vault_tv_episodes episode ON episode.asset_id=asset.id
+                          LEFT JOIN vault_tv_extras extra ON extra.asset_id=asset.id
+                          JOIN vault_tv_seasons season ON season.id=COALESCE(episode.season_id, extra.season_id)
+                          JOIN vault_tv_shows show ON show.id=season.show_id
+                          JOIN vault_tv_resolver_batches batch ON batch.id=track.batch_id
+                          WHERE publication.item_id=item.id AND publication.owner_user_id=batch.owner_user_id
+                            AND asset.owner_user_id=batch.owner_user_id AND show.owner_user_id=batch.owner_user_id
+                            AND asset.lifecycle_state='active' AND asset.asset_type='TV Shows'
+                            AND file.vault_path=track.canonical_destination AND file.sha256=track.checksum
+                            AND file.size_bytes=item.size_bytes AND publication.logical_destination=file.vault_path
+                            AND publication.logical_area='Theatre / TV Shows'
+                            AND placement.slot_id=publication.slot_id AND placement.relative_path=publication.relative_path
+                            AND show.title=batch.proposed_show_title AND season.season_number=track.proposed_season_number
+                            AND ((track.classification='likely_episode' AND episode.episode_number=track.proposed_episode_number)
+                              OR (track.classification='likely_extra' AND extra.asset_id IS NOT NULL AND episode.id IS NULL))
+                        ) THEN 'published' WHEN item.state='move_failed' THEN 'failed' ELSE track.publication_state END,
+                        failure_detail=CASE WHEN item.state='move_failed' THEN 'Arrival Hall managed publication failed' ELSE NULL END
+                       FROM vault_master_items item WHERE track.batch_id=%s AND item.id=track.arrival_item_id AND track.publication_state <> 'cancelled'
+                         AND (track.classification='likely_episode' OR track.publication_state IN ('queued','failed','published'))""",
+                    (batch_id,),
+                )
+                cursor.execute("SELECT classification, publication_state FROM vault_tv_resolver_tracks WHERE batch_id=%s AND publication_state <> 'cancelled'", (batch_id,))
                 tracks = cursor.fetchall()
-                episode_states = {t['publication_state'] for t in tracks if t['classification'] == EPISODE_CLASSIFICATION}
-                if episode_states == {'published'}:
+                episode_states = {track["publication_state"] for track in tracks if track["classification"] == EPISODE_CLASSIFICATION}
+                if episode_states == {"published"}:
                     cursor.execute("UPDATE vault_tv_resolver_batches SET jellyfin_handoff_requested_at=CURRENT_TIMESTAMP WHERE id=%s AND jellyfin_handoff_requested_at IS NULL RETURNING id", (batch_id,))
                     if cursor.fetchone():
                         ready.append(batch_id)
-                states = {t['publication_state'] for t in tracks}
-                if states == {'published'} and all(t['classification'] in {'likely_episode','likely_extra'} for t in tracks):
-                    next_status = 'complete'
-                    if any(t['classification'] == 'likely_extra' for t in tracks):
-                        cursor.execute("UPDATE vault_tv_resolver_batches SET review_metadata=review_metadata || %s WHERE id=%s AND NOT (review_metadata ? 'extras_handoff_requested_at') RETURNING id", (Jsonb({'extras_handoff_requested_at': datetime.now(UTC).isoformat()}), batch_id))
+                states = {track["publication_state"] for track in tracks}
+                if states == {"published"} and all(track["classification"] in {EPISODE_CLASSIFICATION, "likely_extra"} for track in tracks):
+                    next_status = "complete"
+                    if any(track["classification"] == "likely_extra" for track in tracks):
+                        cursor.execute("UPDATE vault_tv_resolver_batches SET review_metadata=review_metadata || %s WHERE id=%s AND NOT (review_metadata ? 'extras_handoff_requested_at') RETURNING id", (Jsonb({"extras_handoff_requested_at": datetime.now(UTC).isoformat()}), batch_id))
                         if cursor.fetchone():
                             ready.append(batch_id)
-                elif 'failed' in states:
-                    next_status = 'failed'
-                elif episode_states == {'published'} and not any(t['classification']=='likely_extra' and t['publication_state']=='queued' for t in tracks):
-                    next_status = 'published'
+                elif "failed" in states:
+                    next_status = "failed"
+                elif episode_states == {"published"} and not any(track["classification"] == "likely_extra" and track["publication_state"] == "queued" for track in tracks):
+                    next_status = "published"
                 else:
-                    next_status = 'publishing'
+                    next_status = "publishing"
                 cursor.execute("UPDATE vault_tv_resolver_batches SET status=%s, updated_at=CURRENT_TIMESTAMP WHERE id=%s AND status<>%s", (next_status, batch_id, next_status))
         return ready
 

@@ -3,6 +3,8 @@ from datetime import datetime, timezone
 import inspect
 from pathlib import Path
 import subprocess
+import shutil
+import pytest
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
@@ -25,6 +27,20 @@ from app.vault_libraries import get_personal_videos_path
 from app.vault_master import ImportItem, MemoryVaultMasterStore
 from tests.conftest import TEST_USERNAME
 from tests.test_vault_libraries import authenticate, catalogue_file
+
+
+def test_bounded_extraction_preserves_aspect_ratio(tmp_path):
+    if not shutil.which("ffmpeg"):
+        pytest.skip("FFmpeg is unavailable")
+    from app.video_intelligence import extract_frame
+    from PIL import Image
+    source = tmp_path / "synthetic.mp4"
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                    "-i", "color=blue:size=960x540:duration=1", str(source)], check=True)
+    destination = tmp_path / "bounded.jpg"
+    extract_frame(source, 0, destination, max_dimension=448)
+    with Image.open(destination) as frame:
+        assert frame.size == (448, 252)
 
 
 def test_sampling_is_deterministic_bounded_and_keeps_temporal_reasons() -> None:
@@ -266,7 +282,7 @@ def test_owner_only_details_and_single_video_queue(
     details = client.get(f"/api/personal-videos/{listing[0]['id']}/details")
     assert details.status_code == 200
     assert details.json()["asset_id"] == str(asset.id)
-    assert "asset_id" not in listing[0]
+    assert listing[0]["asset_id"] == str(asset.id)
 
     queued = client.post("/api/personal-videos/intelligence/jobs", json={"asset_id": str(asset.id)})
     assert queued.status_code == 202

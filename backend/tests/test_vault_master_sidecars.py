@@ -1,3 +1,4 @@
+from tests.managed_arrival import complete_gallery_receipt
 from datetime import date, datetime, timezone
 import json
 from pathlib import Path
@@ -189,7 +190,7 @@ def test_catalogue_mutations_publish_current_canonical_sidecar(
     store.record_decision(item.id, "approved", "owner")
     store.queue_move(item.id, "owner")
     assert (
-        process_next_move(
+        complete_gallery_receipt(
             store,
             arrival_hall,
             {"Gallery": gallery},

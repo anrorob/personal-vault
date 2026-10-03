@@ -41,8 +41,8 @@ def test_approved_human_readable_layout() -> None:
 
 
 def test_layout_normalises_unsafe_separators_without_losing_polish_text() -> None:
-    assert publication_directory("Jan / Kowalski", "Łódź\\Warszawa") == (
-        PurePosixPath("Jan - Kowalski/Łódź - Warszawa")
+    assert publication_directory("Example / Author", "Łódź\\Warszawa") == (
+        PurePosixPath("Example - Author/Łódź - Warszawa")
     )
 
 

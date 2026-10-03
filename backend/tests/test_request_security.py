@@ -3,7 +3,7 @@ import pytest
 
 from app.request_security import client_ip, trusted_proxy_networks
 from app.auth import _passkey_rate_limit_key
-from app.config import get_webauthn_origin
+from app.config import get_allowed_hosts, get_webauthn_origin
 
 
 def request_from(peer: str, headers: dict[str, str] | None = None) -> Request:
@@ -72,8 +72,18 @@ def test_malformed_trusted_proxy_configuration_fails_closed(monkeypatch: pytest.
 def test_webauthn_origin_must_match_its_configured_rp_hostname(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("PV_WEBAUTHN_RP_ID", "vault.pv-hq.com")
-    monkeypatch.setenv("PV_WEBAUTHN_ORIGIN", "https://other.pv-hq.com")
+    monkeypatch.setenv("PV_WEBAUTHN_RP_ID", "vault.example.test")
+    monkeypatch.setenv("PV_WEBAUTHN_ORIGIN", "https://other.example.test")
 
     with pytest.raises(RuntimeError, match="must match"):
         get_webauthn_origin()
+
+
+@pytest.mark.parametrize("configured", ["*.local", "vault.example.test,*", "https://vault.example.test"])
+def test_allowed_hosts_configuration_rejects_wildcards_and_non_hostnames(
+    monkeypatch: pytest.MonkeyPatch, configured: str
+) -> None:
+    monkeypatch.setenv("PV_ALLOWED_HOSTS", configured)
+
+    with pytest.raises(RuntimeError, match="PV_ALLOWED_HOSTS"):
+        get_allowed_hosts()

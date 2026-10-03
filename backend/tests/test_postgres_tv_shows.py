@@ -98,6 +98,32 @@ def test_postgres_tv_publication_is_atomic_visible_and_idempotent(stores: tuple[
     assert tv.visible_hierarchy_artwork(show_id, None, owner.user_id, "poster", metadata_root)
 
 
+def test_deleted_episode_disappears_from_tv_details_and_direct_delivery(
+    stores: tuple[PostgresAuthenticationStore, PostgresVaultMasterStore, PostgresTvShowStore],
+) -> None:
+    auth, vault, tv = stores
+    owner = auth.get_account("owner")
+    second = auth.get_account("second")
+    assert owner and second
+    asset_id, arrival_id = uuid4(), uuid4()
+    vault.restore_catalogued_asset(_asset(asset_id, 1), "owner")
+    show_id = tv.publish_complete_set(
+        owner_user_id=owner.user_id, source_directory="Foundation Season 1",
+        show_title="Foundation", season_number=1, audience="vault-wide",
+        episodes=[(arrival_id, asset_id, 1,
+                   "/vault/Theatre/TV Shows/Foundation/Season 01/Foundation - S01E01.mp4")],
+    )
+    episode_id = tv.get_visible(show_id, owner.user_id).seasons[0].episodes[0].id
+    assert tv.episode_is_visible(episode_id, second.user_id)
+    vault.set_catalogued_asset_deleted(asset_id, owner.user_id, "owner")
+    assert tv.get_visible(show_id, owner.user_id).seasons[0].episodes == []
+    assert not tv.episode_is_visible(episode_id, owner.user_id)
+    assert not tv.episode_is_visible(episode_id, second.user_id)
+    assert tv.visible_episode_source(episode_id, owner.user_id) is None
+    vault.restore_catalogued_asset_deleted(asset_id, owner.user_id, "owner")
+    assert tv.episode_is_visible(episode_id, owner.user_id)
+
+
 def test_postgres_episode_artwork_is_owned_authorized_and_idempotent(
     stores: tuple[PostgresAuthenticationStore, PostgresVaultMasterStore, PostgresTvShowStore]
 ) -> None:

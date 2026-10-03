@@ -59,6 +59,21 @@ class PersonReference:
 
 
 @dataclass(frozen=True)
+class PersonFaceReference:
+    """Reusable, owner-scoped biometric reference, independent of asset lifecycle."""
+    id: UUID
+    person_id: UUID
+    owner_user_id: UUID
+    embedding: bytes
+    embedding_dimension: int | None
+    embedding_model: str
+    embedding_revision: str | None
+    source_asset_id: UUID | None = None
+    source_face_detection_id: UUID | None = None
+    active: bool = True
+
+
+@dataclass(frozen=True)
 class FaceDetection:
     id: UUID
     asset_id: UUID
@@ -94,6 +109,7 @@ class MemoryGalleryPeopleStore:
         self.decision_sources: dict[tuple[UUID, UUID], str] = {}
         self.decision_owner_user_ids: dict[tuple[UUID, UUID], UUID] = {}
         self.face_detections: dict[UUID, dict[str, object]] = {}
+        self.face_references: dict[UUID, PersonFaceReference] = {}
         self.person_detections: dict[UUID, dict[str, object]] = {}
         self.me_people: dict[UUID, UUID] = {}
         self.relationships: dict[tuple[UUID, UUID, UUID], PersonRelationship] = {}
@@ -197,12 +213,12 @@ class MemoryGalleryPeopleStore:
         return detection_id
 
     def reference_embeddings(self, owner: str) -> list[PersonReference]:
-        return [PersonReference(UUID(str(row["reference_person_id"])), bytes(row["embedding"]), str(row.get("embedding_model") or "facenet512"), str(row["embedding_revision"]) if row.get("embedding_revision") else None) for row in self.face_detections.values() if row.get("reference_person_id") and row.get("embedding") and self.get_person(UUID(str(row["reference_person_id"])), owner)]
+        return [PersonReference(reference.person_id, reference.embedding, reference.embedding_model, reference.embedding_revision) for reference in self.face_references.values() if reference.active and self.get_person(reference.person_id, owner) and self.people[reference.person_id].active and reference.owner_user_id == self.people[reference.person_id].owner_user_id]
 
     def reference_embeddings_by_user_id(self, owner_user_id: UUID | None) -> list[PersonReference]:
         if owner_user_id is None:
             return []
-        return [PersonReference(UUID(str(row["reference_person_id"])), bytes(row["embedding"]), str(row.get("embedding_model") or "facenet512"), str(row["embedding_revision"]) if row.get("embedding_revision") else None) for row in self.face_detections.values() if row.get("reference_person_id") and row.get("embedding") and self.get_person(UUID(str(row["reference_person_id"])), owner_user_id)]
+        return [PersonReference(reference.person_id, reference.embedding, reference.embedding_model, reference.embedding_revision) for reference in self.face_references.values() if reference.active and reference.owner_user_id == owner_user_id and self.get_person(reference.person_id, owner_user_id) and self.people[reference.person_id].active]
 
     def unknown_face_detections(
         self, asset_id: UUID, producing_job_id: UUID | None = None, legacy_since: datetime | None = None
@@ -248,6 +264,21 @@ class MemoryGalleryPeopleStore:
             raise ValueError("Face evidence or Person was not found")
         self.face_detections[detection_id]["reference_person_id"] = person_id
         self.face_detections[detection_id]["recognition_result"] = "known"
+        self._upsert_face_reference(detection_id, person_id)
+
+    def _upsert_face_reference(self, detection_id: UUID, person_id: UUID) -> None:
+        face = self.face_detections[detection_id]
+        person = self.people.get(person_id)
+        embedding = face.get("embedding")
+        if person is None or person.owner_user_id is None or not isinstance(embedding, bytes):
+            return
+        self.face_references[uuid5(NAMESPACE_URL, f"person-face-reference:{detection_id}")] = PersonFaceReference(
+            uuid5(NAMESPACE_URL, f"person-face-reference:{detection_id}"), person_id, person.owner_user_id, embedding,
+            int(face["embedding_dimension"]) if isinstance(face.get("embedding_dimension"), int) else None,
+            str(face.get("embedding_model") or "facenet512"),
+            str(face["embedding_revision"]) if face.get("embedding_revision") else None,
+            UUID(str(face["asset_id"])), detection_id,
+        )
 
     def identify_face(self, asset_id: UUID, detection_id: UUID, person_id: UUID, owner: UUID | str) -> None:
         if self.face_detections.get(detection_id, {}).get("asset_id") != asset_id:
@@ -278,6 +309,9 @@ class MemoryGalleryPeopleStore:
             raise ValueError("Face evidence was not found")
         self.face_detections[detection_id]["reference_person_id"] = None
         self.face_detections[detection_id]["recognition_result"] = "unknown"
+        reference = self.face_references.get(uuid5(NAMESPACE_URL, f"person-face-reference:{detection_id}"))
+        if reference is not None:
+            self.face_references[reference.id] = replace(reference, active=False)
         for key in list(self.associations):
             if key[0] == asset_id and key[2] == "user_face" and key[3] == detection_id:
                 del self.associations[key]
@@ -463,6 +497,41 @@ class PostgresGalleryPeopleStore:
             cursor.execute("""CREATE TABLE IF NOT EXISTS vault_face_detections (id UUID PRIMARY KEY, asset_id UUID NOT NULL REFERENCES vault_assets(id), producing_job_id UUID REFERENCES vault_gallery_intelligence_jobs(id), bounding_box JSONB NOT NULL, detector_provider TEXT NOT NULL, detector_model TEXT NOT NULL, detector_revision TEXT, task_version TEXT NOT NULL, embedding BYTEA, embedding_dimension INTEGER, embedding_model TEXT, embedding_revision TEXT, reference_person_id UUID REFERENCES vault_people(id), recognition_candidate_person_id UUID REFERENCES vault_people(id), native_distance DOUBLE PRECISION, recognition_result TEXT CHECK(recognition_result IN ('known','unknown','unmatched')), raw_evidence JSONB NOT NULL DEFAULT '{}'::jsonb, active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
             cursor.execute("ALTER TABLE vault_face_detections ADD COLUMN IF NOT EXISTS reference_person_id UUID REFERENCES vault_people(id)")
             cursor.execute("ALTER TABLE vault_face_detections ADD COLUMN IF NOT EXISTS producing_job_id UUID REFERENCES vault_gallery_intelligence_jobs(id)")
+            cursor.execute("""CREATE TABLE IF NOT EXISTS person_face_references (
+                id UUID PRIMARY KEY,
+                person_id UUID NOT NULL REFERENCES vault_people(id) ON DELETE CASCADE,
+                owner_user_id UUID NOT NULL REFERENCES auth_accounts(user_id),
+                embedding BYTEA NOT NULL,
+                embedding_dimension INTEGER,
+                embedding_model TEXT NOT NULL,
+                embedding_revision TEXT,
+                source_asset_id UUID,
+                source_face_detection_id UUID,
+                source_type TEXT NOT NULL DEFAULT 'face_detection',
+                active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )""")
+            cursor.execute("""DO $$ DECLARE person_fk_name TEXT; person_fk_delete_type "char"; BEGIN
+                SELECT constraint_row.conname,constraint_row.confdeltype
+                INTO person_fk_name,person_fk_delete_type
+                FROM pg_constraint constraint_row
+                JOIN pg_attribute column_row ON column_row.attrelid=constraint_row.conrelid
+                    AND column_row.attnum=ANY(constraint_row.conkey)
+                WHERE constraint_row.conrelid='person_face_references'::regclass
+                  AND constraint_row.contype='f' AND column_row.attname='person_id'
+                LIMIT 1;
+                IF person_fk_name IS NOT NULL AND person_fk_delete_type <> 'c' THEN
+                    EXECUTE format('ALTER TABLE person_face_references DROP CONSTRAINT %I', person_fk_name);
+                    person_fk_name := NULL;
+                END IF;
+                IF person_fk_name IS NULL THEN
+                    ALTER TABLE person_face_references ADD CONSTRAINT person_face_references_person_id_fkey
+                    FOREIGN KEY (person_id) REFERENCES vault_people(id) ON DELETE CASCADE;
+                END IF;
+            END $$""")
+            cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS person_face_references_source_detection_idx ON person_face_references(source_face_detection_id) WHERE source_face_detection_id IS NOT NULL")
+            cursor.execute("CREATE INDEX IF NOT EXISTS person_face_references_owner_person_idx ON person_face_references(owner_user_id,person_id) WHERE active")
             cursor.execute("""CREATE TABLE IF NOT EXISTS vault_person_detections (id UUID PRIMARY KEY, asset_id UUID NOT NULL REFERENCES vault_assets(id), producing_job_id UUID REFERENCES vault_gallery_intelligence_jobs(id), bounding_box JSONB NOT NULL, detector_provider TEXT NOT NULL, detector_model TEXT NOT NULL, detector_revision TEXT, task_version TEXT NOT NULL, raw_evidence JSONB NOT NULL DEFAULT '{}'::jsonb, active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
             cursor.execute("ALTER TABLE vault_person_detections ADD COLUMN IF NOT EXISTS producing_job_id UUID REFERENCES vault_gallery_intelligence_jobs(id)")
             cursor.execute("""CREATE TABLE IF NOT EXISTS vault_asset_people (id UUID PRIMARY KEY, asset_id UUID NOT NULL REFERENCES vault_assets(id), person_id UUID NOT NULL REFERENCES vault_people(id), source TEXT NOT NULL CHECK(source IN ('vault_master','user','user_face','imported')), supporting_face_detection_id UUID REFERENCES vault_face_detections(id), active BOOLEAN NOT NULL DEFAULT TRUE, created_by TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(asset_id,person_id,source))""")
@@ -513,6 +582,31 @@ class PostgresGalleryPeopleStore:
             cursor.execute("CREATE INDEX IF NOT EXISTS vault_face_detections_owner_asset_idx ON vault_face_detections(owner_user_id,asset_id)")
             self._repair_legacy_detection_provenance(cursor, "vault_face_detections")
             self._repair_legacy_detection_provenance(cursor, "vault_person_detections")
+            self._backfill_person_face_references(cursor)
+
+    @staticmethod
+    def _reference_id(source_face_detection_id: UUID) -> UUID:
+        return uuid5(NAMESPACE_URL, f"person-face-reference:{source_face_detection_id}")
+
+    @classmethod
+    def _backfill_person_face_references(cls, cursor) -> None:
+        """Copy only valid legacy reference embeddings; repeat safely on bootstrap."""
+        cursor.execute("""SELECT faces.id,faces.asset_id,faces.reference_person_id,faces.owner_user_id,
+                faces.embedding,faces.embedding_dimension,faces.embedding_model,faces.embedding_revision
+            FROM vault_face_detections faces JOIN vault_people people ON people.id=faces.reference_person_id
+            WHERE faces.active AND faces.embedding IS NOT NULL AND faces.reference_person_id IS NOT NULL
+              AND faces.owner_user_id=people.owner_user_id""")
+        for face in cursor.fetchall():
+            detection_id = UUID(str(face["id"]))
+            cursor.execute("""INSERT INTO person_face_references(
+                    id,person_id,owner_user_id,embedding,embedding_dimension,embedding_model,embedding_revision,
+                    source_asset_id,source_face_detection_id,source_type,active)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,'migrated_face_detection',TRUE)
+                ON CONFLICT(source_face_detection_id) WHERE source_face_detection_id IS NOT NULL DO NOTHING""", (
+                cls._reference_id(detection_id), face["reference_person_id"], face["owner_user_id"], face["embedding"],
+                face["embedding_dimension"], face["embedding_model"] or "facenet512", face["embedding_revision"],
+                face["asset_id"], detection_id,
+            ))
 
     @staticmethod
     def _repair_legacy_detection_provenance(cursor, table_name: str) -> None:
@@ -678,18 +772,20 @@ class PostgresGalleryPeopleStore:
 
     def reference_embeddings(self, owner: str) -> list[PersonReference]:
         with self._connect() as connection, connection.cursor() as cursor:
-            cursor.execute("SELECT faces.reference_person_id,faces.embedding,faces.embedding_model,faces.embedding_revision FROM vault_face_detections faces JOIN vault_people people ON people.id=faces.reference_person_id WHERE people.owner_username=%s AND people.active AND faces.active AND faces.embedding IS NOT NULL", (owner,))
-            return [PersonReference(UUID(str(row["reference_person_id"])), bytes(row["embedding"]), str(row["embedding_model"]), str(row["embedding_revision"]) if row["embedding_revision"] else None) for row in cursor.fetchall()]
+            cursor.execute("""SELECT face_references.person_id,face_references.embedding,face_references.embedding_model,face_references.embedding_revision
+                FROM person_face_references face_references JOIN vault_people people ON people.id=face_references.person_id
+                WHERE people.owner_username=%s AND people.active AND face_references.active
+                  AND face_references.owner_user_id=people.owner_user_id""", (owner,))
+            return [PersonReference(UUID(str(row["person_id"])), bytes(row["embedding"]), str(row["embedding_model"]), str(row["embedding_revision"]) if row["embedding_revision"] else None) for row in cursor.fetchall()]
 
     def reference_embeddings_by_user_id(self, owner_user_id: UUID | None) -> list[PersonReference]:
         if owner_user_id is None:
             return []
         with self._connect() as connection, connection.cursor() as cursor:
-            cursor.execute("""SELECT faces.reference_person_id,faces.embedding,faces.embedding_model,faces.embedding_revision
-                FROM vault_face_detections faces JOIN vault_people people ON people.id=faces.reference_person_id
-                WHERE people.owner_user_id=%s AND faces.owner_user_id=%s AND people.active AND faces.active
-                AND faces.embedding IS NOT NULL""", (owner_user_id, owner_user_id))
-            return [PersonReference(UUID(str(row["reference_person_id"])), bytes(row["embedding"]), str(row["embedding_model"]), str(row["embedding_revision"]) if row["embedding_revision"] else None) for row in cursor.fetchall()]
+            cursor.execute("""SELECT face_references.person_id,face_references.embedding,face_references.embedding_model,face_references.embedding_revision
+                FROM person_face_references face_references JOIN vault_people people ON people.id=face_references.person_id
+                WHERE people.owner_user_id=%s AND face_references.owner_user_id=%s AND people.active AND face_references.active""", (owner_user_id, owner_user_id))
+            return [PersonReference(UUID(str(row["person_id"])), bytes(row["embedding"]), str(row["embedding_model"]), str(row["embedding_revision"]) if row["embedding_revision"] else None) for row in cursor.fetchall()]
 
     def unknown_face_detections(
         self, asset_id: UUID, producing_job_id: UUID | None = None, legacy_since: datetime | None = None
@@ -742,6 +838,21 @@ class PostgresGalleryPeopleStore:
             cursor.execute("UPDATE vault_face_detections SET reference_person_id=%s,recognition_result='known' WHERE id=%s AND active RETURNING id", (person_id, detection_id))
             if cursor.fetchone() is None:
                 raise ValueError("Face evidence was not found")
+            if isinstance(owner, UUID):
+                cursor.execute("""INSERT INTO person_face_references(
+                        id,person_id,owner_user_id,embedding,embedding_dimension,embedding_model,embedding_revision,
+                        source_asset_id,source_face_detection_id,source_type,active)
+                    SELECT %s,%s,faces.owner_user_id,faces.embedding,faces.embedding_dimension,
+                        COALESCE(faces.embedding_model,'facenet512'),faces.embedding_revision,faces.asset_id,faces.id,
+                        'face_reference_confirmation',TRUE
+                    FROM vault_face_detections faces
+                    WHERE faces.id=%s AND faces.owner_user_id=%s AND faces.embedding IS NOT NULL
+                    ON CONFLICT(source_face_detection_id) WHERE source_face_detection_id IS NOT NULL
+                    DO UPDATE SET person_id=EXCLUDED.person_id,owner_user_id=EXCLUDED.owner_user_id,
+                        embedding=EXCLUDED.embedding,embedding_dimension=EXCLUDED.embedding_dimension,
+                        embedding_model=EXCLUDED.embedding_model,embedding_revision=EXCLUDED.embedding_revision,
+                        source_asset_id=EXCLUDED.source_asset_id,source_type=EXCLUDED.source_type,active=TRUE,
+                        updated_at=CURRENT_TIMESTAMP""", (self._reference_id(detection_id), person_id, detection_id, owner))
 
     def identify_face(self, asset_id: UUID, detection_id: UUID, person_id: UUID, owner: UUID | str) -> None:
         if not isinstance(owner, UUID):
@@ -761,6 +872,23 @@ class PostgresGalleryPeopleStore:
                 raise ValueError("Face evidence was not found")
             previous_person_id = previous["reference_person_id"]
             cursor.execute("UPDATE vault_face_detections SET reference_person_id=%s,recognition_result='known' WHERE id=%s AND owner_user_id=%s", (person_id, detection_id, asset_owner_user_id))
+            cursor.execute("""INSERT INTO person_face_references(
+                    id,person_id,owner_user_id,embedding,embedding_dimension,embedding_model,embedding_revision,
+                    source_asset_id,source_face_detection_id,source_type,active)
+                SELECT %s,%s,faces.owner_user_id,faces.embedding,faces.embedding_dimension,
+                    COALESCE(faces.embedding_model,'facenet512'),faces.embedding_revision,faces.asset_id,faces.id,
+                    'face_identification',TRUE
+                FROM vault_face_detections faces
+                WHERE faces.id=%s AND faces.asset_id=%s AND faces.owner_user_id=%s
+                  AND faces.embedding IS NOT NULL
+                ON CONFLICT(source_face_detection_id) WHERE source_face_detection_id IS NOT NULL
+                DO UPDATE SET person_id=EXCLUDED.person_id,owner_user_id=EXCLUDED.owner_user_id,
+                    embedding=EXCLUDED.embedding,embedding_dimension=EXCLUDED.embedding_dimension,
+                    embedding_model=EXCLUDED.embedding_model,embedding_revision=EXCLUDED.embedding_revision,
+                    source_asset_id=EXCLUDED.source_asset_id,source_type=EXCLUDED.source_type,active=TRUE,
+                    updated_at=CURRENT_TIMESTAMP""", (
+                self._reference_id(detection_id), person_id, detection_id, asset_id, asset_owner_user_id,
+            ))
             cursor.execute("UPDATE vault_asset_people SET active=FALSE,updated_at=CURRENT_TIMESTAMP WHERE asset_id=%s AND owner_user_id=%s AND source='user_face' AND supporting_face_detection_id=%s", (asset_id, asset_owner_user_id, detection_id))
             cursor.execute("""INSERT INTO vault_asset_people(id,asset_id,person_id,source,supporting_face_detection_id,created_by,owner_user_id)
                 SELECT %s,assets.id,%s,'user_face',%s,%s,assets.owner_user_id FROM vault_assets assets
@@ -791,6 +919,7 @@ class PostgresGalleryPeopleStore:
             if cursor.fetchone() is None:
                 raise ValueError("Face evidence was not found")
             cursor.execute("UPDATE vault_face_detections SET reference_person_id=NULL,recognition_result='unknown' WHERE id=%s AND owner_user_id=%s", (detection_id, owner))
+            cursor.execute("UPDATE person_face_references SET active=FALSE,updated_at=CURRENT_TIMESTAMP WHERE source_face_detection_id=%s AND owner_user_id=%s", (detection_id, owner))
             cursor.execute("UPDATE vault_asset_people SET active=FALSE,updated_at=CURRENT_TIMESTAMP WHERE asset_id=%s AND owner_user_id=%s AND source='user_face' AND supporting_face_detection_id=%s", (asset_id, owner, detection_id))
 
     def matching_asset_ids(self, person_ids: tuple[UUID, ...], owner: UUID) -> set[UUID]:

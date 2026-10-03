@@ -34,7 +34,7 @@ from app.vault_master_ai import AI_MODEL_ID, AI_MODEL_REVISION
 from app.vault_master_semantic import SemanticSignal, assess_semantic_signals
 
 
-INGESTION_TASK_VERSION = "semantic-intake-v5"
+INGESTION_TASK_VERSION = "semantic-intake-v9"
 ROUTING_MODEL_VERSION = "intelligent-routing-v5"
 ROUTING_MEMORY_VERSION = "routing-memory-v1"
 AUTO_PILOT_ELIGIBILITY_SCORE = 80
@@ -63,8 +63,120 @@ SCREENSHOT_CONTENT_MARKERS = (
     "status bar",
 )
 
+# Visual subjects, not OCR words. Florence often opens with "The image shows a
+# car..." rather than calling an ordinary scene a photograph.
+SCENE_PHOTO_TERMS = (
+    "car", "vehicle", "truck", "bus", "bicycle", "motorcycle", "street",
+    "road", "building", "house", "restaurant", "cafe", "shop", "store",
+    "food", "meal", "animal", "tree", "forest", "mountain", "lake",
+    "river", "sky", "flower", "flowers", "city", "town",
+    "tram stop", "bus stop", "information board", "sign", "signage",
+    "shopfront", "magazine rack", "book rack", "bookshop", "magazines",
+    "books", "display", "desk", "office", "room", "monitor", "television",
+    "bottle", "package", "packaging", "product", "products", "shelf",
+    "shelves", "table", "fruit",
+)
 
-def render_gallery_pdf_preview(source: Path) -> bytes:
+
+def _primary_capture_context(caption: str) -> str | None:
+    """Classify the described subject, before considering text within it.
+
+    Florence's first clause usually frames the image. These patterns describe
+    capture intent, rather than treating a single noun as the destination.
+    """
+    primary = re.split(r"[.!?]", caption.casefold(), maxsplit=1)[0]
+    physical_screen = bool(re.search(
+        r"\b(photograph|photo|camera|photographed)\b.*\b"
+        r"(monitor|screen|television|tv|laptop)\b|"
+        r"\b(monitor|screen|television|tv|laptop)\b.*\b"
+        r"(desk|room|office|frame|reflection|physical|photographed)\b",
+        primary,
+    ))
+    screen_reference = physical_screen and bool(re.search(
+        r"\b(tightly framed|close-up|fills the frame|reference capture|"
+        r"screen content|no surroundings)\b", caption.casefold(),
+    ))
+    if screen_reference:
+        return "screen_reference"
+    if physical_screen:
+        return "scene"
+    if re.search(r"\b(screenshot|screen capture|digital capture)\b", primary):
+        return "screenshot"
+    if re.search(
+        r"\b(app interface|application interface|settings screen|calendar "
+        r"screen|browser page|website screenshot|flight.search screen)\b",
+        primary,
+    ):
+        return "screenshot"
+    document_subject = (
+        r"(receipt|invoice|bank statement|account statement|letter|"
+        r"document|printed page|page|paperwork|form|ticket|"
+        r"health insurance card|identity card|membership card|official card|"
+        r"government-issued card)"
+    )
+    subject = re.sub(
+        r"^(?:(?:the|this) (?:image|picture|photo|photograph) "
+        r"(?:shows|depicts|contains|is (?:a |an )?(?:photograph|photo|image|"
+        r"picture|scan) of|is of) )",
+        "", primary,
+    )
+    subject = re.sub(r"^(?:a |an |the )?", "", subject)
+    subject = re.sub(
+        r"^(?:photograph|photo|image|picture|scan) of (?:a |an |the )?",
+        "", subject,
+    )
+    document_match = re.match(
+        rf"^(?:(?:photographed|scanned|printed|official|financial|"
+        rf"handwritten|purchase|paper|european|synthetic) )*{document_subject}\b", subject,
+    )
+    # "Letter" can mean a glyph on a label rather than correspondence.
+    correspondence = bool(re.search(
+        r"\b(photograph|photo|photographed|handwritten|typed|paper|page|"
+        r"envelope|correspondence|addressed)\b", primary,
+    )) and not bool(re.search(
+        r"\b(label|logo|brand|sign|package|packaging|product)\b", primary,
+    ))
+    if document_match and (document_match.group(1) != "letter" or correspondence):
+        return "document"
+    if ("poster" in primary and re.search(
+        r"\b(photograph|photo|wall|street|shop|room)\b", primary,
+    )):
+        return "scene"
+    if re.search(
+        r"\b(street|road|car|vehicle|people|person|shop|shopfront|store|"
+        r"magazine|bookshop|book rack|tram stop|bus stop|"
+        r"information board|sign|signs|menu|monitor|television|"
+        r"office|desk|room|building|animal|food|bottle|package|packaging|"
+        r"product|products|shelf|shelves|table|fruit)\b",
+        primary,
+    ):
+        return "scene"
+    return None
+
+
+def _structured_document_ocr(ocr_text: str, content_type: str) -> bool:
+    """Require more than an isolated word before OCR competes with a scene."""
+    text = ocr_text.casefold()
+    if content_type == "receipt":
+        indicators = sum(bool(re.search(rf"\b{re.escape(term)}\b", text)) for term in (
+            "receipt", "subtotal", "vat", "amount paid", "change due", "total",
+        ))
+        return indicators >= 2 and bool(re.search(
+            r"\b(subtotal|amount paid|change due|total)\b|[$£€]\s*\d|\d+[.,]\d{2}", text
+        ))
+    if content_type == "financial_document":
+        return sum(bool(re.search(rf"\b{re.escape(term)}\b", text)) for term in (
+            "bank statement", "account statement", "statement period", "account number",
+            "sort code", "opening balance", "closing balance",
+        )) >= 2
+    if content_type == "general_document":
+        return len(text) >= 80 and bool(re.search(
+            r"\b(invoice|contract|application form|certificate|document)\b", text
+        ))
+    return False
+
+
+def render_gallery_pdf_preview(source: Path, *, max_edge: int | None = None) -> bytes:
     """Return a bounded local JPEG rendering of a Gallery PDF's first page.
 
     The caller establishes access and validates the source path. Rendering is
@@ -86,6 +198,8 @@ def render_gallery_pdf_preview(source: Path) -> bytes:
             1.5,
             (MAX_GALLERY_PDF_PREVIEW_PIXELS / (width * height)) ** 0.5,
         )
+        if max_edge is not None:
+            scale = min(scale, max_edge / max(width, height))
         bitmap = page.render(scale=scale, rotation=0)
         try:
             image = bitmap.to_pil().convert("RGB")
@@ -140,6 +254,7 @@ class IngestionAiEvidence:
     requested_by: str
     created_at: datetime
     owner_user_id: UUID | None = None
+    source_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -197,6 +312,7 @@ class IngestionAiStore(Protocol):
         reasons: tuple[str, ...],
         processing_ms: int,
         assessment: "RoutingAssessment",
+        source_sha256: str | None = None,
     ) -> IngestionAiEvidence: ...
     def fail_job(self, job_id: UUID, error: str) -> None: ...
     def create_analysis_batch(
@@ -311,6 +427,10 @@ def _classify(
         "membership card",
         "official card",
         "government-issued card",
+        "printed page",
+        "paperwork",
+        "form",
+        "ticket",
     )
     artwork = ("illustration", "painting", "drawing", "artwork", "poster")
     publication_cover = (
@@ -376,7 +496,7 @@ def _classify(
         "kitten",
         "pet",
         "horse",
-    )
+    ) + SCENE_PHOTO_TERMS
     personal_photo_context = (
         "smiling",
         "posing",
@@ -410,22 +530,56 @@ def _classify(
             if re.search(rf"\b{re.escape(term)}\b", text)
         ]
 
-    if hits := matches(financial):
+    primary_description = caption_text.split(".", 1)[0]
+    primary_context = _primary_capture_context(caption)
+
+    if primary_context == "screenshot":
+        reasons.append("Primary visual subject is a native screen capture")
+        return "screenshot", 0.94, tuple(reasons)
+
+    def document_hits(terms: tuple[str, ...], content_type: str) -> list[str]:
+        hits = matches(terms)
+        # A document word anywhere in a caption can describe a label, sign,
+        # or screen. Only document-subject framing establishes this class;
+        # structured OCR may remain a competitor to a described scene.
+        if primary_context == "document":
+            return hits
+        if (primary_context in {"scene", "screen_reference"}
+                and _structured_document_ocr(ocr_text, content_type)):
+            return hits
+        return []
+
+    if hits := document_hits(financial, "financial_document"):
         reasons.append(f"Financial statement indicators: {', '.join(hits[:3])}")
         return "financial_document", min(0.99, 0.88 + 0.03 * len(hits)), tuple(reasons)
-    if hits := matches(receipt):
+    if hits := document_hits(receipt, "receipt"):
         reasons.append(f"Receipt indicators: {', '.join(hits[:3])}")
         return "receipt", min(0.97, 0.84 + 0.03 * len(hits)), tuple(reasons)
-    if hits := matches(publication_cover):
+    publication_hits = matches(publication_cover)
+    if primary_context in {"scene", "screen_reference"}:
+        publication_hits = []
+    if hits := publication_hits:
         reasons.append(f"Publication-cover indicators: {', '.join(hits[:2])}")
         return "publication_cover", min(0.97, 0.88 + 0.03 * len(hits)), tuple(reasons)
-    if hits := matches(document):
+    if hits := document_hits(document, "general_document"):
         reasons.append(f"Document indicators: {', '.join(hits[:3])}")
-        return "general_document", min(0.94, 0.78 + 0.03 * len(hits)), tuple(reasons)
-    screenshot_hits = matches(SCREENSHOT_CONTENT_MARKERS)
-    if hits := matches(artwork):
+        return "general_document", (
+            max(0.92, min(0.94, 0.78 + 0.03 * len(hits)))
+            if primary_context == "document"
+            else min(0.94, 0.78 + 0.03 * len(hits))
+        ), tuple(reasons)
+    screenshot_hits = matches(SCREENSHOT_CONTENT_MARKERS, caption_text)
+    art_hits = matches(artwork)
+    if primary_context in {"scene", "screen_reference"} and not matches(
+        ("illustration", "painting", "drawing", "artwork"), primary_description,
+    ):
+        art_hits = []
+    if hits := art_hits:
         reasons.append(f"Artwork indicators: {', '.join(hits[:2])}")
         return "artwork", min(0.92, 0.78 + 0.04 * len(hits)), tuple(reasons)
+    if primary_context == "screen_reference":
+        reasons.append("Photographed screen fills the frame as a reference capture")
+        return "screenshot", 0.86, tuple(reasons)
     if direct_hits := matches(direct_personal_photo, caption_text):
         context_hits = matches(personal_photo_context, caption_text)
         reasons.append(
@@ -436,9 +590,12 @@ def _classify(
         # subject is strong visual evidence.  Context can strengthen it but is
         # never enough by itself to make an image automatic-move eligible.
         base_confidence = 0.87 if {"portrait", "selfie", "headshot"} & set(direct_hits) else 0.82
-        return "personal_photo", min(
+        confidence = min(
             0.95,
             base_confidence + 0.02 * min(4, len(direct_hits) + len(context_hits)),
+        )
+        return "personal_photo", (
+            max(0.92, confidence) if primary_context == "scene" else confidence
         ), tuple(reasons)
     if context_hits := matches(personal_photo_context, caption_text):
         reasons.append(f"Personal-photo context only: {', '.join(context_hits[:3])}")
@@ -547,7 +704,7 @@ def assess_destination(
     destinations = {
         "personal_photo": "Gallery",
         "receipt": "Documents",
-        "financial_document": "Ledger",
+        "financial_document": "Documents",
         "general_document": "Documents",
         "screenshot": "Archives",
         "artwork": "Archives",
@@ -635,40 +792,20 @@ def assess_destination(
 def with_learned_rule(
     assessment: RoutingAssessment, rule: RoutingMemoryRule | None
 ) -> RoutingAssessment:
-    # Immature owner learning is display-only evidence.  It must never weaken
-    # the deterministic 80-point routing decision or block auto-pilot.
+    # Routing Memory is advisory in vm-routing-score-v1.  It cannot change the
+    # score, class, destination, gates or automatic eligibility.
     if rule is None or rule.status != "enabled" or rule.maturity != "established":
         return assessment
     components = dict(assessment.confidence_components)
     components["learned_routing"] = round(rule.confidence * 100, 1)
-    conflicts = list(assessment.conflicts)
-    disqualifiers = list(assessment.automatic_disqualifiers)
-    recommended = assessment.recommended_destination
-    if recommended and recommended != rule.destination:
-        conflicts.append(
-            f"Learned routing suggests {rule.destination}; content evidence suggests {recommended}"
-        )
-        disqualifiers.append("Learned routing conflicts with current evidence")
-    else:
-        recommended = rule.destination
-    score = min(100, round(assessment.decision_score * 0.85 + components["learned_routing"] * 0.15))
-    if rule.maturity != "established":
-        disqualifiers.append("Learned routing has not reached established maturity")
-    band = (
-        "individual_review"
-        if conflicts or any("duplicate" in value.casefold() for value in disqualifiers)
-        else "automatic_eligible"
-        if score >= AUTO_PILOT_ELIGIBILITY_SCORE and rule.maturity == "established"
-        else "batch_review"
-    )
     return RoutingAssessment(
-        recommended,
-        score,
-        band,
+        assessment.recommended_destination,
+        assessment.decision_score,
+        assessment.routing_band,
         components,
-        tuple(dict.fromkeys(conflicts)),
-        tuple(dict.fromkeys(disqualifiers)),
-        f"{ROUTING_MODEL_VERSION}+{ROUTING_MEMORY_VERSION}",
+        assessment.conflicts,
+        assessment.automatic_disqualifiers,
+        assessment.decision_model_version,
     )
 
 
@@ -763,7 +900,7 @@ class MemoryIngestionAiStore:
         self.jobs[job.id] = claimed
         return claimed
 
-    def complete_job(self, job_id: UUID, content_type: str, caption: str, ocr_text: str, confidence: float, reasons: tuple[str, ...], processing_ms: int, assessment: RoutingAssessment) -> IngestionAiEvidence:
+    def complete_job(self, job_id: UUID, content_type: str, caption: str, ocr_text: str, confidence: float, reasons: tuple[str, ...], processing_ms: int, assessment: RoutingAssessment, source_sha256: str | None = None) -> IngestionAiEvidence:
         job = self.jobs[job_id]
         if job.status != "processing" or content_type not in SUPPORTED_CONTENT_TYPES:
             raise ValueError("Ingestion AI job is not processing")
@@ -780,6 +917,7 @@ class MemoryIngestionAiStore:
             assessment.confidence_components, assessment.conflicts,
             assessment.automatic_disqualifiers,
             assessment.decision_model_version, job.requested_by, now, job.owner_user_id,
+            source_sha256,
         )
         self.evidence[evidence.id] = evidence
         self.jobs[job.id] = IngestionAiJob(**{**job.__dict__, "status": "completed", "completed_at": now})
@@ -1023,6 +1161,7 @@ class PostgresIngestionAiStore:
                     decision_model_version TEXT NOT NULL DEFAULT 'intelligent-routing-v4',
                     requested_by TEXT NOT NULL,
                     owner_user_id UUID REFERENCES auth_accounts(user_id),
+                    source_sha256 TEXT,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -1033,6 +1172,7 @@ class PostgresIngestionAiStore:
             cursor.execute("ALTER TABLE vault_ingestion_ai_evidence ADD COLUMN IF NOT EXISTS conflicts JSONB NOT NULL DEFAULT '[]'::jsonb")
             cursor.execute("ALTER TABLE vault_ingestion_ai_evidence ADD COLUMN IF NOT EXISTS automatic_disqualifiers JSONB NOT NULL DEFAULT '[]'::jsonb")
             cursor.execute("ALTER TABLE vault_ingestion_ai_evidence ADD COLUMN IF NOT EXISTS decision_model_version TEXT NOT NULL DEFAULT 'intelligent-routing-v4'")
+            cursor.execute("ALTER TABLE vault_ingestion_ai_evidence ADD COLUMN IF NOT EXISTS source_sha256 TEXT")
             cursor.execute("ALTER TABLE vault_ingestion_ai_jobs ADD COLUMN IF NOT EXISTS owner_user_id UUID REFERENCES auth_accounts(user_id)")
             cursor.execute("ALTER TABLE vault_ingestion_ai_evidence ADD COLUMN IF NOT EXISTS owner_user_id UUID REFERENCES auth_accounts(user_id)")
             cursor.execute("""UPDATE vault_ingestion_ai_jobs AS jobs SET owner_user_id=items.owner_user_id
@@ -1287,13 +1427,13 @@ class PostgresIngestionAiStore:
             assert claimed is not None
             return _job_from_row(claimed)
 
-    def complete_job(self, job_id: UUID, content_type: str, caption: str, ocr_text: str, confidence: float, reasons: tuple[str, ...], processing_ms: int, assessment: RoutingAssessment) -> IngestionAiEvidence:
+    def complete_job(self, job_id: UUID, content_type: str, caption: str, ocr_text: str, confidence: float, reasons: tuple[str, ...], processing_ms: int, assessment: RoutingAssessment, source_sha256: str | None = None) -> IngestionAiEvidence:
         with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute("SELECT * FROM vault_ingestion_ai_jobs WHERE id=%s FOR UPDATE", (job_id,))
             job = cursor.fetchone()
             if job is None or job["status"] != "processing" or content_type not in SUPPORTED_CONTENT_TYPES:
                 raise ValueError("Ingestion AI job is not processing")
-            cursor.execute("""INSERT INTO vault_ingestion_ai_evidence (id,job_id,item_id,content_type,caption,ocr_text,confidence,reasons,model_id,model_revision,task_version,processing_ms,recommended_destination,decision_score,routing_band,confidence_components,conflicts,automatic_disqualifiers,decision_model_version,requested_by,owner_user_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""", (uuid4(), job_id, job["item_id"], content_type, caption, ocr_text, confidence, json.dumps(reasons), AI_MODEL_ID, AI_MODEL_REVISION, INGESTION_TASK_VERSION, processing_ms, assessment.recommended_destination, assessment.decision_score, assessment.routing_band, json.dumps(assessment.confidence_components), json.dumps(assessment.conflicts), json.dumps(assessment.automatic_disqualifiers), assessment.decision_model_version, job["requested_by"], job["owner_user_id"]))
+            cursor.execute("""INSERT INTO vault_ingestion_ai_evidence (id,job_id,item_id,content_type,caption,ocr_text,confidence,reasons,model_id,model_revision,task_version,processing_ms,recommended_destination,decision_score,routing_band,confidence_components,conflicts,automatic_disqualifiers,decision_model_version,requested_by,owner_user_id,source_sha256) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""", (uuid4(), job_id, job["item_id"], content_type, caption, ocr_text, confidence, json.dumps(reasons), AI_MODEL_ID, AI_MODEL_REVISION, INGESTION_TASK_VERSION, processing_ms, assessment.recommended_destination, assessment.decision_score, assessment.routing_band, json.dumps(assessment.confidence_components), json.dumps(assessment.conflicts), json.dumps(assessment.automatic_disqualifiers), assessment.decision_model_version, job["requested_by"], job["owner_user_id"], source_sha256))
             evidence = cursor.fetchone()
             cursor.execute("UPDATE vault_ingestion_ai_jobs SET status='completed', completed_at=CURRENT_TIMESTAMP WHERE id=%s", (job_id,))
             assert evidence is not None
@@ -1624,7 +1764,7 @@ def process_next_ingestion_ai_job(store: IngestionAiStore, vault_store: VaultMas
             )
         store.complete_job(
             job.id, content_type, caption, ocr_text, confidence, reasons,
-            processing_ms, assessment,
+            processing_ms, assessment, item.sha256,
         )
     except Exception as error:
         store.fail_job(job.id, str(error))
@@ -1662,6 +1802,7 @@ def queue_pending_ingestion_image_analysis(
             evidence[0].model_id == AI_MODEL_ID
             and evidence[0].model_revision == AI_MODEL_REVISION
             and evidence[0].task_version == INGESTION_TASK_VERSION
+            and evidence[0].source_sha256 == item.sha256
         ):
             continue
         if jobs and jobs[0].status == "failed":

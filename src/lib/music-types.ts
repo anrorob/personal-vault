@@ -1,0 +1,27 @@
+export type MusicTrack = {
+  id: string;
+  asset_id: string;
+  can_edit?: boolean;
+  title: string;
+  artist: string;
+  album: string;
+  album_artist: string | null;
+  album_folder: string;
+  album_group_id?: string | null;
+  album_position?: number | null;
+  album_order_state?: string | null;
+  album_member_count?: number | null;
+  owner_user_id?: string | null;
+  identity_conflicts?: string[];
+  genre: string | null;
+  genres: string[];
+  track_number: number | null;
+  disc_number: number | null;
+  release_year: number | null;
+  overview: string | null;
+  duration_seconds: number | null;
+  artwork_url: string | null;
+  lyrics_available: boolean;
+  enrichment_status: "identified" | "needs_review";
+  playback_url: string;
+};

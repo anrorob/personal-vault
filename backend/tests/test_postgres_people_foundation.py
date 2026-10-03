@@ -67,11 +67,11 @@ def test_postgres_people_foundation_backfills_legacy_uuid_and_persists_owner_sco
     assert migrated.id == legacy_person_id and migrated.full_name == "Owner"
 
     first = people.create_person(
-        owner.username, "Owner", owner.user_id, full_name="Owner Kowalski",
-        preferred_name="Rob", aliases=["Bobby"], date_of_birth=date(1980, 1, 2),
+        owner.username, "Owner", owner.user_id, full_name="Example Owner",
+        preferred_name="Example", aliases=["Bobby"], date_of_birth=date(1980, 1, 2),
     )
-    duplicate = people.create_person(owner.username, "Owner", owner.user_id, full_name="Owner Kowalski", preferred_name="Rob")
-    other_person = people.create_person(other.username, "Owner", other.user_id, full_name="Owner Kowalski")
+    duplicate = people.create_person(owner.username, "Owner", owner.user_id, full_name="Example Owner", preferred_name="Example")
+    other_person = people.create_person(other.username, "Owner", other.user_id, full_name="Example Owner")
     assert first.id != duplicate.id
     assert [person.id for person in people.search_people(owner.user_id, "bobby")] == [first.id]
     assert {person.id for person in people.search_people(owner.user_id, "kowalski")} == {first.id, duplicate.id}

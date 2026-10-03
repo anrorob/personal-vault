@@ -313,7 +313,9 @@ def record_arrival_hall_file_owner(
         owner_user_id = getattr(username, "user_id", None)
         if not isinstance(owner_user_id, UUID):
             raise ValueError("Arrival Hall uploader identity is unavailable")
+        previous = owners.get(relative_path)
         owners[relative_path] = {
+            **(previous if isinstance(previous, dict) else {}),
             "owner_user_id": str(owner_user_id),
             "uploaded_at": datetime.now(timezone.utc).isoformat(),
         }

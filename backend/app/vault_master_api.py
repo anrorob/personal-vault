@@ -3,6 +3,7 @@ from dataclasses import replace
 import os
 import psycopg
 import hashlib
+import secrets
 from pathlib import Path, PurePosixPath
 import shutil
 from urllib.error import HTTPError, URLError
@@ -12,12 +13,21 @@ from uuid import UUID, uuid4, uuid5, NAMESPACE_URL
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import FileResponse, StreamingResponse
+from webauthn import generate_authentication_options, verify_authentication_response
+from webauthn.helpers.structs import PublicKeyCredentialDescriptor, UserVerificationRequirement
+from webauthn.helpers.exceptions import InvalidAuthenticationResponse, InvalidJSONStructure
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from typing import Literal
 
-from app.auth import AuthenticatedAdministrator, ElevatedVaultControlAdministrator, AuthenticatedUsername, get_authentication_store
+from app.auth import (
+    AuthenticatedAdministrator, ElevatedVaultControlAdministrator, AuthenticatedUsername,
+    PASSKEY_TIMEOUT_MS, PasskeyVerifyRequest, _credential_raw_id,
+    _passkey_options, _passkey_rate_limit_key, get_authentication_store,
+    get_passkey_store,
+)
 from app.auth_store import AuthenticationStore
-from app.config import get_database_conninfo, get_metadata_storage_root
+from app.config import get_database_conninfo, get_metadata_storage_root, get_webauthn_origin, get_webauthn_rp_id
+from app.passkeys import PasskeyStore
 from app.share_grants import (
     ACTIVE_GRANT_STATE,
     LOCAL_ALL_TARGET,
@@ -25,10 +35,11 @@ from app.share_grants import (
     PENDING_GRANT_STATE,
     PostgresShareGrantStore,
 )
+from app.people import get_share_grant_store
 from app.federation import FEDERATION_PROTOCOL_VERSION, FederationStore, FederatedDownloadOperation, sign_envelope
 from app.federated_download_executor import FederatedDownloadPromotionRequest, queue_signed_request
 from app.incoming import get_incoming_path
-from app.arrival_managed_publisher import reissue_item as reissue_arrival_theatre_item
+from app.home_videos import get_home_videos_path
 from app.theatre_movie_rename import queue_movie_rename
 from app.reading_room_intake import (
     CORRECTION_AUTHOR_KEY,
@@ -94,7 +105,6 @@ from app.vault_master import (
     tv_publication_set_is_ready,
     enqueue_root,
     require_file_within_root,
-    safely_remove_rejected_arrival_item,
     safely_remove_exact_duplicate,
     sha256_file,
 )
@@ -317,7 +327,7 @@ class RoutingMemoryListing(BaseModel):
 class RoutingMemoryUpdate(BaseModel):
     action: Literal["enable", "disable", "reset", "edit"]
     destination: Literal[
-        "Gallery", "Home Videos", "Music", "Movies", "TV Shows", "Documents", "Archives", "Ledger"
+        "Gallery", "Home Videos", "Music", "Movies", "TV Shows", "Documents", "Archives"
     ] | None = None
 
 
@@ -326,7 +336,7 @@ class AutopilotPolicyUpdate(BaseModel):
     content_type: Literal[
         "personal_photo", "receipt", "financial_document", "general_document", "artwork"
     ] = "personal_photo"
-    destination: Literal["Gallery", "Documents", "Ledger", "Archives"] = "Gallery"
+    destination: Literal["Gallery", "Documents", "Archives"] = "Gallery"
     threshold: int = Field(default=80, ge=80, le=100)
     max_items: int = Field(default=50, ge=1, le=AUTOPILOT_MAX_ITEMS)
     max_failures: int = Field(default=2, ge=1, le=AUTOPILOT_MAX_FAILURES)
@@ -398,6 +408,7 @@ class GalleryScreenshotAuditResult(BaseModel):
 
 
 class VaultMasterItem(BaseModel):
+    album_group_id: UUID | None = None
     id: UUID
     batch_id: UUID
     source_kind: str
@@ -582,7 +593,9 @@ class VaultAsset(BaseModel):
     metadata: dict[str, object] | None = None
     metadata_provenance: dict[str, str] | None = None
     origin_vault_id: UUID | None = None
-    lifecycle_state: Literal["active", "hidden"] | None = None
+    lifecycle_state: Literal["active", "hidden", "deleted"] | None = None
+    current_location: str | None = None
+    original_section: str | None = None
 
 
 class VaultAssetSearchResult(BaseModel):
@@ -1039,30 +1052,6 @@ class BinRestorePreflight(BaseModel):
     reason: str | None = None
 
 
-class PermanentDeletionReviewRequest(BaseModel):
-    """A reasoned, non-destructive request for permanent-deletion review."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    reason: str = Field(min_length=1, max_length=500)
-
-    @field_validator("reason")
-    @classmethod
-    def validate_reason(cls, value: str) -> str:
-        cleaned = value.strip()
-        if not cleaned:
-            raise ValueError("A permanent-deletion reason is required")
-        return cleaned
-
-
-class PermanentDeletionConfirmation(BaseModel):
-    """A second explicit authorization without deletion execution."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    confirm: Literal[True]
-
-
 class PermanentDeletionExecution(BaseModel):
     """A final explicit instruction to execute confirmed deletion."""
 
@@ -1079,6 +1068,7 @@ ApprovedCategory = Literal[
     "Documents",
     "Archives",
     "Music",
+    "Music Videos",
 ]
 
 
@@ -1182,9 +1172,7 @@ class SidecarRestoreConfirmation(BaseModel):
 def get_destination_paths() -> dict[str, Path]:
     return {
         "Gallery": Path(os.getenv("PV_GALLERY_PATH", "/media/gallery")),
-        "Home Videos": Path(
-            os.getenv("PV_PERSONAL_VIDEOS_PATH", "/media/personal-videos")
-        ),
+        "Home Videos": get_home_videos_path(),
         "Movies": Path(os.getenv("PV_MOVIES_PATH", "/media/movies")),
         "Documents": Path(
             os.getenv("PV_DOCUMENTS_PATH", "/media/documents")
@@ -1203,12 +1191,7 @@ def get_catalogue_preview_roots() -> dict[str, Path]:
         "/vault/Gallery": Path(
             os.getenv("PV_GALLERY_PATH", "/media/gallery")
         ),
-        "/vault/Home Videos": Path(
-            os.getenv(
-                "PV_PERSONAL_VIDEOS_PATH",
-                "/media/personal-videos",
-            )
-        ),
+        "/vault/Home Videos": get_home_videos_path(),
         "/vault/Documents": Path(
             os.getenv("PV_DOCUMENTS_PATH", "/media/documents")
         ),
@@ -1766,7 +1749,9 @@ def resolve_owned_feature_image_path(
 
 
 def to_api_item(item: ImportItem) -> VaultMasterItem:
-    return VaultMasterItem(**item.__dict__)
+    from app.music_groups import item_album
+    album = item_album(item) if item.proposed_category == "Music" else None
+    return VaultMasterItem(**item.__dict__, album_group_id=album.id if album else None)
 
 
 def to_api_asset(asset: CataloguedAsset, username: str) -> VaultAsset:
@@ -1807,6 +1792,33 @@ def search_vault_assets(
             )
         ]
     )
+
+
+@router.get(
+    "/assets/recovery/search",
+    response_model=VaultAssetSearchResult,
+    response_model_exclude_none=True,
+)
+def search_recoverable_vault_assets(
+    response: Response,
+    username: AuthenticatedUsername,
+    store: VaultMasterStoreDependency,
+    query: str = Query(min_length=1, max_length=240),
+    limit: int = Query(default=50, ge=1, le=100),
+) -> VaultAssetSearchResult:
+    """Arrival Hall's owner-only catalogue search, including deleted assets."""
+    response.headers["Cache-Control"] = "private, no-store"
+    assets = store.search_recoverable_catalogued_assets(query, username.user_id, limit)
+    return VaultAssetSearchResult(assets=[
+        VaultAsset(
+            **asset.__dict__,
+            current_location=("Deleted" if asset.lifecycle_state == "deleted" else
+                              "Hidden" if asset.lifecycle_state == "hidden" else
+                              "Theatre" if asset.asset_type in {"Movies", "Movie", "TV Shows"}
+                              else asset.asset_type),
+            original_section=asset.asset_type if asset.lifecycle_state == "deleted" else None,
+        ) for asset in assets
+    ])
 
 
 @router.get(
@@ -2215,6 +2227,24 @@ def list_ingestion_ai_evidence(
     )
 
 
+@router.get("/items/{item_id}/routing-decisions")
+def list_item_routing_decisions(
+    item_id: UUID,
+    username: AuthenticatedUsername,
+    store: VaultMasterStoreDependency,
+    autopilot_store: AutopilotStoreDependency,
+    authentication: AuthenticationStoreDependency,
+    response: Response,
+) -> list[dict[str, object]]:
+    response.headers["Cache-Control"] = "private, no-store"
+    account = authentication.get_account(username)
+    item = store.get_item(item_id)
+    if (account is None or item is None or item.owner_user_id != account.user_id
+            or item.source_kind != INCOMING_SOURCE):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return autopilot_store.list_routing_decisions(item_id, account.user_id)
+
+
 def _analysis_batch_result(
     batch: object,
     username: str,
@@ -2349,15 +2379,9 @@ def get_asset_ai_evidence(
     if asset is None or not asset_is_editable_by(asset, username):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     response.headers["Cache-Control"] = "private, no-store"
-    source_items = [
-        item
-        for item in store.list_items()
-        if item.source_kind == INCOMING_SOURCE
-        and item.state == "moved"
-        and item.owner_user_id == getattr(username, "user_id", None)
-        and item.sha256 == asset.sha256
-        and item.proposed_destination == asset.vault_path
-    ]
+    from app.gallery_reconciliation import published_source_items
+
+    source_items = published_source_items(store, asset)
     visual_evidence = [
         evidence
         for item in source_items
@@ -2369,6 +2393,22 @@ def get_asset_ai_evidence(
         key=lambda evidence: evidence.created_at,
         default=None,
     )
+    # Published-asset recovery is a second, canonical-asset-bound source.  The
+    # original Arrival Hall evidence remains preferred when available.
+    recovered_visual_evidence = None
+    from app.gallery_publication import current_florence
+    if not current_florence(latest_visual_evidence):
+        from app.gallery_florence import get_gallery_florence_store
+        try:
+            recovered_visual_evidence = get_gallery_florence_store().latest_evidence(
+                asset.id, asset.owner_user_id
+            ) if asset.owner_user_id else None
+        except RuntimeError:
+            # In-memory unit tests and legacy deployments without the additive
+            # schema retain the established Arrival Hall-only projection.
+            recovered_visual_evidence = None
+        if current_florence(recovered_visual_evidence):
+            latest_visual_evidence = None
     return AiEvidenceResult(
         jobs=[
             AiJobResult.model_validate(job, from_attributes=True)
@@ -2384,7 +2424,14 @@ def get_asset_ai_evidence(
                 from_attributes=True,
             )
             if latest_visual_evidence is not None
-            else None
+            else (VisualDescriptionEvidenceResult(
+                caption=recovered_visual_evidence.caption, confidence=1.0,
+                model_id=recovered_visual_evidence.model_id,
+                model_revision=recovered_visual_evidence.model_revision,
+                task_version=recovered_visual_evidence.task_version,
+                processing_ms=recovered_visual_evidence.processing_ms,
+                created_at=recovered_visual_evidence.created_at,
+            ) if recovered_visual_evidence is not None else None)
         ),
     )
 
@@ -2566,6 +2613,8 @@ def set_catalogued_asset_local_sharing(
     asset = store.get_visible_catalogued_asset_by_id(asset_id, username)
     if asset is None or not asset_is_editable_by(asset, username):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    if asset.asset_type == 'Home Videos' and asset.lifecycle_state == 'hidden' and edit.mode != 'private':
+        raise HTTPException(409, 'Hidden videos must be restored before sharing.')
     if edit.mode != "specific" and edit.recipient_user_ids:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Only specific sharing can name recipients")
     if edit.mode == "specific" and not edit.recipient_user_ids:
@@ -2624,6 +2673,8 @@ def set_catalogued_assets_local_sharing(
         if not asset_is_editable_by(asset, username):
             raise HTTPException(status_code=422, detail={"message": "Selected asset is not owned by the authenticated user", "asset_id": str(asset_id), "asset_title": asset.display_title or asset.filename})
         assets.append(asset)
+    if any(asset.lifecycle_state == "hidden" for asset in assets) and edit.mode != "private":
+        raise HTTPException(status_code=409, detail="Hidden videos must be restored before sharing." if any(asset.asset_type == "Home Videos" for asset in assets) else "Hidden photos must be restored before sharing.")
     if edit.mode != "specific" and edit.recipient_user_ids:
         raise HTTPException(status_code=422, detail="Only specific sharing can name recipients")
     if edit.mode == "specific" and not edit.recipient_user_ids:
@@ -3313,7 +3364,7 @@ def serve_federated_origin_content(share_id: UUID, asset_id: UUID, x_pv_federati
     if not x_pv_federation_signature or not x_pv_federation_timestamp or x_pv_requester_vault is None: raise HTTPException(status_code=404)
     if not FederationStore(get_database_conninfo()).authorizes_origin_content(share_id,asset_id,x_pv_requester_vault,x_pv_federation_timestamp,x_pv_federation_signature): raise HTTPException(status_code=404)
     asset=store.get_catalogued_asset_by_id(asset_id)
-    if asset is None or asset.asset_type.casefold() not in {'movie','movies','personal videos','personal video','home videos','home video'}: raise HTTPException(status_code=404)
+    if asset is None or asset.lifecycle_state != "active" or asset.asset_type.casefold() not in {'movie','movies','personal videos','personal video','home videos','home video'}: raise HTTPException(status_code=404)
     try: path=resolve_catalogued_asset_path(asset,preview_roots)
     except (OSError,ValueError): raise HTTPException(status_code=404) from None
     return FileResponse(path=path,media_type=asset.mime_type,headers={"Cache-Control":"private, no-store","X-Content-Type-Options":"nosniff","Accept-Ranges":"bytes"})
@@ -3337,7 +3388,7 @@ def serve_federated_origin_download(
     ):
         raise HTTPException(status_code=404)
     asset = store.get_catalogued_asset_by_id(asset_id)
-    if asset is None:
+    if asset is None or asset.lifecycle_state != "active":
         raise HTTPException(status_code=404)
     try:
         path = resolve_catalogued_asset_path(asset, preview_roots)
@@ -3353,7 +3404,7 @@ def serve_federated_origin_preview(share_id: UUID, asset_id: UUID, x_pv_federati
     if not x_pv_federation_signature or not x_pv_federation_timestamp or x_pv_requester_vault is None: raise HTTPException(status_code=404)
     if not FederationStore(get_database_conninfo()).authorizes_origin_preview(share_id,asset_id,x_pv_requester_vault,x_pv_federation_timestamp,x_pv_federation_signature): raise HTTPException(status_code=404)
     asset=store.get_catalogued_asset_by_id(asset_id)
-    if asset is None or asset.asset_type.casefold()!='gallery': raise HTTPException(status_code=404)
+    if asset is None or asset.lifecycle_state != "active" or asset.asset_type.casefold()!='gallery': raise HTTPException(status_code=404)
     try: path=resolve_catalogued_asset_path(asset,preview_roots)
     except (OSError,ValueError): raise HTTPException(status_code=404) from None
     if asset.mime_type.startswith('image/'): return FileResponse(path=path,media_type=asset.mime_type,headers={"Cache-Control":"private, no-store","X-Content-Type-Options":"nosniff"})
@@ -3379,7 +3430,7 @@ def get_commons_shared_asset_preview(
     if asset_id not in {shared.asset_id for shared in shared_assets}:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     asset = store.get_catalogued_asset_by_id(asset_id)
-    if asset is None or asset.asset_type.casefold() != "gallery":
+    if asset is None or asset.lifecycle_state != "active" or asset.asset_type.casefold() != "gallery":
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     try:
         preview_path = resolve_catalogued_asset_path(asset, preview_roots)
@@ -3638,16 +3689,141 @@ def hide_catalogued_asset(
     asset_id: UUID,
     username: AuthenticatedUsername,
     store: VaultMasterStoreDependency,
+    share_store: PostgresShareGrantStore = Depends(get_share_grant_store),
 ) -> VaultAsset:
     """Hide an owner's canonical asset without changing its bytes or path."""
     asset = store.get_visible_catalogued_asset_by_id(asset_id, username)
     if asset is None or not asset_is_editable_by(asset, username):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-    updated = store.set_catalogued_asset_lifecycle_state(
-        asset_id, username.user_id, username, "hidden"
-    )
+    # Hidden content must never retain active sharing authority.  Do not revoke
+    # grants implicitly: the owner must deliberately unshare first.
+    try:
+        if share_store.has_active_share_for_asset(asset_id, asset.owner_user_id or username.user_id):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"This {'video' if asset.asset_type == 'Home Videos' else 'photo'} is shared. Unshare it before hiding.")
+    except HTTPException:
+        raise
+    except Exception:
+        # A failed share-state check is ambiguous and must not create a hidden
+        # asset that might remain accessible through a stale grant.
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Sharing state could not be confirmed; try again later.") from None
+    try:
+        updated = store.set_catalogued_asset_lifecycle_state(
+            asset_id, username.user_id, username, "hidden"
+        )
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    except Exception:
+        raise HTTPException(503, "Sharing state could not be confirmed; try again later.") from None
     if updated is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return to_api_asset(updated, username)
+
+
+@router.post("/assets/{asset_id}/lifecycle/delete/options")
+def begin_recoverable_asset_delete(
+    asset_id: UUID,
+    request: Request,
+    username: AuthenticatedUsername,
+    store: VaultMasterStoreDependency,
+    auth_store: AuthenticationStore = Depends(get_authentication_store),
+    passkeys: PasskeyStore = Depends(get_passkey_store),
+) -> dict[str, object]:
+    asset = store.get_visible_catalogued_asset_by_id(asset_id, username)
+    if asset is None or not asset_is_editable_by(asset, username):
+        raise HTTPException(status_code=404)
+    rate_key = _passkey_rate_limit_key(request)
+    lockout = auth_store.get_lockout_seconds(rate_key)
+    if lockout:
+        raise HTTPException(429, "Too many passkey attempts. Try again later.",
+                            headers={"Retry-After": str(lockout)})
+    credentials = passkeys.list_credentials(username.user_id)
+    if not credentials:
+        raise HTTPException(400, "An active passkey is required to Delete")
+    challenge = secrets.token_bytes(32)
+    ceremony = passkeys.create_challenge(
+        "authentication", username.user_id, challenge,
+        purpose=f"recoverable_delete:{asset_id}",
+    )
+    options = generate_authentication_options(
+        rp_id=get_webauthn_rp_id(), challenge=challenge, timeout=PASSKEY_TIMEOUT_MS,
+        allow_credentials=[PublicKeyCredentialDescriptor(id=item.credential_id)
+                           for item in credentials],
+        user_verification=UserVerificationRequirement.REQUIRED,
+    )
+    return _passkey_options(options, ceremony.id)
+
+
+@router.post("/assets/{asset_id}/lifecycle/delete")
+def delete_catalogued_asset(
+    asset_id: UUID,
+    body: PasskeyVerifyRequest,
+    request: Request,
+    username: AuthenticatedUsername,
+    store: VaultMasterStoreDependency,
+    auth_store: AuthenticationStore = Depends(get_authentication_store),
+    passkeys: PasskeyStore = Depends(get_passkey_store),
+) -> dict[str, bool]:
+    asset = store.get_visible_catalogued_asset_by_id(asset_id, username)
+    if asset is None or not asset_is_editable_by(asset, username):
+        raise HTTPException(status_code=404)
+    rate_key = _passkey_rate_limit_key(request)
+    lockout = auth_store.get_lockout_seconds(rate_key)
+    if lockout:
+        raise HTTPException(429, "Too many passkey attempts. Try again later.",
+                            headers={"Retry-After": str(lockout)})
+    challenge = passkeys.consume_challenge(
+        body.challenge_id, "authentication", username.user_id,
+        purpose=f"recoverable_delete:{asset_id}",
+    )
+    if challenge is None:
+        raise HTTPException(400, "Delete passkey challenge is invalid or expired")
+    try:
+        credential = passkeys.get_credential(_credential_raw_id(body.credential))
+        if credential is None or credential.user_id != username.user_id:
+            raise ValueError("Passkey does not belong to the current user")
+        verified = verify_authentication_response(
+            credential=body.credential, expected_challenge=challenge.challenge,
+            expected_rp_id=get_webauthn_rp_id(), expected_origin=get_webauthn_origin(),
+            credential_public_key=credential.public_key,
+            credential_current_sign_count=credential.sign_count,
+            require_user_verification=True,
+        )
+        passkeys.record_authentication(credential.id, verified.new_sign_count)
+    except (InvalidAuthenticationResponse, InvalidJSONStructure, ValueError, TypeError) as error:
+        retry_after = auth_store.record_failed_attempt(rate_key)
+        if retry_after:
+            raise HTTPException(429, "Too many passkey attempts. Try again later.",
+                                headers={"Retry-After": str(retry_after)}) from error
+        raise HTTPException(401, "Delete passkey confirmation failed") from error
+    auth_store.clear_failed_attempts(rate_key)
+    try:
+        updated = store.set_catalogued_asset_deleted(asset_id, username.user_id, username)
+    except (ValueError, RuntimeError) as error:
+        raise HTTPException(409, str(error)) from error
+    if updated is None:
+        raise HTTPException(status_code=404)
+    return {"deleted": True}
+
+
+@router.post("/assets/{asset_id}/lifecycle/restore-deleted", response_model=VaultAsset)
+def restore_deleted_catalogued_asset(
+    asset_id: UUID,
+    username: AuthenticatedUsername,
+    store: VaultMasterStoreDependency,
+    preview_roots: dict[str, Path] = Depends(get_catalogue_preview_roots),
+) -> VaultAsset:
+    asset = store.get_catalogued_asset_by_id(asset_id)
+    if asset is None or asset.owner_user_id != username.user_id or asset.lifecycle_state != "deleted":
+        raise HTTPException(status_code=404)
+    try:
+        original = resolve_catalogued_asset_path(asset, preview_roots)
+        if not original.is_file():
+            raise ValueError("Original canonical file is unavailable")
+        updated = store.restore_catalogued_asset_deleted(asset_id, username.user_id, username)
+    except (OSError, ValueError) as error:
+        raise HTTPException(409, str(error)) from error
+    if updated is None:
+        raise HTTPException(status_code=404)
     return to_api_asset(updated, username)
 
 
@@ -3750,149 +3926,6 @@ def preflight_catalogued_asset_quarantine_endpoint(
     )
 
 
-@router.get(
-    "/assets/{asset_id}/lifecycle/permanent-deletion-preflight",
-    response_model=PermanentDeletionPreflight,
-)
-def preflight_catalogued_asset_permanent_deletion_endpoint(
-    asset_id: UUID,
-    response: Response,
-    username: AuthenticatedUsername,
-    store: VaultMasterStoreDependency,
-    preview_roots: dict[str, Path] = Depends(get_catalogue_preview_roots),
-    quarantine_root: Path = Depends(get_quarantine_root),
-    retention_days: int = Depends(get_quarantine_retention_days),
-) -> PermanentDeletionPreflight:
-    """Assess a quarantined asset for permanent deletion without mutation."""
-    asset = store.get_visible_catalogued_asset_by_id(asset_id, username)
-    if asset is None or not asset_is_editable_by(asset, username):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-    response.headers["Cache-Control"] = "private, no-store"
-    return preflight_catalogued_asset_permanent_deletion(
-        asset,
-        quarantine_root,
-        store.list_catalogued_asset_history(asset_id),
-        retention_days,
-        preview_roots,
-    )
-
-
-@router.post(
-    "/assets/{asset_id}/lifecycle/permanent-deletion-review",
-    response_model=VaultAssetHistoryEntry,
-    status_code=status.HTTP_201_CREATED,
-)
-def request_catalogued_asset_permanent_deletion_review(
-    asset_id: UUID,
-    request: PermanentDeletionReviewRequest,
-    username: AuthenticatedUsername,
-    store: VaultMasterStoreDependency,
-    preview_roots: dict[str, Path] = Depends(get_catalogue_preview_roots),
-    quarantine_root: Path = Depends(get_quarantine_root),
-    retention_days: int = Depends(get_quarantine_retention_days),
-) -> VaultAssetHistoryEntry:
-    """Record owner intent only after live deletion preflight passes."""
-    asset = store.get_visible_catalogued_asset_by_id(asset_id, username)
-    if asset is None or not asset_is_editable_by(asset, username):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-    preflight = preflight_catalogued_asset_permanent_deletion(
-        asset,
-        quarantine_root,
-        store.list_catalogued_asset_history(asset_id),
-        retention_days,
-        preview_roots,
-    )
-    if not preflight.ready or preflight.eligible_at is None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=preflight.reason or "The asset is not eligible for permanent deletion",
-        )
-    entry = store.request_catalogued_asset_permanent_deletion_review(
-        asset_id,
-        username,
-        request.reason,
-        preflight.eligible_at,
-    )
-    if entry is None:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT)
-    return VaultAssetHistoryEntry(**entry)
-
-
-@router.post(
-    "/assets/{asset_id}/lifecycle/permanent-deletion-review/cancel",
-    response_model=VaultAssetHistoryEntry,
-    status_code=status.HTTP_201_CREATED,
-)
-def cancel_catalogued_asset_permanent_deletion_review(
-    asset_id: UUID,
-    username: AuthenticatedUsername,
-    store: VaultMasterStoreDependency,
-) -> VaultAssetHistoryEntry:
-    """Withdraw a pending permanent-deletion review without mutation."""
-    asset = store.get_visible_catalogued_asset_by_id(asset_id, username)
-    if asset is None or not asset_is_editable_by(asset, username):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-    entry = store.cancel_catalogued_asset_permanent_deletion_review(
-        asset_id,
-        username,
-    )
-    if entry is None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="No pending permanent-deletion review can be withdrawn",
-        )
-    return VaultAssetHistoryEntry(**entry)
-
-
-@router.post(
-    "/assets/{asset_id}/lifecycle/permanent-deletion-confirm",
-    response_model=VaultAssetHistoryEntry,
-    status_code=status.HTTP_201_CREATED,
-)
-def confirm_catalogued_asset_permanent_deletion_review(
-    asset_id: UUID,
-    confirmation: PermanentDeletionConfirmation,
-    username: AuthenticatedUsername,
-    store: VaultMasterStoreDependency,
-    preview_roots: dict[str, Path] = Depends(get_catalogue_preview_roots),
-    quarantine_root: Path = Depends(get_quarantine_root),
-    retention_days: int = Depends(get_quarantine_retention_days),
-) -> VaultAssetHistoryEntry:
-    """Record deliberate authorization after repeating live preflight."""
-    del confirmation
-    asset = store.get_visible_catalogued_asset_by_id(asset_id, username)
-    if asset is None or not asset_is_editable_by(asset, username):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-    preflight = preflight_catalogued_asset_permanent_deletion(
-        asset,
-        quarantine_root,
-        store.list_catalogued_asset_history(asset_id),
-        retention_days,
-        preview_roots,
-    )
-    if not preflight.ready or not preflight.checksum_verified:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=preflight.reason or "The asset is not eligible for permanent deletion",
-        )
-    entry = store.confirm_catalogued_asset_permanent_deletion_review(
-        asset_id,
-        username,
-        asset.sha256,
-    )
-    if entry is None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="No pending permanent-deletion review can be confirmed",
-        )
-    return VaultAssetHistoryEntry(**entry)
-
-
-@router.post(
-    "/assets/{asset_id}/lifecycle/permanent-deletion-execute",
-    response_model=VaultAssetHistoryEntry,
-    status_code=status.HTTP_201_CREATED,
-)
 def execute_catalogued_asset_permanent_deletion(
     asset_id: UUID,
     execution: PermanentDeletionExecution,
@@ -3970,6 +4003,68 @@ def execute_catalogued_asset_permanent_deletion(
     return VaultAssetHistoryEntry(**entry)
 
 
+def run_server_admin_permanent_deletion(
+    asset_id: UUID,
+    reason: str,
+    administrator: AuthenticatedUsername,
+    store: VaultMasterStore,
+    preview_roots: dict[str, Path],
+    quarantine_root: Path,
+    retention_days: int,
+    metadata_root: Path,
+    *,
+    confirmed: bool,
+) -> VaultAssetHistoryEntry:
+    """Run the retained irreversible-deletion workflow for a server CLI only.
+
+    This function is deliberately not registered on the application router.  It
+    repeats live preflight before recording review and confirmation, then calls
+    the single deletion engine above.  The caller must supply a live
+    administrator identity and the literal confirmation switch.
+    """
+    if not confirmed:
+        raise ValueError("Use --confirm-permanent-deletion after reviewing the preflight")
+    if getattr(administrator, "role", None) != "administrator" or not getattr(
+        administrator, "active", False
+    ):
+        raise ValueError("A live administrator identity is required")
+    asset = store.get_catalogued_asset_by_id(asset_id)
+    if asset is None or not asset_is_editable_by(asset, administrator):
+        raise ValueError("The asset does not exist or is not owned by this administrator")
+    cleaned_reason = reason.strip()
+    if not cleaned_reason:
+        raise ValueError("A permanent-deletion reason is required")
+    preflight = preflight_catalogued_asset_permanent_deletion(
+        asset,
+        quarantine_root,
+        store.list_catalogued_asset_history(asset_id),
+        retention_days,
+        preview_roots,
+    )
+    if not preflight.ready or not preflight.checksum_verified or preflight.eligible_at is None:
+        raise ValueError(preflight.reason or "The asset is not eligible for permanent deletion")
+    review = store.request_catalogued_asset_permanent_deletion_review(
+        asset_id, str(administrator), cleaned_reason, preflight.eligible_at
+    )
+    if review is None:
+        raise ValueError("The permanent-deletion review could not be recorded")
+    confirmation = store.confirm_catalogued_asset_permanent_deletion_review(
+        asset_id, str(administrator), asset.sha256
+    )
+    if confirmation is None:
+        raise ValueError("The permanent-deletion review could not be confirmed")
+    return execute_catalogued_asset_permanent_deletion(
+        asset_id,
+        PermanentDeletionExecution(execute=True),
+        administrator,
+        store,
+        preview_roots,
+        quarantine_root,
+        retention_days,
+        metadata_root,
+    )
+
+
 @router.post(
     "/assets/{asset_id}/lifecycle/quarantine-confirm",
     response_model=VaultAsset,
@@ -4043,6 +4138,8 @@ def preflight_catalogued_asset_folder_move_endpoint(
     asset = store.get_visible_catalogued_asset_by_id(asset_id, username)
     if asset is None or not asset_is_editable_by(asset, username):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    if request.category != asset.asset_type or "storage_placement" in asset.metadata:
+        raise HTTPException(409, "Use the logical section Move workflow for this asset.")
     return preflight_catalogued_asset_folder_move(asset, request, preview_roots)
 
 
@@ -4074,6 +4171,8 @@ def confirm_catalogued_asset_folder_move(
     asset = store.get_visible_catalogued_asset_by_id(asset_id, username)
     if asset is None or not asset_is_editable_by(asset, username):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    if request.category != asset.asset_type or "storage_placement" in asset.metadata:
+        raise HTTPException(409, "Use the logical section Move workflow for this asset.")
     try:
         source, destination, destination_vault_path = copy_catalogued_asset_to_existing_folder(asset, request, preview_roots)
     except (OSError, ValueError) as error:
@@ -4687,8 +4786,9 @@ def list_tv_resolver_batches(
     # deployed PostgreSQL uses durable review records.
     durable = None if isinstance(store, MemoryVaultMasterStore) or owner_id is None else PostgresTvResolverStore(get_database_conninfo())
     if durable is not None:
-        # Retain the approved 99-track review as staging shrinks during delivery.
-        # Its remaining extras must not generate an overlapping replacement.
+        # A durable batch owns its staged members while it is publishing.  Do
+        # not create a replacement proposal merely because its episode files
+        # have left Arrival Hall and only extras remain.
         protected_ids = {
             track["arrival_item_id"]
             for batch in durable.list_for_owner(owner_id, include_complete=True)
@@ -5117,7 +5217,13 @@ def edit_proposal(
     store: VaultMasterStoreDependency,
     ai_store: IngestionAiStoreDependency,
 ) -> VaultMasterItem:
-    require_owned_arrival_item(item_id, username, store)
+    original = require_owned_arrival_item(item_id, username, store)
+    if edit.category == "Music Videos":
+        from app.music_video_identity import validate_media
+        try:
+            validate_media(original.mime_type)
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from None
     item = store.update_proposal(
         item_id,
         edit.category,
@@ -5239,18 +5345,69 @@ def remove_rejected_arrival_item(
             PostgresTvResolverStore(get_database_conninfo()).retire_removed(item.id)
         return to_api_item(item)
     try:
-        safely_remove_rejected_arrival_item(item, incoming_path)
+        from app.arrival_recovery import remove
+        removed = remove(store, item.id, username.user_id, incoming_path)
     except (OSError, ValueError) as error:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(error),
         ) from error
-    removed = store.record_decision(item_id, "arrival_removed", username)
     if removed is None:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
     if not isinstance(store, MemoryVaultMasterStore):
         PostgresTvResolverStore(get_database_conninfo()).retire_removed(item.id)
     return to_api_item(removed)
+
+
+@router.get("/recovery")
+def arrival_recovery_listing(response: Response, username: AuthenticatedUsername, store: VaultMasterStoreDependency,
+                             incoming_path: Path = Depends(get_incoming_path)) -> dict:
+    from app.arrival_recovery import inspect, TERMINAL, recovery_candidate
+    response.headers["Cache-Control"] = "private, no-store"
+    owner = getattr(username, "user_id", None)
+    return {"items": [inspect(item, store, incoming_path) for item in store.list_items()
+        if owner and item.owner_user_id == owner and item.source_kind == INCOMING_SOURCE and item.state not in TERMINAL and recovery_candidate(item, store, incoming_path)]}
+
+
+@router.post("/music/imports/{album_id}/approve", response_model=BulkActionResult)
+def approve_music_import(album_id: UUID, selection: ItemSelection, username: AuthenticatedUsername,
+                         store: VaultMasterStoreDependency) -> BulkActionResult:
+    from app.music_imports import approve_import
+    try:
+        items = approve_import(store, getattr(username, "user_id", None), album_id, selection.item_ids)
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return BulkActionResult(items=[to_api_item(item) for item in items])
+
+
+class ArrivalRecoverySelection(ItemSelection):
+    action: Literal["recheck", "retry", "remove"]
+    confirmation: str | None = None
+
+
+@router.post("/recovery")
+def recover_arrival_selection(selection: ArrivalRecoverySelection, username: AuthenticatedUsername,
+                             store: VaultMasterStoreDependency,
+                             incoming_path: Path = Depends(get_incoming_path)) -> dict:
+    from app.arrival_recovery import inspect, recheck
+    if selection.action == "remove" and selection.confirmation != "REMOVE FROM ARRIVAL HALL":
+        raise HTTPException(status_code=422, detail="Explicit staged removal confirmation is required")
+    outcomes = []
+    for item_id in dict.fromkeys(selection.item_ids):
+        try:
+            item = require_owned_arrival_item(item_id, username, store)
+            if selection.action == "remove":
+                remove_rejected_arrival_item(item_id, RejectedArrivalRemovalConfirmation(confirmation="REMOVE FROM ARRIVAL HALL"), username, store, incoming_path)
+                result = inspect(store.get_item(item_id), store, incoming_path)
+            else:
+                result = recheck(store, item_id, username.user_id, incoming_path, retry=selection.action == "retry")
+            outcomes.append({**result, "processed": result["status"] != "needs_recovery"})
+        except (HTTPException, OSError, ValueError, LookupError) as error:
+            outcomes.append({"item_id": str(item_id), "processed": False,
+                "message": str(error.detail) if isinstance(error, HTTPException) else str(error)})
+    return {"outcomes": outcomes}
 
 
 @router.post("/bulk/approve", response_model=BulkActionResult)
@@ -5590,21 +5747,13 @@ def reissue_theatre_promotion(
     store: VaultMasterStoreDependency,
     incoming_path: Path = Depends(get_incoming_path),
 ) -> VaultMasterItem:
-    """Recover an expired root request without a second owner approval."""
-    item = require_owned_arrival_item(item_id, username, store)
-    destination = item.proposed_destination
-    if (
-        item.state != "theatre_promotion_pending"
-        or item.proposed_category not in {"Movies", "TV Shows"}
-        or not destination
-        or store.get_catalogued_asset(destination) is not None
-    ):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Theatre promotion is not eligible for reissue")
-    try:
-        reissue_arrival_theatre_item(item, incoming_path)
-    except (OSError, ValueError) as error:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
-    return to_api_item(item)
+    """Compatibility route; use the same targeted recovery for Music and Theatre."""
+    from app.arrival_recovery import recheck
+    require_owned_arrival_item(item_id, username, store)
+    result = recheck(store, item_id, username.user_id, incoming_path, retry=True)
+    if result["status"] == "needs_recovery":
+        raise HTTPException(status_code=409, detail=result["message"])
+    return to_api_item(store.get_item(item_id))
 
 
 def require_inventory_duplicate(

@@ -24,7 +24,7 @@ def test_screenshot_is_capture_context_not_an_absolute_destination() -> None:
     )
 
     assert assessment.content_type == "financial_document"
-    assert assessment.recommended_destination == "Ledger"
+    assert assessment.recommended_destination == "Documents"
     assert assessment.capture_contexts == ("screenshot",)
     assert assessment.action == "individual_review"
 

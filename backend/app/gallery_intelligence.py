@@ -22,32 +22,14 @@ from psycopg.rows import dict_row
 from app.config import get_database_conninfo
 from app.vault_master import CataloguedAsset, VaultMasterStore
 from app.vault_master_ai import AI_MODEL_ID, AI_MODEL_REVISION
+from app.gallery_taxonomy import GALLERY_TAXONOMY, approved_gallery_terms
 GALLERY_INTELLIGENCE_TASK_VERSION = "gallery-intelligence-rampp-v1"
 GALLERY_INTELLIGENCE_RESOLVER_VERSION = "gallery-concept-resolver-v1"
 BULK_COMPLETION_GRACE = timedelta(seconds=12)
 Decision = Literal["include", "exclude"]
 
-# Deliberately small, controlled Stage A vocabulary. Specialist evidence is
-# resolved into it; no recognition confidence is used as an acceptance gate.
-INITIAL_TERMS: tuple[tuple[str, str, str], ...] = (
-    ("photo_type", "portrait", "Portrait"),
-    ("photo_type", "selfie", "Selfie"),
-    ("photo_type", "landscape", "Landscape"),
-    ("photo_type", "animal", "Animal"),
-    ("photo_type", "food", "Food"),
-    ("photo_type", "document", "Document"),
-    ("photo_type", "screenshot", "Screenshot"),
-    ("photo_type", "architecture", "Building / Architecture"),
-    ("photo_type", "vehicle", "Vehicle"),
-    ("photo_type", "night_photo", "Night photo"),
-    ("content_tag", "motorcycle", "Motorcycle"),
-    ("content_tag", "outdoors", "Outdoors"),
-    ("content_tag", "building", "Building"),
-    ("content_tag", "animal", "Animal"),
-    ("content_tag", "cat", "Cat"),
-    ("content_tag", "beach", "Beach"),
-    ("content_tag", "sea", "Sea"),
-)
+# Compatibility name for existing shared-vocabulary bootstrap consumers.
+INITIAL_TERMS = GALLERY_TAXONOMY
 
 
 @dataclass(frozen=True)
@@ -176,7 +158,7 @@ def resolve_gallery_concepts(
             current = by_slug.get(current.parent_slug.casefold()) if current.parent_slug else None
         for slug in reversed(hierarchy):
             values.extend(terms_by_concept.get(slug, ()))
-    return tuple(dict.fromkeys(values))
+    return approved_gallery_terms(dict.fromkeys(values))
 
 
 def normalise_rampp_tags(raw_tags: object) -> tuple[tuple[str, str], ...]:
@@ -306,7 +288,7 @@ class MemoryGalleryIntelligenceStore:
         model_id = evidence.model_id if evidence else AI_MODEL_ID
         model_revision = evidence.model_revision if evidence else AI_MODEL_REVISION
         task_version = evidence.task_version if evidence else GALLERY_INTELLIGENCE_TASK_VERSION
-        for namespace, slug in terms:
+        for namespace, slug in approved_gallery_terms(terms):
             display = self.terms[(namespace, slug)]
             self.assignments[(job.asset_id, namespace, slug)] = MetadataAssignment(job.asset_id, namespace, slug, display, "vault_master", confidence, model_id, model_revision, task_version)
         if evidence:
@@ -325,7 +307,7 @@ class MemoryGalleryIntelligenceStore:
         Gallery and Personal Video Intelligence deliberately share terms and
         the authoritative user include/exclude layer.
         """
-        for namespace, slug in terms:
+        for namespace, slug in approved_gallery_terms(terms):
             display = self.terms.get((namespace, slug))
             if display:
                 self.assignments[(asset_id, namespace, slug)] = MetadataAssignment(
@@ -354,6 +336,12 @@ class MemoryGalleryIntelligenceStore:
             if assigned_asset == asset_id and decision == "include" and (asset_id, namespace, slug) not in self.assignments:
                 values.append(MetadataAssignment(asset_id, namespace, slug, self.terms[(namespace, slug)], "user", None, None, None, None))
         return values
+
+    def create_custom_tag(self,asset_id,owner_id,name):
+        slug,display = custom_tag_identity(name)
+        self.terms.setdefault(('content_tag',slug),display)
+        self.decide(asset_id,'content_tag',slug,'include',str(owner_id))
+        return {'namespace':'content_tag','slug':slug,'display_name':self.terms[('content_tag',slug)]}
 
     def list_terms(self) -> list[dict[str, str]]:
         return [
@@ -385,6 +373,18 @@ class MemoryGalleryIntelligenceStore:
 
     def resolve_raw_tags(self, raw_tags: object) -> tuple[tuple[str, str], ...]:
         return resolve_gallery_concepts(raw_tags, tuple(self.concepts), tuple(self.concept_terms))
+
+
+def custom_tag_identity(value: str) -> tuple[str, str]:
+    import re
+    import unicodedata
+    name = ' '.join(unicodedata.normalize('NFKC', value).split())
+    if not name or len(name)>64 or any(unicodedata.category(c).startswith('C') for c in value):
+        raise ValueError('Enter a tag of 1-64 characters without control characters')
+    slug = re.sub(r'[^\w]+', '-', name.casefold()).strip('-')
+    if not slug:
+        raise ValueError('A tag must contain letters or numbers')
+    return slug, name
 
 
 class PostgresGalleryIntelligenceStore:
@@ -608,7 +608,7 @@ class PostgresGalleryIntelligenceStore:
             model_id = evidence.model_id if evidence else AI_MODEL_ID
             model_revision = evidence.model_revision if evidence else AI_MODEL_REVISION
             task_version = evidence.task_version if evidence else GALLERY_INTELLIGENCE_TASK_VERSION
-            for namespace, slug in terms:
+            for namespace, slug in approved_gallery_terms(terms):
                 cursor.execute("SELECT id FROM vault_metadata_terms WHERE namespace=%s AND slug=%s", (namespace, slug)); term = cursor.fetchone()
                 if term:
                     cursor.execute("""INSERT INTO vault_asset_metadata_assignments(id,asset_id,term_id,source,confidence,model_id,model_revision,task_version)
@@ -633,7 +633,7 @@ class PostgresGalleryIntelligenceStore:
     ) -> None:
         """Persist resolver output without fabricating a Gallery job/evidence row."""
         with self._connect() as connection, connection.cursor() as cursor:
-            for namespace, slug in terms:
+            for namespace, slug in approved_gallery_terms(terms):
                 cursor.execute(
                     "SELECT id FROM vault_metadata_terms WHERE namespace=%s AND slug=%s AND active",
                     (namespace, slug),
@@ -709,6 +709,20 @@ class PostgresGalleryIntelligenceStore:
                   AND COALESCE(decisions.decision, '') <> 'exclude'
                 ORDER BY terms.namespace, terms.slug, assignments.created_at DESC NULLS LAST""", (asset_id, asset_id))
             return [dict(row) for row in cursor.fetchall()]
+
+    def create_custom_tag(self,asset_id,owner_id,name):
+        slug,display = custom_tag_identity(name)
+        with self._connect() as conn:
+            if conn.execute('SELECT id FROM vault_assets WHERE id=%s AND owner_user_id=%s FOR UPDATE',(asset_id,owner_id)).fetchone() is None:
+                raise ValueError('Asset owner is unavailable')
+            term=conn.execute("""INSERT INTO vault_metadata_terms(id,namespace,slug,display_name)
+                VALUES(%s,'content_tag',%s,%s) ON CONFLICT(namespace,slug) DO UPDATE SET active=TRUE
+                RETURNING id,namespace,slug,display_name""",(uuid4(),slug,display)).fetchone()
+            conn.execute("""INSERT INTO vault_asset_metadata_decisions(id,asset_id,term_id,decision,decided_by)
+                VALUES(%s,%s,%s,'include',%s) ON CONFLICT(asset_id,term_id) DO UPDATE
+                SET decision='include',decided_by=EXCLUDED.decided_by,active=TRUE,updated_at=CURRENT_TIMESTAMP""",
+                (uuid4(),asset_id,term['id'],str(owner_id)))
+            return {k:term[k] for k in ('namespace','slug','display_name')}
 
     def list_terms(self) -> list[dict[str, object]]:
         with self._connect() as connection, connection.cursor() as cursor:

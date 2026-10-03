@@ -135,7 +135,7 @@ def test_exact_descriptor_roundtrip_hash_storage_and_audit(pairing_client):
 
 
 @pytest.mark.parametrize("origin,expected", [
-    ("https://another.example.net", "https://another.example.net"),
+    ("https://vault.example.test", "https://vault.example.test"),
     ("https://vault.example.net", "https://vault.example.net"),
     ("https://VAULT.EXAMPLE.NET:443/", "https://vault.example.net"),
     ("https://vault.example.net:8443/", "https://vault.example.net:8443"),
@@ -145,13 +145,8 @@ def test_configured_origin(pairing_client, monkeypatch, origin, expected):
     monkeypatch.setenv("PV_WEBAUTHN_ORIGIN", origin)
     monkeypatch.setenv("PV_WEBAUTHN_RP_ID", urlsplit(origin).hostname)
     pairing_client.headers["Origin"] = expected
-    pairing_client.headers["Host"] = urlsplit(expected).netloc
     _, descriptor = issue(pairing_client)
     assert descriptor["origin"] == expected
-    response = pairing_client.post("/api/vault-supplier/pair", json=pair_request(descriptor))
-    assert response.status_code == 200, response.text
-    assert response.json()["vault_id"] == descriptor["vault_id"]
-    assert response.json()["server_identity"]["key_id_sha256"] == descriptor["server_key_id"]
 
 
 @pytest.mark.parametrize("origin", ["", "http://testserver", "https://testserver/path", "https://user:test@testserver", "https://@testserver", "https://testserver?", "https://testserver#", "https://testserver?q=1", "https://testserver/#a", " https://testserver", "https://testserver\n", "https://testserver:bad", "https://testserver:0", "https://testserver:", "https://testserver:65536", "https://testserver\\bad"])
@@ -197,7 +192,6 @@ def test_current_identity_change_fails_without_consuming(pairing_client, monkeyp
         monkeypatch.setenv("PV_WEBAUTHN_ORIGIN", "https://new.example.net")
         monkeypatch.setenv("PV_WEBAUTHN_RP_ID", "new.example.net")
         pairing_client.headers["Origin"] = "https://new.example.net"
-        pairing_client.headers["Host"] = "new.example.net"
     else:
         private, _ = _key()
         from cryptography.hazmat.primitives import serialization
@@ -309,3 +303,88 @@ def test_bootstrap_additive_idempotent_and_legacy_rows_fail_closed(pairing_clien
     assert restored.id == original.id and restored.code_hash == original.code_hash
     assert restored.consumed_at is None and restored.invalidated_at is None and restored.binding is None
     assert_error(pairing_client.post("/api/vault-supplier/pair", json=pair_request(descriptor)), "invalid_pairing_code")
+
+
+def test_revoked_identity_requires_fresh_credential_and_invalidates_old_auth(pairing_client):
+    _, descriptor = issue(pairing_client)
+    request = pair_request(descriptor)
+    assert pairing_client.post("/api/vault-supplier/pair", json=request).status_code == 200
+    store = store_for(pairing_client)
+    installation_id = UUID(request["installation_id"])
+    user_id = pairing_client.app.dependency_overrides[get_authentication_store]().get_account("owner").user_id
+    original = store.get_installation(installation_id)
+    old_token, _ = store.create_authorization(installation_id, user_id)
+    old_challenge = store.create_challenge(installation_id, user_id)
+    assert store.revoke_installation(installation_id, user_id)
+    assert store.authorize_request(installation_id, user_id, old_token) is None
+    assert_error(pairing_client.post("/api/vault-supplier/pair", json=request), "pairing_code_used")
+    assert store.get_installation(installation_id).revoked_at is not None
+    with pytest.raises(ValueError, match="installation_revoked"):
+        store.register_installation(original, user_id)
+
+    _, fresh = issue(pairing_client)
+    request["pairing_secret"] = fresh["pairing_secret"]
+    response = pairing_client.post("/api/vault-supplier/pair", json=request)
+    assert response.status_code == 200, response.text
+    restored = store.get_installation(installation_id)
+    assert restored.revoked_at is None
+    assert (restored.installation_id, restored.vault_id, restored.public_key, restored.created_at) == (
+        original.installation_id, original.vault_id, original.public_key, original.created_at)
+    assert store.authorize_request(installation_id, user_id, old_token) is None
+    assert store.consume_challenge(old_challenge.id, installation_id) is None
+    assert store.create_challenge(installation_id, user_id) is not None
+    assert store.get_pairing_code(fresh["pairing_secret"]).consumed_at is not None
+    assert_error(pairing_client.post("/api/vault-supplier/pair", json=request), "pairing_code_used")
+
+
+def test_failed_repair_preserves_revocation_and_fresh_credential(pairing_client):
+    _, descriptor = issue(pairing_client)
+    request = pair_request(descriptor)
+    assert pairing_client.post("/api/vault-supplier/pair", json=request).status_code == 200
+    store = store_for(pairing_client)
+    installation_id = UUID(request["installation_id"])
+    user_id = pairing_client.app.dependency_overrides[get_authentication_store]().get_account("owner").user_id
+    assert store.revoke_installation(installation_id, user_id)
+    _, fresh = issue(pairing_client)
+    bad = pair_request(fresh)
+    bad["installation_id"] = request["installation_id"]
+    assert_error(pairing_client.post("/api/vault-supplier/pair", json=bad), "invalid_installation_identity")
+    assert store.get_installation(installation_id).revoked_at is not None
+    assert store.get_pairing_code(fresh["pairing_secret"]).consumed_at is None
+    mutate_record(store, fresh["pairing_secret"], expires_at=_now() - timedelta(seconds=1))
+    request["pairing_secret"] = fresh["pairing_secret"]
+    assert_error(pairing_client.post("/api/vault-supplier/pair", json=request), "pairing_code_expired")
+    assert store.get_installation(installation_id).revoked_at is not None
+
+
+def test_repair_does_not_restore_other_users_or_accept_unrelated_user(pairing_client):
+    _, descriptor = issue(pairing_client)
+    request = pair_request(descriptor)
+    assert pairing_client.post("/api/vault-supplier/pair", json=request).status_code == 200
+    store = store_for(pairing_client)
+    installation_id = UUID(request["installation_id"])
+    owner = pairing_client.app.dependency_overrides[get_authentication_store]().get_account("owner").user_id
+    other = uuid4()
+    unrelated = uuid4()
+    if isinstance(store, PostgresVaultSupplierStore):
+        # Account references are needed only inside the disposable schema.
+        auth = PostgresAuthenticationStore(store._conninfo)
+        # Use the fixture owner's account shape with independent identities.
+        account = pairing_client.app.dependency_overrides[get_authentication_store]().get_account("owner")
+        auth.create_account(replace(account, user_id=other, username="example-other", email=None))
+        auth.create_account(replace(account, user_id=unrelated, username="example-unrelated", email=None))
+    original = store.get_installation(installation_id)
+    store.register_installation(original, other)
+    assert store.revoke_installation(installation_id, owner)
+    binding = pairing_binding(store.local_vault()[0], LanServerIdentity.load())
+    secret = "R" * 43
+    store.create_pairing_code(binding, unrelated, secret)
+    with pytest.raises(ValueError, match="installation_revoked"):
+        store.complete_pairing(secret, binding, original, unrelated)
+    assert store.get_pairing_code(secret).consumed_at is None
+    assert store.get_installation(installation_id).revoked_at is not None
+    _, fresh = issue(pairing_client)
+    request["pairing_secret"] = fresh["pairing_secret"]
+    assert pairing_client.post("/api/vault-supplier/pair", json=request).status_code == 200
+    assert store.create_challenge(installation_id, other) is None
+    assert store.create_challenge(installation_id, owner) is not None

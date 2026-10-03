@@ -5,6 +5,7 @@ import os
 from pathlib import Path, PurePosixPath
 import tempfile
 
+from app.media_formats import VIDEO_EXTENSIONS as MOVIE_EXTENSIONS
 from app.config import (
     get_jellyfin_api_key,
     get_jellyfin_url,
@@ -27,9 +28,7 @@ from app.vault_master import (
 
 
 logger = logging.getLogger("pv.vault-master.jellyfin")
-MOVIE_EXTENSIONS = frozenset(
-    {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
-)
+
 MOVIES_VAULT_ROOT = PurePosixPath("/vault/Theatre/Movies")
 MUSIC_VAULT_ROOT = PurePosixPath("/vault/Music")
 AUDIO_EXTENSIONS = frozenset(
@@ -109,6 +108,14 @@ def request_jellyfin_library_scan() -> None:
     get_jellyfin_metadata_client().refresh_library()
 
 
+def request_managed_movie_library_scan(asset_type: str) -> bool:
+    """Index a newly published Movie when targeted Jellyfin updates are ignored."""
+    if asset_type != "Movies":
+        return False
+    request_jellyfin_library_scan()
+    return True
+
+
 def jellyfin_movie_metadata(
     movie: JellyfinMovie,
     details: JellyfinMovieDetails,
@@ -125,6 +132,8 @@ def jellyfin_movie_metadata(
     return {
         "display_title": details.title,
         "release_year": details.year,
+        "release_date": details.release_date,
+        "original_title": details.original_title,
         "official_rating": details.official_rating,
         "community_rating": details.community_rating,
         "runtime_ticks": details.runtime_ticks,
@@ -656,15 +665,27 @@ def import_jellyfin_music_library(
         raise ValueError("Music metadata root is not a directory")
     imported_count = 0
     failed_count = 0
+    candidates = []
     for path in sorted(root.rglob("*")):
         if path.is_symlink() or not path.is_file() or path.suffix.casefold() not in AUDIO_EXTENSIONS:
             continue
-        vault_path = str(
-            MUSIC_VAULT_ROOT
-            / PurePosixPath(path.relative_to(root).as_posix())
-        )
-        asset = store.get_catalogued_asset(vault_path)
-        if asset is None:
+        asset = store.get_catalogued_asset(str(MUSIC_VAULT_ROOT / PurePosixPath(path.relative_to(root).as_posix())))
+        if asset is not None and "storage_placement" not in asset.metadata:
+            candidates.append((path, asset))
+    from app.storage_placement import resolve_metadata_placement
+    for asset in store.list_catalogued_assets_by_vault_path_prefix("/vault/Music/"):
+        if asset.asset_type != "Music" or "storage_placement" not in asset.metadata:
+            continue
+        try:
+            path = resolve_metadata_placement(asset.metadata)
+        except (OSError, ValueError):
+            failed_count += 1
+            continue
+        if path is not None:
+            candidates.append((path, asset))
+    for path, asset in candidates:
+        vault_path = asset.vault_path
+        if path.suffix.casefold() not in AUDIO_EXTENSIONS:
             continue
         try:
             audio = client.find_audio_by_path(path)
@@ -715,6 +736,11 @@ def import_jellyfin_music_library(
                     "genres",
                 ):
                     imported_metadata.pop(identity_field, None)
+            album_group = store.get_asset_music_album(asset.id)
+            if album_group is not None:
+                imported_metadata["music_identity_suggestion"] = {key: imported_metadata.get(key) for key in ("artist", "album", "album_artist") if key in imported_metadata}
+                for key in ("artist", "album", "album_artist"):
+                    imported_metadata.pop(key, None)
             updated = store.import_catalogued_asset_metadata(
                 asset.id,
                 imported_metadata,

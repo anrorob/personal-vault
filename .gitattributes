@@ -1,0 +1,2 @@
+# Linux maintenance packages must remain executable when archived on Windows.
+ops/backup/** text eol=lf

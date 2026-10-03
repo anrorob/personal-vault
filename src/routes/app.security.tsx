@@ -209,10 +209,24 @@ function SecurityPage() {
     await load();
   };
 
+  // Presentation only: keep every active installation and retain all fetched audit data.
+  const visibleSupplierInstallations = [
+    ...supplierInstallations.filter((installation) => !installation.revoked_at),
+    ...supplierInstallations
+      .filter((installation) => installation.revoked_at)
+      .sort((a, b) => Date.parse(b.revoked_at!) - Date.parse(a.revoked_at!))
+      .slice(0, 3),
+  ];
+  const recentEvents = [...events]
+    .sort((a, b) => Date.parse(b.occurred_at) - Date.parse(a.occurred_at))
+    .slice(0, 3);
+
   return (
-    <section className="mx-auto max-w-3xl space-y-6">
-      <div>
-        <h2 className="pv-content-title text-2xl">Passkeys</h2>
+    <section className="mx-auto min-w-0 max-w-3xl space-y-6">
+      <section aria-labelledby="passkeys-heading" className="pv-panel space-y-4 p-4 sm:p-6">
+        <h2 id="passkeys-heading" className="pv-content-title text-2xl">
+          Passkeys
+        </h2>
         <p className="mt-2 text-sm" style={{ color: "var(--pv-text-dim)" }}>
           Add a passkey for quick, secure sign-in on this device.
         </p>
@@ -227,11 +241,59 @@ function SecurityPage() {
             assist with recovery.
           </p>
         )}
-      </div>
-      <div className="pv-panel space-y-4 p-6">
+        {passkeysSupported() ? (
+          <button className="pv-btn-primary" disabled={busy} onClick={() => void add()}>
+            {busy ? "Working..." : "Add passkey"}
+          </button>
+        ) : (
+          <p className="text-sm">
+            This browser does not support passkeys. Password sign-in remains available.
+          </p>
+        )}
+        <div className="space-y-3">
+          {credentials.length ? (
+            credentials.map((credential) => (
+              <div
+                key={credential.id}
+                className="flex flex-wrap items-center justify-between gap-4 border-t pt-3"
+                style={{ borderColor: "var(--pv-border)" }}
+              >
+                <div>
+                  <p className="break-all font-medium">{credential.label || "Passkey"}</p>
+                  <p className="text-xs" style={{ color: "var(--pv-text-dim)" }}>
+                    Added {new Date(credential.created_at).toLocaleDateString()}
+                    {credential.last_used_at
+                      ? ` · last used ${new Date(credential.last_used_at).toLocaleDateString()}`
+                      : ""}
+                  </p>
+                </div>
+                <button
+                  className="pv-btn-secondary"
+                  disabled={busy}
+                  onClick={() => void remove(credential.id)}
+                >
+                  Remove
+                </button>
+              </div>
+            ))
+          ) : (
+            <p className="text-sm" style={{ color: "var(--pv-text-dim)" }}>
+              No passkeys have been added yet.
+            </p>
+          )}
+        </div>
+      </section>
+      {message ? (
+        <p role="status" className="text-sm" style={{ color: "var(--pv-text-dim)" }}>
+          {message}
+        </p>
+      ) : null}
+      <section aria-labelledby="supplier-heading" className="pv-panel space-y-4 p-4 sm:p-6">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
-            <h3 className="text-lg font-semibold">Vault Supplier</h3>
+            <h3 id="supplier-heading" className="text-lg font-semibold">
+              Vault Supplier
+            </h3>
             <p className="text-sm" style={{ color: "var(--pv-text-dim)" }}>
               Pair a Windows Vault Supplier installation to this Vault. Pairing credentials are
               single-use and short-lived.
@@ -278,43 +340,46 @@ function SecurityPage() {
             </p>
           </div>
         )}
-        {supplierInstallations.length ? (
-          supplierInstallations.map((installation) => (
-            <div
-              key={installation.installation_id}
-              className="flex flex-wrap items-center justify-between gap-3 border-t pt-3"
-              style={{ borderColor: "var(--pv-border)" }}
-            >
-              <div>
-                <p className="font-medium">
-                  Installation {installation.installation_id.slice(0, 8)}…
-                  {installation.installation_id.slice(-4)}
-                </p>
-                <p className="text-sm" style={{ color: "var(--pv-text-dim)" }}>
-                  Paired {dateTime(installation.created_at)} · {installation.supplier_version}
-                  {installation.last_seen_at
-                    ? ` · Last seen ${dateTime(installation.last_seen_at)}`
-                    : ""}
-                </p>
+        {visibleSupplierInstallations.length ? (
+          <div className="space-y-3">
+            {visibleSupplierInstallations.map((installation) => (
+              <div
+                key={installation.installation_id}
+                className="flex flex-wrap items-center justify-between gap-3 border-t pt-3"
+                style={{ borderColor: "var(--pv-border)" }}
+              >
+                <div>
+                  <p className="font-medium">
+                    {installation.installation_id.slice(0, 8)}…
+                    {installation.installation_id.slice(-4)}
+                  </p>
+                  <p className="text-sm" style={{ color: "var(--pv-text-dim)" }}>
+                    Paired {dateTime(installation.created_at)} · {installation.supplier_version} ·{" "}
+                    {installation.revoked_at ? "Revoked" : "Active"}
+                    {installation.last_seen_at
+                      ? ` · Last seen ${dateTime(installation.last_seen_at)}`
+                      : ""}
+                  </p>
+                </div>
+                {!installation.revoked_at && (
+                  <button
+                    className="pv-btn-danger"
+                    type="button"
+                    onClick={() => void revokeSupplier(installation)}
+                    disabled={busy}
+                  >
+                    Revoke
+                  </button>
+                )}
               </div>
-              {!installation.revoked_at && (
-                <button
-                  className="pv-btn-danger"
-                  type="button"
-                  onClick={() => void revokeSupplier(installation)}
-                  disabled={busy}
-                >
-                  Revoke
-                </button>
-              )}
-            </div>
-          ))
+            ))}
+          </div>
         ) : (
           <p className="text-sm" style={{ color: "var(--pv-text-dim)" }}>
             No Vault Supplier installations are authorized for this user.
           </p>
         )}
-      </div>
+      </section>
       <div className="pv-panel space-y-4 p-6">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
@@ -369,18 +434,20 @@ function SecurityPage() {
           </p>
         )}
       </div>
-      <div className="pv-panel space-y-3 p-6">
+      <section aria-labelledby="activity-heading" className="pv-panel space-y-3 p-4 sm:p-6">
         <div>
-          <h3 className="text-lg font-semibold">Recent security activity</h3>
+          <h3 id="activity-heading" className="text-lg font-semibold">
+            Recent security activity
+          </h3>
           <p className="text-sm" style={{ color: "var(--pv-text-dim)" }}>
-            Latest 50 account security events. IP and browser details are informational.
+            Latest 3 account security events. IP and browser details are informational.
           </p>
         </div>
         {events.length ? (
-          events.map((event) => (
+          recentEvents.map((event) => (
             <div
               key={event.id}
-              className="border-t pt-3 text-sm"
+              className="break-words border-t pt-3 text-sm"
               style={{ borderColor: "var(--pv-border)" }}
             >
               <p className="font-medium">{eventLabel(event)}</p>
@@ -396,55 +463,7 @@ function SecurityPage() {
             No recent security activity.
           </p>
         )}
-      </div>
-      <div className="pv-panel p-6 space-y-4">
-        {passkeysSupported() ? (
-          <button className="pv-btn-primary" disabled={busy} onClick={() => void add()}>
-            {busy ? "Working..." : "Add passkey"}
-          </button>
-        ) : (
-          <p className="text-sm">
-            This browser does not support passkeys. Password sign-in remains available.
-          </p>
-        )}
-        {message ? (
-          <p role="status" className="text-sm" style={{ color: "var(--pv-text-dim)" }}>
-            {message}
-          </p>
-        ) : null}
-        <div className="space-y-3">
-          {credentials.length ? (
-            credentials.map((credential) => (
-              <div
-                key={credential.id}
-                className="flex items-center justify-between gap-4 border-t pt-3"
-                style={{ borderColor: "var(--pv-border)" }}
-              >
-                <div>
-                  <p className="font-medium">{credential.label || "Passkey"}</p>
-                  <p className="text-xs" style={{ color: "var(--pv-text-dim)" }}>
-                    Added {new Date(credential.created_at).toLocaleDateString()}
-                    {credential.last_used_at
-                      ? ` · last used ${new Date(credential.last_used_at).toLocaleDateString()}`
-                      : ""}
-                  </p>
-                </div>
-                <button
-                  className="pv-btn-secondary"
-                  disabled={busy}
-                  onClick={() => void remove(credential.id)}
-                >
-                  Remove
-                </button>
-              </div>
-            ))
-          ) : (
-            <p className="text-sm" style={{ color: "var(--pv-text-dim)" }}>
-              No passkeys have been added yet.
-            </p>
-          )}
-        </div>
-      </div>
+      </section>
     </section>
   );
 }

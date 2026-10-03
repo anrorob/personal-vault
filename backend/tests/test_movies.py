@@ -1,10 +1,11 @@
 import hashlib
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from io import BytesIO
 from types import SimpleNamespace
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -32,6 +33,13 @@ from app.vault_master import (
 from tests.conftest import TEST_PASSWORD, TEST_USERNAME
 
 
+@pytest.fixture(autouse=True)
+def explicit_jellyfin_path_mapping(monkeypatch, tmp_path):
+    monkeypatch.setenv("PV_JELLYFIN_MEDIA_PATH_MAP_JSON", json.dumps([
+        {"section": "movies", "pv_root": str(tmp_path), "jellyfin_root": "/provider/movies"}
+    ]))
+
+
 def create_video(
     library_path: Path,
     relative_path: str,
@@ -40,6 +48,22 @@ def create_video(
     video_path = library_path / relative_path
     video_path.parent.mkdir(parents=True, exist_ok=True)
     video_path.write_bytes(content)
+
+
+def test_movie_source_uses_authoritative_slot_placement(tmp_path: Path, monkeypatch) -> None:
+    slot = tmp_path / "slot"
+    relative = "Theatre/Movies/Example/Example.mkv"
+    physical = slot / relative
+    physical.parent.mkdir(parents=True)
+    physical.write_bytes(b"synthetic")
+    monkeypatch.setenv("PV_STORAGE_SLOT_ROOTS_JSON", json.dumps({"PV-DEV-DISK-001": str(slot)}))
+    asset = SimpleNamespace(vault_path="/vault/" + relative, metadata={
+        "storage_placement": {"slot_id": "PV-DEV-DISK-001", "relative_path": relative}
+    })
+    assert resolve_catalogued_movie_path(asset, {}) == physical
+    asset.metadata["storage_placement"]["relative_path"] = "Theatre/Movies/other.mkv"
+    with pytest.raises(ValueError):
+        resolve_catalogued_movie_path(asset, {})
 
 
 class FakeJellyfinClient:
@@ -145,8 +169,10 @@ class FakeJellyfinClient:
             f"{image_type}{index}?maxWidth={max_width}"
         )
 
-    def open_resource(self, url: str) -> JellyfinStream:
+    def open_resource(self, url: str, range_header: str | None = None) -> JellyfinStream:
         self.requested_hls_url = url
+        self.requested_hls_urls.append(url)
+        self.requested_range = range_header
 
         if self.stream_error:
             raise self.stream_error
@@ -324,11 +350,51 @@ def test_movies_endpoint_returns_live_library(
             "id": response_body[0]["id"],
             "asset_id": str(asset.id),
             "title": "Matrix Revolutions",
+            "original_title": None,
             "year": None,
             "poster_url": None,
             "is_exclusive_movie": False,
         }
     ]
+
+
+def test_movies_catalogue_exposes_existing_original_title_for_search(
+    client: TestClient,
+    tmp_path: Path,
+) -> None:
+    create_video(tmp_path, "Example Movie.mkv")
+    store = MemoryVaultMasterStore()
+    asset = catalogue_movie(
+        store,
+        tmp_path,
+        "Example Movie.mkv",
+        metadata={
+            "display_title": "Example Movie",
+            "original_title": "Example Original",
+            "release_year": 1999,
+        },
+    )
+    create_video(tmp_path, "Private Example.mkv")
+    catalogue_movie(
+        store,
+        tmp_path,
+        "Private Example.mkv",
+        owner_username="other-user",
+        metadata={"original_title": "Private Original"},
+    )
+    app.dependency_overrides[get_movies_library_path] = lambda: tmp_path
+    assert client.get("/api/movies").status_code == 401
+    authenticate(client)
+    response = client.get("/api/movies")
+    assert response.status_code == 200
+    assert [
+        (item["id"], item["original_title"], item["year"])
+        for item in response.json()
+    ] == [(str(asset.id), "Example Original", 1999)]
+    assert (
+        store.catalogued_assets[asset.vault_path].effective_metadata["original_title"]
+        == "Example Original"
+    )
 
 
 def test_movies_endpoint_remains_catalogue_browsable_without_a_library_mount(
@@ -461,6 +527,7 @@ def test_movies_endpoint_only_lists_visible_catalogued_assets(
         "id": body[0]["id"],
         "asset_id": str(shared_asset.id),
         "title": "Shared",
+        "original_title": None,
         "year": None,
         "poster_url": None,
         "is_exclusive_movie": False,
@@ -527,6 +594,7 @@ def test_exclusive_movies_filter_shows_only_owner_selected_titles(
             "id": str(selected.id),
             "asset_id": str(selected.id),
             "title": "Selected",
+                "original_title": None,
             "year": None,
             "poster_url": None,
             "is_exclusive_movie": True,
@@ -623,6 +691,65 @@ def test_playback_endpoint_requires_authentication(
     assert response.json() == {"detail": "Authentication required"}
 
 
+def test_development_playback_info_enforces_auth_and_handles_disabled_jellyfin(
+    client: TestClient, tmp_path: Path, monkeypatch,
+) -> None:
+    relative_path = "Example Film (2026)/Example Film.mkv"
+    create_video(tmp_path, relative_path)
+    store = MemoryVaultMasterStore()
+    catalogue_movie(store, tmp_path, relative_path)
+    movie = scan_movie_library(tmp_path)[0]
+    app.dependency_overrides[get_movies_library_path] = lambda: tmp_path
+    monkeypatch.setenv("PV_ENVIRONMENT", "development")
+    monkeypatch.setenv("PV_JELLYFIN_ENABLED", "false")
+
+    endpoint = f"/api/movies/{movie.id}/playback-info"
+    assert client.get(endpoint).status_code == 401
+    authenticate(client)
+    assert client.get("/api/movies/unknown/playback-info").status_code == 404
+    result = client.get(endpoint)
+    assert result.status_code == 200
+    assert result.json() == {"availability": "jellyfin_disabled", "source": None, "playback": None}
+
+
+def test_development_playback_info_uses_authorized_movie_and_safe_provider_fields(
+    client: TestClient, tmp_path: Path, monkeypatch,
+) -> None:
+    from app import movie_playback
+
+    relative_path = "Example Film (2026)/Example Film.mkv"
+    create_video(tmp_path, relative_path)
+    store = MemoryVaultMasterStore()
+    catalogue_movie(store, tmp_path, relative_path)
+    movie = scan_movie_library(tmp_path)[0]
+    playback_movie = JellyfinMovie("example-item", "example-source", str(tmp_path / relative_path), "mkv", "hevc", ("eac3",))
+    provider = FakeJellyfinClient(movie=playback_movie)
+    provider.playback_source_info = lambda item: {"container": "mkv", "video": {"Codec": "hevc"}}
+    provider.playback_decision = lambda item, *, h264_supported: {
+        "direct_play_supported": False,
+        "remux_supported": False,
+        "transcode_supported": True,
+        "transcode_required": True,
+        "reasons": ["VideoCodecNotSupported"],
+    }
+    app.dependency_overrides[get_movies_library_path] = lambda: tmp_path
+    monkeypatch.setenv("PV_ENVIRONMENT", "development")
+    monkeypatch.setenv("PV_JELLYFIN_ENABLED", "true")
+    monkeypatch.setattr(movie_playback, "get_jellyfin_client", lambda: provider)
+    authenticate(client)
+
+    response = client.get(f"/api/movies/{movie.id}/playback-info?h264_supported=true")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["source"]["video"]["Codec"] == "hevc"
+    assert body["playback"]["confirmed_mode"] is None
+    assert body["client_capability"]["h264_mp4"] is True
+    assert body["jellyfin_decision"]["reasons"] == ["VideoCodecNotSupported"]
+    assert body["actual_session"]["status"] == "UNOBSERVED"
+    assert provider.requested_path == PurePosixPath("/provider/movies") / relative_path
+    assert "secret" not in str(body)
+
+
 def test_playback_endpoint_matches_largest_movie_file_privately(
     client: TestClient,
     tmp_path: Path,
@@ -694,9 +821,7 @@ def test_playback_endpoint_matches_largest_movie_file_privately(
             }
         ],
     }
-    assert jellyfin_client.requested_path == (
-        tmp_path / main_relative_path
-    )
+    assert jellyfin_client.requested_path == PurePosixPath("/provider/movies") / main_relative_path
     assert "private-jellyfin-id" not in response.text
     assert str(tmp_path) not in response.text
 
@@ -1027,6 +1152,7 @@ def test_movie_catalogue_remains_browsable_without_jellyfin(
             "id": str(asset.id),
             "asset_id": str(asset.id),
             "title": "The Matrix: Canonical Edition",
+                "original_title": None,
             "year": 1999,
             "poster_url": (
                 f"/api/vault-master/assets/{asset.id}/artwork/poster"
@@ -1327,3 +1453,48 @@ def test_hls_master_selects_only_an_available_subtitle_track(
         "detail": "Subtitle track is not available"
     }
     assert jellyfin_client.requested_subtitle_index == 8
+
+
+def test_quality_plan_authentication_permissions_disabled_and_range(client, tmp_path, monkeypatch):
+    from app.playback_policy import BrowserCapabilities
+    from app.movie_playback import private_resources
+    from tests.test_playback_policy import Client as PlanProvider
+
+    relative = "Example Film/Example Film.mp4"
+    create_video(tmp_path, relative)
+    store = MemoryVaultMasterStore()
+    catalogue_movie(store, tmp_path, relative)
+    movie = scan_movie_library(tmp_path)[0]
+    item = JellyfinMovie("example", "source", str(tmp_path / relative), "mp4", "h264", ("aac",))
+    provider = FakeJellyfinClient(movie=item)
+    plan_provider = PlanProvider(direct=True)
+    provider._base_url = plan_provider._base_url
+    provider.playback_source_info = plan_provider.playback_source_info
+    provider.request_playback_info = plan_provider.request_playback_info
+    app.dependency_overrides[get_movies_library_path] = lambda: tmp_path
+    app.dependency_overrides[get_jellyfin_client] = lambda: provider
+    endpoint = f"/api/movies/{movie.id}/playback-plan"
+    assert client.post(endpoint, json={}).status_code == 401
+    authenticate(client)
+    assert client.post("/api/movies/unknown/playback-plan", json={}).status_code == 404
+    monkeypatch.setenv("PV_JELLYFIN_ENABLED", "false")
+    assert client.post(endpoint, json={}).status_code == 503
+    monkeypatch.setenv("PV_JELLYFIN_ENABLED", "true")
+    monkeypatch.setenv("PV_JELLYFIN_MEDIA_PATH_MAP_JSON", "[]")
+    assert client.post(endpoint, json={}).status_code == 503
+    assert provider.requested_path is None
+    explicit_jellyfin_path_mapping = [{"section": "movies", "pv_root": str(tmp_path), "jellyfin_root": "/provider/movies"}]
+    monkeypatch.setenv("PV_JELLYFIN_MEDIA_PATH_MAP_JSON", json.dumps(explicit_jellyfin_path_mapping))
+    response = client.post(endpoint, json={"capabilities": BrowserCapabilities(direct=True).model_dump()})
+    assert response.status_code == 200
+    plan = response.json()
+    assert plan["source_type"] == "file"
+    assert "provider.invalid" not in response.text
+    provider.stream = JellyfinStream(response=BytesIO(b"data"), status_code=206,
+        headers={"Content-Length": "4", "Content-Range": "bytes 0-3/10", "Accept-Ranges": "bytes"},
+        url="http://provider.invalid/Videos/example/stream", content_type="video/mp4")
+    delivered = client.get(plan["url"], headers={"Range": "bytes=0-3"})
+    assert delivered.status_code == 206
+    assert delivered.headers["content-range"] == "bytes 0-3/10"
+    assert provider.requested_range == "bytes=0-3"
+    assert client.get(plan["url"].replace(movie.id, "unknown")).status_code == 404
